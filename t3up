@@ -1,15 +1,19 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["textual==8.2.8"]
+# dependencies = ["textual==8.2.8", "textual-image==0.14.1", "pillow==12.3.0"]
 # ///
 """t3up: full-screen dashboard for checking and updating T3 coding servers over SSH."""
 import argparse
 import asyncio
+import base64
 from asyncio.subprocess import PIPE, STDOUT
 from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+import io
 import os
+import json
 import platform
 from pathlib import Path
 import plistlib
@@ -18,6 +22,10 @@ import shlex
 import subprocess
 import sys
 import time
+import urllib.request
+from rich.align import Align
+from rich.columns import Columns
+from rich.console import Group
 from rich.table import Table
 from rich.text import Text
 from textual.app import App, SystemCommand
@@ -29,57 +37,96 @@ from textual.widgets import Button, Footer, Input, OptionList, RichLog, Static
 from textual.widgets.option_list import Option
 
 VERSION = re.compile(r'[0-9][a-zA-Z0-9.+-]*')
+RAW_VERSION = re.compile(r'\d+\.\d+\.\d+(?:[-+][a-zA-Z0-9.+-]+)?')  # in '--version' output
 LOCAL = platform.node().split('.')[0]  # this machine, e.g. 'Ganz-Harbour'
 HOST = re.compile(r'[a-zA-Z0-9_][a-zA-Z0-9_.@:-]*')
 
-REMOTE = r'''set -eu
-PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
-export PATH
-mode=$1 version=$2 app=$3 only=${4:-all}
-# Update a component only in update mode and when it was selected.
-want() { [ "$mode" = update ] && case ",$only," in *,all,*|*",$1,"*) true ;; *) false ;; esac; }
+# Non-interactive SSH skips shell rc files: add the usual per-user and Homebrew bin dirs.
+# One line, so sign-in commands can start with it too. ponytail: nvm picks highest by name, not semver.
+PATH_SETUP = ('for dir in "$HOME"/.nvm/versions/node/*/bin; do if [ -d "$dir" ]; then PATH="$dir:$PATH"; fi; done; '
+              'PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:$HOME/.opencode/bin:$HOME/.volta/bin:'
+              '$HOME/.local/share/pnpm:/usr/local/bin:/opt/homebrew/bin:$PATH"; export PATH')
+REMOTE = 'set -eu\n' + PATH_SETUP + r'''
+mode=$1 version=$2 only=${3:-all}
+picked() { case ",$only," in *",$1,"*) true ;; *) false ;; esac; }
+# Update a component only in update mode and when it was picked or ONLY is `all`.
+want() { [ "$mode" = update ] && { picked all || picked "$1"; }; }
 event() { printf '\n@@t3up\t%s\t%s\n' "$1" "$2"; }
-npm_global() {
-  if [ -w "$(npm prefix -g)" ]; then npm install -g "$@"
-  else sudo -n npm install -g "$@"; fi
-}
 command -v t3 >/dev/null
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-# npm is installation tooling, not an update target. Its latest release may
-# require a newer Node than this host has; keep the working bundled version.
-# Missing tools are installed per user (~/.local/bin, no sudo) when selected for update.
-# Each step then reports whether the tool is signed in; t3up runs the login itself.
-codex_step() {
-  if ! command -v codex >/dev/null; then
-    want codex || { event skip 'Codex: not installed'; return; }
-    npm install --prefix "$HOME/.local" -g @openai/codex@latest
-    event done "Codex: none -> $(codex --version)"
-  else
-    before=$(codex --version) after=$before
-    if want codex; then
-      case $(command -v codex) in
-        "$HOME"/.local/*) npm install --prefix "$HOME/.local" -g @openai/codex@latest ;;
-        *) npm_global @openai/codex@latest ;;
-      esac
-      after=$(codex --version)
+# One npm install at a time: parallel `npm install -g` into one prefix can corrupt it.
+# npm is installation tooling, not an update target: keep the host's working version.
+npm_into() {  # prefix package
+  waited=0
+  until mkdir "$tmp/npm-lock" 2>/dev/null; do  # its holder may have been killed
+    waited=$((waited + 1))
+    [ "$waited" -lt 900 ] || { echo 'Gave up waiting 15 minutes for another npm install' >&2; return 1; }
+    sleep 1
+  done
+  if [ -w "$1" ]; then set -- npm install -g --prefix "$1" "$2"
+  else set -- sudo -n npm install -g --prefix "$1" "$2"; fi
+  if "$@"; then rmdir "$tmp/npm-lock"; else s=$?; rmdir "$tmp/npm-lock"; return "$s"; fi
+}
+# Update a provider CLI the way T3 Code's own provider updater does: with the tool's
+# native updater when it installed itself, else with the package manager that owns it.
+upgrade() {  # Name bin npm-package native-real-path-glob native-update-args
+  real=$(command -v "$2")
+  real=$(readlink -f "$real" 2>/dev/null || printf '%s' "$real")
+  case $real in $4) "$2" $5; return ;; esac
+  pkg=$3  # the package that owns the path wins: OpenCode 1.x and 2.x are different packages
+  case $real in */node_modules/*)
+    pkg=${real##*/node_modules/}  # @scope/name/bin/x or name/bin/x
+    case $pkg in @*/*/*) scope=${pkg%%/*} pkg=${pkg#*/} pkg=$scope/${pkg%%/*} ;; *) pkg=${pkg%%/*} ;; esac
+  esac
+  case $real in
+    */.bun/*) bun add -g "$pkg@latest" ;;
+    */pnpm/*) pnpm add -g "$pkg@latest" ;;
+    */lib/node_modules/*) prefix=${real%%/lib/node_modules/*}; npm_into "${prefix:-/}" "$pkg@latest" ;;
+    */Cellar/*|*/Caskroom/*)
+      keg=${real#*/Cellar/} keg=${keg#*/Caskroom/}
+      case $real in */Caskroom/*) brew upgrade --cask "${keg%%/*}" ;; *) brew upgrade "${keg%%/*}" ;; esac ;;
+    *) echo "$1 at $real was not installed by npm, bun, pnpm, Homebrew or its own installer; update it by hand" >&2
+       return 1 ;;
+  esac
+}
+# Report a provider's version, updating it when wanted. A missing tool is installed per
+# user (no sudo) only when picked by name; otherwise its step ends here, as skipped.
+tool() {  # Name bin npm-package native-real-path-glob native-update-args [install-script-url]
+  if ! command -v "$2" >/dev/null; then
+    if [ "$mode" = update ] && picked "$2"; then
+      if [ -n "${6:-}" ]; then
+        curl -fsSL "$6" -o "$tmp/$2-install.sh"
+        bash "$tmp/$2-install.sh"
+      else mkdir -p "$HOME/.local"; npm_into "$HOME/.local" "$3@latest"; fi
+      event done "$1: none -> $("$2" --version </dev/null)"
+      return
     fi
-    event done "Codex: $before -> $after"
+    event skip "$1: not installed"
+    exit 0  # leaves the step's subshell: nothing else to check
   fi
+  before=$("$2" --version </dev/null) after=$before
+  if want "$2"; then upgrade "$@"; after=$("$2" --version </dev/null); fi
+  event done "$1: $before -> $after"
+}
+# Each provider step then reports whether the tool is signed in; t3up runs the login itself.
+codex_step() {
+  tool Codex codex @openai/codex '*/packages/standalone/*' update
   codex login status </dev/null >/dev/null 2>&1 || event auth Codex
 }
 claude_step() {
-  if ! command -v claude >/dev/null; then
-    want claude || { event skip 'Claude: not installed'; return; }
-    curl -fsSL https://claude.ai/install.sh -o "$tmp/claude-install.sh"
-    bash "$tmp/claude-install.sh"
-    event done "Claude: none -> $(claude --version)"
-  else
-    before=$(claude --version) after=$before
-    if want claude; then claude update; after=$(claude --version); fi
-    event done "Claude: $before -> $after"
-  fi
+  tool Claude claude @anthropic-ai/claude-code '*/.local/share/claude/*' update https://claude.ai/install.sh
   claude auth status --json </dev/null 2>/dev/null | grep -q '"loggedIn": *true' || event auth Claude
+}
+opencode_step() {  # signs in per model provider, so there is no single status to check
+  tool OpenCode opencode opencode-ai '*/.opencode/bin/opencode' upgrade https://opencode.ai/install
+}
+grok_step() {  # Grok updates itself however it was installed
+  tool Grok grok @xai-official/grok '*' update
+  grok models </dev/null 2>&1 | grep -qi 'you are logged in' || event auth Grok
+}
+pi_step() {  # API keys per model provider; no sign-in to check
+  tool Pi pi @earendil-works/pi-coding-agent '' ''
 }
 t3_binary() {
   state="$HOME/.t3/runtime/service-state.json"
@@ -90,12 +137,13 @@ t3_binary() {
     printf '%s\n' "$binary"
   else command -v t3; fi
 }
+# Cursor and Antigravity run inside T3 (an SDK and a T3-managed download): updating T3 updates them.
 t3_step() {
   binary=$(t3_binary)
   before=$("$binary" --version | sed 's/^t3 v//') server=$before
   if want t3; then
     if systemctl cat t3.service >/dev/null 2>&1; then
-      npm_global "t3@${version:-nightly}"
+      npm_into "$(npm prefix -g)" "t3@${version:-nightly}"
       sudo -n systemctl restart t3.service
     elif [ -n "$version" ]; then "$binary" update --yes --allow-downgrade "$version"
     else "$binary" update --yes --channel nightly; fi
@@ -106,7 +154,6 @@ t3_step() {
     fi
     server=$("$binary" --version | sed 's/^t3 v//')
   fi
-  printf '%s' "$server" > "$tmp/server"
   event version "$server"
   event done "T3: $before -> $server"
 }
@@ -118,46 +165,89 @@ step() {
   ( set +e; ( set -e; "$2" ); echo $? > "$tmp/$1" ) 2>&1 |
     while IFS= read -r line || [ -n "$line" ]; do printf '%s| %.3000s\n' "$1" "$line"; done &
 }
-step Codex codex_step
-codex_pid=$!
-step Claude claude_step
-# Concurrent `npm install -g` into one prefix can corrupt it: if Codex and T3
-# would both install into the global prefix, let Codex finish first.
-if want codex && want t3 && systemctl cat t3.service >/dev/null 2>&1; then
-  case $(command -v codex || true) in "$HOME"/.local/*|'') ;; *) wait "$codex_pid" ;; esac
-fi
-step T3 t3_step
+names='T3 Codex Claude OpenCode Grok Pi'
+for name in $names; do step "$name" "$(printf '%s' "$name" | tr A-Z a-z)_step"; done
 wait
 failed=0
-for name in Codex Claude T3; do
+for name in $names; do
   if [ "$(cat "$tmp/$name" 2>/dev/null)" != 0 ]; then event fail "$name"; failed=1; fi
 done
 [ "$failed" = 0 ] || exit 1
-server=$(cat "$tmp/server")
-event begin 'Health and desktop compatibility'
+event begin 'Health'
 healthy=0
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
   if curl --max-time 3 -fsS -o /dev/null http://127.0.0.1:3773/ 2>/dev/null; then healthy=1; break; fi
   sleep 1
 done
 [ "$healthy" -eq 1 ] || { echo 'T3 health check failed on localhost:3773' >&2; exit 1; }
-if [ -n "$app" ] && [ "$server" != "$app" ]; then
-  echo "Desktop $app differs from server $server. Update the desktop or run t3up $app." >&2
-  exit 1
-fi
-event done 'Health: OK; desktop version matches (when available)'
+event done 'Health: OK'
 event complete OK
 '''
 
-# What each server runs, in card order: step name -> menu label. The --only key is the
-# lowercased name. Adding one: a <name>_step in REMOTE, its `step` line and status loop, and here.
-COMPONENTS = {'T3': 'T3 server', 'Codex': 'Codex CLI', 'Claude': 'Claude Code'}
-# Interactive sign-in per tool: Codex shows a code to enter in your browser, Claude asks for one.
-LOGIN = {'Codex': 'codex login --device-auth', 'Claude': 'claude auth login'}
+# What each server runs, in card order: step name -> menu label. The --only key and the
+# command are the lowercased name. Adding one: a <name>_step in REMOTE, `names` there, and here.
+# T3 Code's other providers need nothing here: Cursor and Antigravity ship inside T3.
+COMPONENTS = {'T3': 'T3 server', 'Codex': 'Codex CLI', 'Claude': 'Claude Code',
+              'OpenCode': 'OpenCode', 'Grok': 'Grok CLI', 'Pi': 'Pi'}
+# Where each tool's newest release is published: npm package and dist-tag. T3 updates follow
+# the nightly channel; OpenCode 2.x moved to its own package.
+RELEASES = {'T3': ('t3', 'nightly'), 'Codex': ('@openai/codex', 'latest'),
+            'Claude': ('@anthropic-ai/claude-code', 'latest'), 'OpenCode': ('opencode-ai', 'latest'),
+            'OpenCode 2': ('@opencode/cli', 'latest'), 'Grok': ('@xai-official/grok', 'latest'),
+            'Pi': ('@earendil-works/pi-coding-agent', 'latest')}
+REGISTRY = os.environ.get('T3UP_REGISTRY', 'https://registry.npmjs.org')
+# Interactive sign-in per tool: each prints a link or code to finish in your browser.
+LOGIN = {'Codex': 'codex login --device-auth', 'Claude': 'claude auth login', 'Grok': 'grok login'}
 
 
 def login_command(name):
-    return f'PATH="$HOME/.local/bin:/usr/local/bin:$PATH" {LOGIN[name]}'
+    return f'{PATH_SETUP}; {LOGIN[name]}'
+
+
+def fetch_latest():
+    """{'T3': '0.0.46-nightly.20261003.2632', ...} from the npm registry. Blocking: run it in a thread.
+    A tool the registry can't answer for is left out, so offline just means no update hints."""
+    def one(item):
+        name, (package, tag) = item
+        try:
+            with urllib.request.urlopen(f'{REGISTRY}/-/package/{package}/dist-tags', timeout=5) as response:
+                return name, json.load(response)[tag]
+        except (OSError, ValueError, KeyError):
+            return name, None
+    with ThreadPoolExecutor(len(RELEASES)) as pool:
+        return {name: version for name, version in pool.map(one, RELEASES.items()) if version}
+
+
+def numbers(version):
+    """'0.0.46-nightly.20261003.2632' -> [0, 0, 46, 20261003, 2632], to compare versions."""
+    return [int(n) for n in re.findall(r'\d+', version)]
+
+
+def desktop_behind(desktop, hosts):
+    """The newest T3 a server runs, if this machine's T3 Code desktop app is older: update the app."""
+    newest = max((h.current['T3'] for h in hosts if 'T3' in h.current), key=numbers, default='')
+    return newest if desktop and newest and numbers(newest) > numbers(desktop) else ''
+
+
+def updates(h, latest, target=''):
+    """{tool: newer version} for what h last reported; a pinned T3 target counts as newer when it differs."""
+    found = {}
+    for name, current in h.current.items():
+        new = latest.get('OpenCode 2' if name == 'OpenCode' and current.startswith('2.') else name)
+        if name == 'T3' and target:
+            new = target if target != current else None
+        elif new and numbers(new) <= numbers(current):
+            new = None
+        if new:
+            found[name] = new
+    return found
+
+
+def compact(new, current):
+    """How a tile names an available version: '0.0.47', or '#2632' for a new build of the same nightly."""
+    if short(new) == short(current) and new != current:
+        return '#' + new.rsplit('.', 1)[-1]
+    return short(new).replace('-nightly', '')
 
 
 def desktop_version():
@@ -195,6 +285,13 @@ def ssh_hosts():
             for host in words[1:] if HOST.fullmatch(host)]
 
 
+def only_arg(value):
+    """'codex,claude' -> itself, if every name is a component (or 'all')."""
+    if not set(value.split(',')) <= {'all', *map(str.lower, COMPONENTS)}:
+        raise argparse.ArgumentTypeError(f'choose from all, {", ".join(map(str.lower, COMPONENTS))}')
+    return value
+
+
 def clean(text):
     text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
     return ''.join(c for c in text if c >= ' ' or c == '\t').strip()
@@ -218,21 +315,23 @@ def version_text(detail):
     nightlies = [re.fullmatch(r'(.*-nightly)\.(\d{8})\.(\d+)', v) for v in (old, new)]
     if short(old) != short(new) or not all(nightlies):
         return f'{short(old)} → {short(new)}'
-    # Same version, different nightly: the fewest trailing digits that tell the builds apart.
+    # Same version, different nightly: the digits from the first one that changed, '…23 → …32'.
     (base, d1, b1), (_, d2, b2) = (m.groups() for m in nightlies)
     a, b = (b1, b2) if b1 != b2 else (d1, d2)
-    k = next(k for k in range(1, len(a) + len(b)) if a[-k:] != b[-k:])
-    return f'{base} (…{a[-k:]} → …{b[-k:]})'
+    same = len(os.path.commonprefix([a, b])) if len(a) == len(b) else 0
+    return f'{base} (…{a[same:]} → …{b[same:]})'
 
 
 class Host:
     def __init__(self, name):
         self.name, self.lines = name, deque(maxlen=2000)
+        self.installed = {'T3'}  # survives runs, so a check only shows tiles for tools seen before
         self.reset('')
         self.status = 'idle'
 
     def reset(self, mode, only='all'):
         self.mode, self.only, self.status, self.steps, self.auth = mode, only, 'running', {}, []
+        self.current = {}  # tool -> full version it reported, e.g. '0.0.46-nightly.20261003.2623'
         self.error, self.version, self.log = '', '—', None
         self.started, self.elapsed = time.monotonic(), 0.0
 
@@ -254,7 +353,7 @@ async def read_lines(stream, limit=1 << 16):
         yield buffer
 
 
-async def run_job(h, mode, version, app, only, logs, emit):
+async def run_job(h, mode, version, only, logs, emit):
     """Run the remote script on one host; emit(host, kind, text) on every change."""
     h.reset(mode, only)
     logs.mkdir(parents=True, exist_ok=True)
@@ -263,7 +362,7 @@ async def run_job(h, mode, version, app, only, logs, emit):
     emit(h, 'start', h.lines[-1])
     command = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2', h.name,
-               shlex.join(['sh', '-s', '--', mode, version, app, only])]
+               shlex.join(['sh', '-s', '--', mode, version, only])]
     complete, status = False, None
     last = {}  # latest output line per step tag ('' = untagged)
     process = None
@@ -298,10 +397,13 @@ async def run_job(h, mode, version, app, only, logs, emit):
                 elif event in ('done', 'skip', 'fail'):
                     value = last.get(step, 'Failed') if event == 'fail' else version_text(detail)
                     if event == 'done' and step == 'Health':
-                        value = 'Online · desktop matches' if app else 'Online · desktop not detected'
+                        value = 'Online'
                     if event == 'fail':
                         h.error = f'{step}: {value}'
                     h.steps[step] = (event, value)
+                    (h.installed.discard if event == 'skip' else h.installed.add)(step)
+                    if event == 'done' and (found := RAW_VERSION.findall(detail)):
+                        h.current[step] = found[-1]
                     h.lines.append(f'{ {"done": "✓", "skip": "–", "fail": "✗"}[event]} {step}  {value}')
                     emit(h, 'step', h.lines[-1])
                 elif event == 'auth':
@@ -328,7 +430,9 @@ async def run_job(h, mode, version, app, only, logs, emit):
 # ── Interactive app ─────────────────────────────────────────────────────────
 
 SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-STEPS = (*COMPONENTS, 'Health')
+TILE, GAP, LOGO_LINES = 9, 1, 2  # a tool's tile: its width, the gap between tiles, its logo's height
+
+
 # Graphite neutrals, one blue accent; green/amber/red only ever mean status.
 BG, SURFACE, LINE = '#16161a', '#1f1f24', '#34343c'
 TEXT, MUTED, DIM, FAINT = '#ececf1', '#a1a1ab', '#6e6e78', '#45454d'
@@ -341,13 +445,46 @@ THEME = Theme('t3up', primary=ACCENT, accent=ACCENT, success=GREEN, warning=AMBE
                          'block-hover-background': ACCENT + '1a', 'border': ACCENT,
                          'scrollbar': LINE, 'scrollbar-hover': FAINT, 'scrollbar-background': BG})
 
-
 def status(h, now):
     """(icon, color, label) summarising a host, e.g. ('✓', GREEN, 'healthy')."""
     if h.status == 'running':
         return SPIN[int(now * 10) % 10], AMBER, 'updating' if h.mode == 'update' else 'checking'
     return {'idle': ('·', DIM, 'not checked'), 'failed': ('✗', RED, 'failed'),
             'ok': ('✓', GREEN, 'updated' if h.mode == 'update' else 'healthy')}[h.status]
+
+
+def tile(h, name, now, logo, new=None):
+    """The tool's logo over its version: '↑ 2.1.289' after an update, a spinner while it runs."""
+    event, value = h.steps.get(name, ('', ''))
+    if event == 'begin' and h.status == 'running':
+        version = Text(SPIN[int(now * 10) % 10], style=AMBER)  # the card's border says what it is doing
+    elif event in ('begin', 'fail'):
+        version = Text('✗ failed', style=RED)
+    elif ' → ' in value:  # 'a → b', or 'base (…23 → …33)' for a new build of one nightly
+        done = '#' + h.current[name].rsplit('.', 1)[-1] if value.endswith(')') else value.split(' → ')[-1]
+        version = Text(f'↑ {done}', style=f'bold {GREEN}')
+    else:
+        version = Text(value or '—', style=TEXT if event else FAINT)
+    version.plain = version.plain.replace('-nightly', '')  # every server shares the channel; the header names it
+    if name in h.auth:  # one line under the version, always there so every card is as tall
+        note = Text('sign in', style=AMBER)
+    elif new and h.status != 'running':
+        note = Text(f'→ {compact(new, h.current[name])}', style=ACCENT)
+    else:
+        note = Text('')
+    grid = Table.grid()
+    grid.add_column(justify='center', width=TILE, no_wrap=True)
+    grid.add_row(Align.center(logo))
+    grid.add_row(version)
+    grid.add_row(note)
+    return grid
+
+
+def versions_tooltip(h, new):
+    """Every tool's full version, which tiles shorten, and the full version of any update."""
+    width = max(map(len, h.current), default=0)
+    return '\n'.join(f'{name:<{width}}  {version}' + (f'  →  {new[name]}' if name in new else '')
+                     for name, version in sorted(h.current.items(), key=lambda item: list(COMPONENTS).index(item[0]))) or None
 
 
 class Card(Static, can_focus=True):
@@ -362,46 +499,41 @@ class Card(Static, can_focus=True):
         self.focus()
         self.app.action_open()
 
+    def on_resize(self):  # slots in one line, or wrapped tiles when they no longer fit
+        self.show()
+
     def show(self):
         h, now = self.host, time.monotonic()
         running = h.status == 'running'
-        table = Table.grid(expand=True, padding=(0, 1))
-        table.add_column(width=1)
-        table.add_column(width=6, style=MUTED)
-        table.add_column(ratio=1, no_wrap=True, overflow='ellipsis')
-        if h.status == 'failed' and not h.steps:  # never got as far as a step: just say why
-            table.add_row(Text('✗', style=RED), Text('Error', style=RED), Text(h.error, style=RED))
-            table.add_row('', '', '')
-            table.add_row('', '', Text('enter → retry or open a terminal', style=DIM))
+        lines = []
+        if h.status == 'failed' and not h.steps:  # never got as far as a step: just say why, as tall as tiles
+            lines += [Text(''), Text(f'✗ {h.error}', style=RED, no_wrap=True, overflow='ellipsis'),
+                      Text('enter → retry or open a terminal', style=DIM), Text('')]
         else:
-            for step in STEPS:
-                event, value = h.steps.get(step, ('', ''))
-                if event == 'begin' and running:
-                    icon, style, value = SPIN[int(now * 10) % 10], AMBER, 'updating…' if h.mode == 'update' else 'checking…'
-                elif event in ('begin', 'fail'):
-                    icon, style, value = '✗', RED, value or 'did not finish'
-                elif event == 'skip':
-                    icon, style = '–', DIM
-                elif event:
-                    icon, style = '✓', GREEN
-                else:
-                    icon, style, value = '·', FAINT, ''
-                old, arrow, new = value.partition(' → ')  # an update: highlight the new version
-                text = Text.assemble((old, TEXT if event == 'done' else style),
-                                     (arrow, DIM), (new, f'bold {GREEN}'))
-                if step in h.auth:
-                    text.append('  not signed in', style=AMBER)
-                table.add_row(Text(icon, style=style), step, text)
+            new = updates(h, self.app.latest, self.app.target)
+            tools = self.app.tools  # every tool any server has, so each sits in the same place on every card
+            tiles = [tile(h, name, now, self.app.logos[name], new.get(name))
+                     if name in h.installed and h.steps.get(name, ('begin',))[0] != 'skip' else Text('')
+                     for name in tools]
+            if self.content_size.width and self.content_size.width < len(tools) * (TILE + GAP) - GAP:
+                lines.append(Columns([t for t in tiles if not isinstance(t, Text)], padding=(1, GAP)))  # too narrow: wrap
+            else:
+                row = Table.grid(expand=True)
+                for _ in tools:
+                    row.add_column(ratio=1, justify='center')
+                row.add_row(*(Align.center(t) for t in tiles))
+                lines.append(row)
             if h.error:
-                table.add_row(Text('!', style=RED), Text('Error', style=RED), Text(h.error, style=RED))
-            elif running and h.lines:
-                table.add_row('', '', Text(h.lines[-1], style=DIM))
-        self.update(table)
+                lines.append(Text(f'✗ {h.error}', style=RED, no_wrap=True, overflow='ellipsis'))
+        self.update(Group(*lines))
         icon, color, label = status(h, now)
         elapsed = now - h.started if running else h.elapsed
         took = '' if h.status == 'idle' else f'  [{DIM}]{elapsed:.{0 if running else 1}f}s[/]'
         self.border_title = f' {h.name} '
-        self.border_subtitle = f' [{color}]{icon} {label}[/]{took} '
+        self.tooltip = versions_tooltip(h, updates(h, self.app.latest, self.app.target))
+        waiting = len(updates(h, self.app.latest, self.app.target)) if h.status == 'ok' else 0
+        more = f' · [{ACCENT}]{waiting} to update[/]' if waiting else ''
+        self.border_subtitle = f' [{color}]{icon} {label}[/]{more}{took} '
         self.set_classes(h.status)
 
 
@@ -526,6 +658,21 @@ class ServersEditor(Dialog):
         return super().dismiss(self.hosts)
 
 
+def load_logos():
+    """Each tool's logo as an image renderable: the terminal's graphics protocol when it has one
+    (Kitty's: Ghostty, kitty, WezTerm), else colored half blocks. Probes the terminal on first
+    import, so this must run before Textual takes over stdin."""
+    from PIL import Image as PILImage
+    from textual_image.renderable import HalfcellImage, Image, TGPImage
+    picture = Image if Image is TGPImage else HalfcellImage  # Sixel only works as a Textual widget
+    def padded(name):  # a transparent strip on top keeps a logo off the card's border: less than a line
+        logo = PILImage.open(io.BytesIO(base64.b64decode(LOGO_PNGS[name]))).convert('RGBA')
+        canvas = PILImage.new('RGBA', (logo.width, logo.height * 5 // 4), (0, 0, 0, 0))
+        canvas.paste(logo, (0, canvas.height - logo.height))
+        return canvas
+    return {name: picture(padded(name), width='auto', height=LOGO_LINES) for name in COMPONENTS}
+
+
 class T3Up(App):
     TITLE = 't3up'
     CSS = '''
@@ -536,9 +683,9 @@ class T3Up(App):
         text-style: bold; tint: transparent; }
     #update-all:hover { border: round $accent-lighten-2; color: $accent-lighten-2; }
     #update-all:disabled { border: round $panel-lighten-2; color: $text-disabled; }
-    #cards { grid-size: 1; grid-gutter: 1 2; grid-rows: 7; padding: 1 2; height: 1fr; overflow-y: auto;
+    #cards { grid-size: 1; grid-gutter: 1 2; grid-rows: auto; padding: 1 2; height: 1fr; overflow-y: auto;
              scrollbar-size-vertical: 1; }
-    Card { height: 7; padding: 0 1; border: round $panel-lighten-2; border-title-color: $foreground;
+    Card { height: auto; padding: 0 1; border: round $panel-lighten-2; border-title-color: $foreground;
            border-title-style: bold; }
     Card.failed { border: round $error 60%; }
     Card:focus { border: round $accent; border-title-color: $accent; }
@@ -594,6 +741,9 @@ class T3Up(App):
         self.names, self.hosts, self.cards = names, [], {}
         self.logs, self.target, self.desktop = logs, '', desktop_version()
         self.selected, self.quit_armed = None, 0.0
+        self.latest = {}  # newest release per tool, refreshed with every check
+        self.tools = ['T3']  # tools found on any server: each card's slots, in order
+        self.logos = load_logos()
         self.terminal_lock = asyncio.Lock()
         # Direct refs, so the 0.1s tick can't hit a NoMatches while the app tears down.
         self.top, self.grid = Static(id='top'), Grid(id='cards')
@@ -634,10 +784,20 @@ class T3Up(App):
         self.start([h for h in self.hosts if h.name not in old], 'check')
 
     def fit(self, width):
-        self.grid.styles.grid_size_columns = max(1, min(len(self.hosts), (width - 4) // 44))
+        """Cards exactly as wide as their tiles (a slot per tool any server has, in one line), as many
+        side by side as fit. Too narrow for even one: a single card as wide as the screen, tiles wrapped."""
+        self.tools = [name for name in COMPONENTS if any(name in h.installed for h in self.hosts)] or ['T3']
+        # + border and padding; at least wide enough for the status on its bottom border
+        card = max(36, len(self.tools) * (TILE + GAP) - GAP + 4)
+        columns = max(1, min(len(self.hosts), (width - 4 + 2) // (card + 2)))  # grid padding 2+2, gutter 2
+        self.grid.styles.grid_size_columns = columns
+        self.grid.styles.grid_columns = str(card) if width - 4 >= card else '1fr'
 
     def on_resize(self, event):
         self.fit(event.size.width)
+        narrow = event.size.width < 90
+        self.update_all.label = '↑ Update all' if narrow else '↑  Update all servers'
+        self.update_all.styles.min_width = 16 if narrow else 26
 
     def check_action(self, action, parameters):
         return bool(self.hosts) or action not in ('open', 'refresh', 'update', 'update_all', 'logs', 'ssh', 'move')
@@ -647,13 +807,35 @@ class T3Up(App):
             if h.status == 'running':
                 self.cards[h.name].show()
         counts = Counter(h.status for h in self.hosts)
-        left = Text.assemble((' t3up ', f'bold {BG} on {ACCENT}'), ('   On ', DIM), (LOCAL, TEXT),
-                             ('   Desktop ', DIM), (short(self.desktop) or 'not detected', TEXT),
-                             *((('   Installs ', DIM), (self.target, AMBER)) if self.target else ()))  # pinned only
-        right = Text()
-        for key, style, label in (('running', AMBER, 'busy'), ('ok', GREEN, 'ok'), ('failed', RED, 'failed')):
-            if counts[key]:
-                right.append(f'  ● {counts[key]} {label}', style=style)
+        counts['behind'] = sum(h.status == 'ok' and bool(updates(h, self.latest, self.target)) for h in self.hosts)
+        badge = (' t3up ', f'bold {BG} on {ACCENT}')
+        on = [('   On ', DIM), (LOCAL, TEXT)]
+        pinned = [('   Installs ', DIM), (self.target, AMBER)] if self.target else []
+        behind = desktop_behind(self.desktop, self.hosts)  # the app on this machine, not a server, needs updating
+        if behind:  # never dropped, only shortened: it is the one thing to do on this machine
+            bump = compact(behind, self.desktop)
+            desktops = [[('   Desktop ', DIM), (short(self.desktop), AMBER), (f' → {bump} · update the app', AMBER)],
+                        [('   update desktop → ', AMBER), (bump, AMBER)]]
+        else:
+            desktops = [[('   Desktop ', DIM), (short(self.desktop) or 'not detected', TEXT)], []]
+        def tally(terse):
+            right = Text()
+            for key, style, label, mark in (('running', AMBER, 'busy', '…'), ('ok', GREEN, 'ok', '✓'),
+                                            ('behind', ACCENT, 'can update', '↑'), ('failed', RED, 'failed', '✗')):
+                if counts[key]:
+                    right.append(f'  {mark} {counts[key]}' if terse else f'  ● {counts[key]} {label}', style=style)
+            return right
+        # The widest layout that fits: narrow terminals lose where t3up runs, then the long counts,
+        # then the long desktop line.
+        full, short_desktop = desktops
+        layouts = [(on + full + pinned, False), (full + pinned, False), (full + pinned, True),
+                   (short_desktop + pinned, True), (short_desktop, True)]
+        width = self.top.size.width or 200
+        for parts, terse in layouts:
+            left, right = Text.assemble(badge, *parts), tally(terse)
+            if len(left) + len(right) <= width:
+                break
+        self.top.tooltip = f'T3 Code desktop {self.desktop}' if self.desktop else None
         top = Table.grid(expand=True)
         top.add_column(ratio=1, no_wrap=True, overflow='ellipsis')
         top.add_column(justify='right', no_wrap=True)
@@ -677,7 +859,9 @@ class T3Up(App):
             elif kind in ('line', 'step'):
                 self.output.write(text)
         if kind == 'done':
-            logins = [name for name in h.auth if h.mode == 'update' and h.only in ('all', name.lower())]
+            self.fit(self.size.width)  # a tool found or removed changes how wide cards must be
+            only = h.only.split(',')
+            logins = [name for name in h.auth if h.mode == 'update' and ('all' in only or name.lower() in only)]
             if logins:
                 self.run_worker(self.sign_in(h, logins))
             if h.status == 'failed':
@@ -692,9 +876,15 @@ class T3Up(App):
         if busy:
             self.notify(f'Already running: {", ".join(busy)}', severity='warning')
         self.desktop = desktop_version()
+        self.run_worker(self.refresh_latest())
         for h in hosts:
             if h.status != 'running':
-                self.run_worker(run_job(h, mode, self.target, self.desktop, only, self.logs, self.emit))
+                self.run_worker(run_job(h, mode, self.target, only, self.logs, self.emit))
+
+    async def refresh_latest(self):
+        self.latest = await asyncio.to_thread(fetch_latest) or self.latest
+        for card in self.cards.values():
+            card.show()
 
     def update_menu(self, hosts, heading, extra=()):
         def chosen(choice):
@@ -706,12 +896,16 @@ class T3Up(App):
                 self.action_logs()
             elif choice:
                 self.start(hosts, 'update', choice)
-        target = self.target or 'latest nightly'
+        def detail(name):
+            if name == 'T3':
+                return f'→ {self.target or "latest nightly"}'
+            missing = sum(h.steps.get(name, ('',))[0] == 'skip' for h in hosts)
+            return ('not installed · install latest' if missing == len(hosts) else
+                    f'→ latest · installs on {missing} missing' if missing else '→ latest')
         self.push_screen(Menu(heading, [
             'Update',
-            ('all', '↑', 'Everything', ', '.join(COMPONENTS)),
-            *((name.lower(), '↑', label, f'→ {target if name == "T3" else "latest"}')
-              for name, label in COMPONENTS.items()),
+            ('all', '↑', 'Everything', 'T3 and every installed provider'),
+            *((name.lower(), '↑', label, detail(name)) for name, label in COMPONENTS.items()),
             'Inspect',
             ('check', '↻', 'Check again', 'versions and health, changes nothing'),
             *extra,
@@ -823,11 +1017,16 @@ async def headless(names, args, app, logs):
     hosts = [Host(name) for name in names]
     mode = 'check' if args.check else 'update'
     print(f'\nT3UP · {mode} · {len(hosts)} servers in parallel · from {LOCAL}\n')
-    await asyncio.gather(*(run_job(h, mode, args.version, app, args.only or 'all', logs, emit) for h in hosts))
+    latest, *_ = await asyncio.gather(asyncio.to_thread(fetch_latest),
+                                      *(run_job(h, mode, args.version, args.only or 'all', logs, emit) for h in hosts))
     print('\nRESULTS')
     for h in hosts:
         ok = h.status == 'ok'
-        print(f'  {"✓" if ok else "✗"} {h.name:<16} {"OK" if ok else "FAILED":<7} {h.version:<35} {h.elapsed:.1f}s')
+        new = ', '.join(f'{name} {compact(v, h.current[name])}' for name, v in updates(h, latest, args.version).items())
+        print(f'  {"✓" if ok else "✗"} {h.name:<16} {"OK" if ok else "FAILED":<7} {h.version:<35} {h.elapsed:.1f}s'
+              + (f'   update available: {new}' if new and ok else ''))
+    if behind := desktop_behind(app, hosts):
+        print(f'\n! T3 Code on this machine is {app}, older than the servers ({behind}): update the app.')
     failures = sum(h.status != 'ok' for h in hosts)
     print(f'\n{len(hosts) - failures}/{len(hosts)} passed · Logs: {logs}\n')
     return int(bool(failures))
@@ -841,8 +1040,9 @@ def main():
     parser.add_argument('version', nargs='?', default='', help='headless update to this exact T3 version')
     parser.add_argument('--check', action='store_true', help='headless: check versions and health')
     parser.add_argument('--update', action='store_true', help='headless: update servers')
-    parser.add_argument('--only', choices=['all', *map(str.lower, COMPONENTS)],
-                        help='headless update: only this component (default all)')
+    parser.add_argument('--only', type=only_arg, metavar='NAMES',
+                        help=f'headless update: only these, comma-separated ({",".join(map(str.lower, COMPONENTS))}); '
+                        'installs a missing provider. Default all: T3 and every installed provider')
     parser.add_argument('--host', action='append', metavar='HOST', help='only this configured host (repeatable)')
     parser.add_argument('--list', action='store_true', help='list configured hosts and exit')
     parser.add_argument('--verbose', '-v', action='store_true', help='headless: show installer output')
@@ -874,6 +1074,153 @@ def main():
         parser.error('no terminal; use --check or --update')
     T3Up(hosts, logs).run()
     return 0
+
+
+# ── Logos ────────────────────────────────────────────────────────────────────
+# Each tool's logo as a PNG: T3 Code's app icon art, cropped square; the Codex mark; Clawd, from the
+# pixel art Claude Code ships; the OpenCode mark; the Grok mark; and pi's own 4x4 pixel logo.
+LOGO_PNGS = {
+    'T3': (
+        'iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAMAAADVRocKAAAAwFBMVEWtrrja2+eCeZ9gY3s5RJFMLYFnXIcVID5DO10fKEYOFDn7'
+        '+/sWE0IkE0xXRqhueMVSWLNnZ7lmWLFjRacICjVjPaLr6+t4eo9bY7d2gsxnacPFxc5pcr0YC0NaPaNiO51saoNWOZVZWHQwKGtD'
+        'Knc0NVeqqbWHe7mRlMh9gJLX19jW1uIsJ1NLR2o6N4W5t8iSisJFO2aNhrXi4t6GhZhVWcAyMm5dYsCqp81NRp0hDUcwHmKXl66m'
+        'msQ+SWFgWHorr0yuAAAAQHRSTlP/////////////////////////////////////////////////////////////////////////'
+        '////////////73leyQAABZ1JREFUeNq1mIliojoUhml7O3OvJsgScUFQpFprwW0cu870/d/qZmEJkECw+s/Umbb4fzknyUmO2uBv'
+        '56IC9AukgtqF/al77g+ApvQmFMfoHHdlQCeKVNPTOQ/QIkOlEBhg8fOCMyCK4PMvutDwK9Ium57rAYDYXgj47/wNpgRYzKPLJUgA'
+        '+BnfLS5nL0zR4jx79Tk4d4Y7VwMw66tFwOpbmzn4TnG+QgQA1BO0C9e2a8xBjTog1C5beYr2cKMbGIBaiZ6gKgJgY/w2CGD+NGgh'
+        'vM8jhcduZyGxp4Btt43uEFqoPOcYTBiwbAWYo87CUXju2XgZ97AwQGsJQEqAmx7TGRGoARziPuqNrgkYjUar6wFuiP95ALVJdkZM'
+        'VwOwCCig/SpSWaW7HDA/DgZPT/gv+SL/feYeXA6O9IeD5LdHvJPBnGr2WNQNn6BVL09Rpdq43JOzai0CgNWawCfSE/mvfACrXi/f'
+        'BxXxgAECkntzYCfSdduyLIm/AqByQLJTLEzMdd2yTNNa8f6v4/MAWftFXkkAejJ609rx/lvOv2UE2QmWBkDssR55f5f3bwvIpiGd'
+        'Aepv8hvDNceJeuSl5RxkhyHvb/Hr+nkyLqjFKuJO4iRDib9b8DfPB3ARhHYu/kR0dta4QHhRBuQNBvk32wS2/4ef4J1hMhHMy8vL'
+        '8KXNRkvWKAyDaT/zPxT88cYmBzFJHB5+cibXAmaotD5BOLXtfgrwbwslzt2uTJ0xjPzQbwAAvlB0YNDvT/tEggQxyM7ABL01gPUA'
+        '2J/Z921K8HeiUv3IBdEiAhID9k8ASQQ74Wnw2jaCpJB2QuyPCXmOJIDuFhP0NhEk+5cbO1NfAui+YvvfRAoA1iGRF/hQVvgoOzM/'
+        'N8GGqE0EoHqNRwPprSJG0gakApC3Sd58SbV11+WrxhJAIg01AxR6DWy2nxWv6c7eo4DTKcRjRE0RNMtDcFaI4sAAZCn9swnBNyMg'
+        'QQA0L5w8MANQSAS+CcAI9Mm9dV0EGMbbSbJM1QFezAPoJGh85XsLvwkAEZcjZ14B4ESB7wHgmgN8CQCGHiIVAJKkiL94C1JEdWoG'
+        'eIuZEAE9fmOvI5ABhjxh0whAx64bI6/qD93qMh1O8luYyUBNAI9O5TKGlAHZRoYQ/7ywl5cM0CvJbAbgANgQB3uAPOQxIfDlFkrF'
+        '3BMCMOK5HsDNpONqszg+RdFiPz+WPjHYQigBTHKA42QA3Kd0WMVOA8ifeq6UUvzOgQebI0gApPKHWPgMOYVhrNADOl03ov7v2qgx'
+        'AgTwVUvP9arg7/xiMwAjjbT7o5EUcIdAwV3XTUfBP03Q+w8t7QZHkgg+3gr2un9wFPxvYSqSohJi4nKPHvD1oyTTJb+ose+uZ14O'
+        'yOwzAgY4HECgg+sQSUbvLOPcP11F5QicVEKAbz0u18kDRW8Hb40Z5PyF+wCP71cqIQAjAuuwdNcOL4JYfxbtxYDdKpepS+T7b2/W'
+        '4c/WxVqv1/hVWx6/IlC0FwISjcekUzH0Gvl+4OM+bf9vvF8sTpBUJAiVAT1cZieTeoJNIH5ArT0ARdImEylgQkKw9HqRK3AA5dIm'
+        '2KgnhExYO9cM8O17UANIVUpPYp/OgmFlsksAcqEPpQTNxJlIEUk0k56Z2dMQDCv7psqgLaE8SVpuRECmQJZZsi8ibNqTPMhC0IZD'
+        'U1kWrwTh0xz1pSFgwPAs/5TA/HEINQBFhlUW/rzI15OeUxpCAmhGWAKRT6T8lPDRAKhHWGJ/O/fv3zcC5BBL6s8RAiVAlWFJZFtp'
+        'q9ynn15MJTnSDOxplBDDOufC+BMA7f0f3sUAmcS2Ov1TUH/KImgLIIyMYhjSUmpTe/wJxj1sDUibEul5g0VyRAl0loEyIBm3UXue'
+        '4bMGa5oqCB4+yoi9dsbIUwXkyOQJZLEWS8b+x/9GvRb0Wd/+yQAAAABJRU5ErkJggg=='
+    ),
+    'Codex': (
+        'iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAT2klEQVR42u2de5RcVZXGf/vce6uqO50XmiAiCAOCJIhGsni4Ejr4'
+        'GGXAEWG6B9EExgc4I2vpWs6MjiOrUoMzjEsFYRwUGAgQAtilMAgMT02CyMgjiiMtD0FAeUhCIOlnVd17zp4/zr3d1elukk5Xd2Kn'
+        '71pndXWt7rq39j7729/Ze599hF10dXRo0NaGExEFuL9DmzYLi3EsVWGxsxwC7I0yRwyhOixClxE2qfKMwqNGuC+OeeDU5fJS9rnF'
+        'ooYrV2Kzz93dL5nsGxaLalauRDMB3foDPU4dH1N4vyoHF/LgFKwFZ/1rVf+gYiAwEARgDMQJWMtGMdzrlB92VbhlxQrpzRTc3i52'
+        'WgHbzPpMKDdfr6dIwBdMwNJ8DqpVqNUAsAoig88nCODns6p/U9PXJgyRQt7/caXCsyjf7XqZ7y3/vHRtq+w9VgGqKgAiouXrdHEU'
+        '8O+5HO9Thf5+FLAiGMCM/bNRAQcQ5QhSZT4VO8499TS5YXe3BpkMyCmVxAH88Pv6ldBQDENy/X3Y9AmCBt7OqeJyOcIohGqNG7oq'
+        'nHPGGbJ57VoNly3DlsuYeZ0Iy2DdOli4kAHryN7ftAnt7ERLJRQm1npkMiBn1SqdM7uJq5tn8Jfd3agqThor+KFWAQ5FW1oIqlV+'
+        '219h+ekr5IGdnEDhwoVoeztuIpQxYQpoa9OgXBZ71VW676xmflQo8O6ubhIRApkk6HNKUigQOkdvrcYnZs3lJ71bORzl7QoHKcwH'
+        'ZgMRUEHYJI4XTcDjoeGxGjxVD10TwbBkImGno0PnGce6fJ4Fvb3EIkST6Q1FwDlcFGGsBVU2RhHzczkw4r24qvfoGcsCz776KyQi'
+        'PCmwLgy58eS/Yq2Ih9JG+hSZIIcr5TJ5tawtFDi6t4fEGMJdRUVUUREkDCBOULzT1pRcpQQBzbyBghghiHKQiyCOIbH8nwpX1P7I'
+        'Vcs/L12qKitXIpl/29nLNPrLrlxJICKuVuXy5hkc3dNDgiF0KZPcFQNBFLSWoAiCECCEKoTp60Dxv2fvOdBqDdfdQ1Kp4UzAEU0F'
+        'Lirsw4aODj1TRDS18mC3sYDMNNes0bNaWri0p4c4xdepcA0wrJynuvfUapyzfLk8USxqWCpJsksVkC161qxhfxPwaxFmJAkiMvmr'
+        '7clQRHMzYRzTVUs4e8XH5Yad9QsNg6CFCxER0cTx9UKBmbWa920Djm7qDAOEPT1Y65jVlOf6a67Vr7a3i/VwpDLpFpBp/+rrdHFo'
+        'eNAmPkww1ab+CDRXjeBaWgi6uzn/jOXylbHCUUOdsEv4Ui6HWOd9n5viQwRxiunuJW6ZxT+tWq3nlkqSFIsaTpoFZJx/1So9wOR4'
+        'TCGvumsirbvsUlQMtlAg7O3m9E+dKdfvqE8w4+X8BxxArlhUQ8SphWYKzvlopu5C2jnpQxBrCao1XFjg8muu0YPb28UWVbcr33Bn'
+        'MT+NblqgAnDFaj0lTlCnA6HkPesSpFbDNc9gRn+NKzs69HjKDYagYlENK6GULsmv6tB9XcIHBU51jhP2OOgZedWdtMwk7OriU2ef'
+        'IVduD4pkZ5IpV6zRJWI42zlOampijnNQ6Wf6SrlIECI24UXXx8KzzqIry4XsHASpSkcZ094u9jvX6MFNEecJnBblvdC7e7CSxvVl'
+        'WvgAplbDtsxi315luYh8J2VFyZgtoD6Z8t1r9FNRyDfzeeb09g7E9A2CDKQ0pjWQpU5tLoepVXlyryaOaGsjHrMFZMK/6CLNF/bi'
+        'e4UmzqxWoLsbK2YggAU67ObTFwTVKi5f4NBXqywVkR+P5gvC1xX+FTqvqYlyoUBrTw+JKoGYVPDT13Z9gQkRV+FjwI87O0fGBxlN'
+        '+N+4ROfPnM0d+QKLenqIjUyZqOakKSCKMHGNp8IKC84+W2IfJxoKReEIyRSdt1BbpMbtUZ5FPd0kYiY3kzVlnHGMiuHAOM8hQGdR'
+        'kZIMBWozQjJFbYWrC828u6eXGENYn7qbHjs+nOJyBQIbsNALeHjkIdyG5ycXXKl/39LCKT3dxAKRm3ay44sRCeB4GwDLgNIICiiq'
+        'mnbBffsaPTwMOK+3F6tKqNO0cvyOwM/bfQBYNxoNXYnPnTi9KGiiUOvBimkMqxcG6wyzesI9KD6EU3AwE4YWgQ0oIOOn375WT4oi'
+        '3tvX63m+NqgsxDqoxV76QQBRuOcoQRVJyy9aRvubsLPTayWJ+WrYQOGIeMHnc3DYfv7ny5vhpU2+1GMPUYAfdnQ0CUslcd+8QpdE'
+        'eY6uVHADK9zxCj+BN8yGk98Lb5yb4qGD+38F9/3CK2HKW0JKOVXpft18gDOcEeSgWsNJA9KUWQ35icd54TvnfxeBJYu8JTz+LBRy'
+        'HiNlKseFfIH9RoDOecO/anjhKp1TgxOqFVAlGC/zEYEkgXlz4U1vTIv4zVCTbF0MT7+QbgRImcKUdcJ+w8Nzo67WqsKxQcS+cYyq'
+        'NCaV6OqWDPXpMUl3VrxxDhx5GPRVfT3mFF6MmVoMIjwGsHDTCCxIlaNNAFrDwfhLxlX9NqJNr8FLr8Cb56VbjOq2vKjCsUfAo09D'
+        'b79nR1POHyhqQkyln61BwsPFopq2tuHGbpyyyKkPEzVK8yJQs7D+FyNDlALNBVjyLqjEdXuOmFKJel+ZnScXRxxZKokrl4f7V6PC'
+        'gdaBU0yjbm7V087Hfw9PPJcKvW6GZ6Xh7zoU9tsbKrUpqQSxDnFKUy7ixn+9XI8YqVLCOHiTtY21gGwYAz/eAIkdmSAEBo5fnO6E'
+        'nII+AEHiGEfAbHLceP4ancvKwT1zPhqqNFs/Oxtay2PVr3pf2AQPPTayFTiFg98Chx3oHXLGGqaYEky1QpJv4qC4wqXbQpEBZjiX'
+        'xiwaOFR9GCIXwb2PQE9fCjM6PBv0viP937lU+m6KDSDs7SHJz6Bt5ZX614OFvB6CakxUPBwwAbzWA2sfGb7gktQK5s2FoxZA7xSl'
+        'pem8MnGMInyjuFpndXaiqirGKRWdQAdoHRTyHoZe2jwcijJaetw7Ye4sH8Jgqq4JatjCDPajxt+VSuJWriMwKnRhfKn1RN08o6V3'
+        'PfT6tHTZopSWmilbQ2qqFVThnC9eozNKx2MN8MfU7HVCNjRkVpCDzueg89lB6NmWli4+FPbfGyrVbaKJU2QAJq7h8s3sW0g4CUSN'
+        'OjrF+JXbhGhdB/KjGOOtILGp0EegpR9YPPWY0BBZCOoURTndO2HhfqdgJ7ik3KpnOs9vhvserYuabmMFh+6XWsFUXSErQa2GqHJc'
+        'cZW+KTTC2mqFfjE0OTcQQJ2Y/KjzVvDwE7D0HX7GjxS9nTsTnn4RcuFQqJoqMdI4RqMcc6oxS83XPim/dZaHwxBVi1MHEzniGI47'
+        'wgt/W+Fmmn9li1+guAl+ll01cDgRUMt7srKU60VYat3E7KzTFGL6qvC2feGotzNsF59Lf+98Fp55MU3WWJiilRJiE1DH4SFADGXb'
+        'zflBwCxnJwCGUtYjAie9Zyjc1L+uJXDr/YNwNVVTlqpeAU55qykWNbzgbHlFHVdFOcQ5bEPpV9rkpacPjl0Ab917cLYPPJDzyln/'
+        'CDz3xxT77dSjoQN0NFWAKnuFgENV3Pf4Rn8vZ4owM7MCaVArkFoMc1rgQ0cP9n+rT+AYA5u3wt0PQlMENqmrapqKFiAgfoLNNqWS'
+        'uLYy5sK/lRfU8rVcHpNZwbiDdNYLu7/ihT+zeWh2rJ6K3nIfdPemOWLbgHvvxkPThoQoYVazJm1tmAULkC2z+Vm+wFHV/nQjxjhw'
+        'WAxUa3DAPvDF073gZQTH+/hzcPH3fcxI3W7Wekonrk+ZKnHKxEUXLEBLJUmIWRHX6BaDcRandeHlMQ/rBXpyq4cZHeE5Egs3rfVf'
+        'VN3Y7lXf0jL7/4bSRR1KCBo27IDv6xoyb9o6NCi3iz3n63pyrsBNSYyqG2gcOaYrMN7xLlkEZ5w43PFmi7KfPATX3enhybqdm0x9'
+        'VX+/MGjMhM26ZMaxD6cXosYuCFXRMEKShCdG2iETlkqSfO7r+tko4uI4IRAdY7GWeIzL5+Dcz3gHXF+ikuH+1h447798TtiYnTP3'
+        'xMLSRb7MpZBrLPK8sgXueQB+93wKj41Tgg1zBHGV28IROl5ZUNMVcnW1wr+akL2c9S2/dnjRZaCvAh9Z5sMK2WzfdmF28zp4bSu0'
+        'NPtOuTLGArD+Kpz25/D+YyYG/g/YB444GC68Fp5+3k+o8SpB65Id6tgwbGa3lzGlkrj+CotNwF42RlUR51Jmsp2B+g648+fAcYuG'
+        'sx6Xrraf+gPc90toyvtKOt3Bz8/wuFqFfed54TudAJxWb125CE5c6ifIWJ5x1Gf3z2niKqrKumEWsCDdzSfKYUEAcQ0rY+gpIeIV'
+        '8IY53mxHC8p13Jny/Z0oyhLj1xbz5w7veNjIKzD+2ebP9bM/seMnWwouDDFJzHO9W3lwVMFax0GZxmWMi4wAeG2Ld6rpLnokTcyE'
+        'Aax/GB77nXe82ZfSMX4LA7y6JV03TFDIInveLT2+K0A+N757pd/TBSGmVuXOa78lvcPmzW/SXRzOso+zgB0bdXMWwhBe2AjrHvTY'
+        'b1L+Hwbwymvww7shHw0167Hcw1qIIo/LD/za3yNbYzRyhGmh5v/cmz7rOKmuG4QfVFk18kbt8gBHnZn+w5itzlofz1lzK3T3wTFH'
+        'eIE98wco3wVbu/1ssnbn4x1qIRC44gfeEhYdNugkpRFV5QKbt8DtP4UNndBUSCFTxkU/bS5PUK1w/5Vfk58Xi2pGhSB1qMuWzLJz'
+        'ZeoCdNwOt63zVtHd4wtxc9Hgl9mplW/WcVU8hK3+Edx0T7oOaOAOn76KP6NgQPgNWFw4H5w8L0UbCV8ve1WXTB67ttNNGc0py4nT'
+        '7Upo3UzS8YUH6u8RxwPnDzTsMgaacuDGM/N1YKLZfJ6g2s9dV50vdxSLakrtYocroM3DkCqvpbil47m31jnhLMQsDQ7VqExMOEgd'
+        'JON83myuGANxjUpg+UJ9a8tRaag6ns8iouOJS+sIAS1tfIJjEjrQjK+LVq5AVOnlH1d/Ux5r69CglHZOGaaAdYN5s986CzhkesP2'
+        'uIQfF5qIKj38aPW35IIs3jaqBSwDt97Dxa+rFZwqRnRakGO1Fslmfp6o0s8jzSErKKopb7NLZpgC/LEdEMziidpWng8D9k+StDvW'
+        '9MUYEu9xPkcUxzyu3fzFZZfJ1mJRTWmbzlkjCFW0rUODq0tSUcs6Y1DcxJerTJXhLKqWJJcjqtV4qNrP8Wsuk5fq27/tcNM+Bz+w'
+        'CSucw8i0H3jdrcAp2UiMIYxyhHGFNfFLfLZclp62Ng1KpZFbV8roER046SyamgMeC0L2twmOaRgaZT+kl00ujyQxW5zjyx2XyKXb'
+        'Nj4cQ+ti0dYiwa2XSZ/CKhP45kPTEDNkWHUkgIQ5AkBrNVbXLEd2XCKXFotqQLd7xMnrAIsaQE/7JPvEEU+I0KzOHwAi09SSMPLp'
+        'yiRmK8LNKBeXvysb6k+QGnctQfZBp3xa/yXfxLnVPn8ezB7bOUsGumAJwt3GcBOO28qXye8HWjsDYznYR7YX3S8Wkd90kU+6eCAI'
+        'eUcSY0XSchXZs7ytgo1ymLjGXf99pXyofqKmVSVjDi1uJ9MlCirlC6X/xE/o8hz8HIicTU8jcnvW7E/zAaKOVahK65nklx1AbTSG'
+        '07BypgyKPrxcz8gVuCquEaOEyJ5jA6o4E2Cs5eXEcsgda7IeQOOLE+wQrSyXxba2anjLarm62s+/RRGRUxK3Z7EeF/i6ozV3rJGu'
+        '1laCRpwtucO8fv16bGurhrdeK//c3893oohIHYlzqGtAtcBuPhTF1PqpkPCfoLJsWWMAWMZa19vWhimXxZ5wup6fi/hyHPtUmzBx'
+        'p6PuDocy5PKEtSqX3H6DfG4sNHMCSlrrlHCafkaEi42hkCQk+DStTKVu9in2o45XQ+HwWw5lk49aituFh3kOKuGDH9V3S8QlYcTR'
+        'aYFVgmKmUNgijnxg7eN3leW6Rs7+cU/S7GFaWzVsmsc5Cv8QRrzZWrA+hO3zCZK2rttBui27iQGpEucKRLUKl999o5zVaOE39Bwx'
+        'gA+16TyrfFqUvzGGt4kZ3GyhDpu1cUyTFSIyLGNpjME4l5qZ+KMQZbKjm57zx1GOKKmx9tV5fPDPXsOVy40/VVsatekmgySA1lYt'
+        'RHvxPuAUVZYCB4XhYEh72xxu9r71ZTAvi7A3acuvXZIIyoSf8MvY8d71N8sWHxsTt5sfaT5UEQBHnqXRrM0cYhLejuMQJ7xZfC/l'
+        'mSgVEfqBLQrPGMOj9PBIUuD9QcjVAjOcJUHSFbtOfJwHH24Ik5j7+/r56P/eLRspqmmU052kjT1eEdkibmc+ofXDekwgXBcEHJjE'
+        'JKkvMVlTWGlQVDPr1oLzW7LCCJKE73e9yCc3bJC+7cXzd1MFjBDQ+w2ycaO/3/z5Q+dy/fvlMq61lWD9ekmO/YDOz+f4jyCg3fma'
+        '0EQgGHJy0/gx3wpIGGGcpaLw1XW3ybe8g5u4mc/uTtXrGcdxJ+gKgZVByIE2Aeew6cObnYlHqc9gOZQgDP3/O8edxvKltXfJr7zg'
+        '0UY73D8pBdRbT6kkbsmJOlcSPgecHYa8RXWgYtml2C11ypC6ykdN0T07aDEwxteoWg+O96pywU/vlJvHmkzZAxQw3Bre2apzZuX4'
+        'iEKbwhIjzM5wPCv0HdISra7cfKDmFZ4U4W513PCze+S+bZU92TmeP5n95ZlvyN456gN6YJBwjAhLgAXA/gpzBVqASKEiylbgZQxP'
+        'qvBwINwX1Niwfr1URmNuk3n9P3PlIzz9FheqAAAAAElFTkSuQmCC'
+    ),
+    'Claude': (
+        'iVBORw0KGgoAAAANSUhEUgAAAKMAAABgCAYAAABxEMKaAAABGElEQVR42u3dQQ2EMBBA0ekGM1hYAWsBB2sBDVjAARZWABaQAxcE'
+        'sMkESnjvTEgoP+1tWiLR0ndr8CjtMJWsd70sJ7UQI2IEMSJGECNiBDEiRhAjYgQxIkYQI2IEMSJGECPsmrt/wHv8HXpu/n787T/W'
+        '7Ir1sjPimAYxIkYQI2IEMSJGECNiBDEiRhAjYgQxIkYQI4iR2hQ3FGBnBDEiRhAjYgQxIkYQI2KEZCXcN024bxrEiBhBjIgRxIgY'
+        'QYyIEcSIGEGMiBHEiBhBjCBGxAhiRIwgRsQIYkSMIEbECGJEjHCGJiodFnR0iFTm4KG7y1yzK4Z42RlxTIMYESOIETGCGBEjiBEx'
+        'ghgRI4gRMYIYESOIEcRIbTbRJx1matZtnAAAAABJRU5ErkJggg=='
+    ),
+    'OpenCode': (
+        'iVBORw0KGgoAAAANSUhEUgAAAFAAAABgCAYAAACKa/UAAAAAq0lEQVR42u3dsRHAIAhAUfEyJQMynY0TmB20iZf3B6B4BzUxx1hN'
+        '23UEAAECBCiAAAECFECAAAEKIMB7ek4HZObVAFVlA50wQIACCBAgQAEECBCgAAIECFAAAQIEKIAAAQIUQIAAAQogQIAABRAgQIAC'
+        'CBAgQAEECBAgQAEECBCgAAIECFAAAQIEKIAAAQIUQIBfL/wTsYEAAQIUQIAAAQogQIAABRAgwN/0Ai0yC1G6NlcuAAAAAElFTkSu'
+        'QmCC'
+    ),
+    'Grok': (
+        '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'
+    ),
+    'Pi': (
+        'iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAA50lEQVR42u3csQ2DMBBAUYM8BotkCMQEmYAuBQUDpKBgF4SUiahY'
+        'wgwQUR5R0PsDYImnc3VytU1jSTqtGd5V5Pdrv/i3AQAAQAAACAAAAQAgAAAEAIAAABAAAAIAQAAACMA9y31+hB6wvNrQvZp/32sy'
+        'AQAACAAAAQAgAAAEAIAAABAAAAIAQAAACAAAAQCggHL0Ad28hu7tNMF7R/vnWUyAK0gAAAgAAAEAIAAABACAAAAQAAACAEAAAAgA'
+        'AAFI9oLSle8FmQABACAAAAQAgAAAEAAAAgBAAAAIAAABACAAAAQAgL46AEVEEZ7TKi2hAAAAAElFTkSuQmCC'
+    ),
+}
 
 
 if __name__ == '__main__':
