@@ -17,9 +17,9 @@ from rich.table import Table
 from rich.text import Text
 from textual.app import App, SystemCommand
 from textual.binding import Binding
-from textual.containers import Grid, Vertical
+from textual.containers import Grid, Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Footer, Input, OptionList, RichLog, Static, TextArea
+from textual.widgets import Button, Footer, Input, OptionList, RichLog, Static, TextArea
 from textual.widgets.option_list import Option
 
 VERSION = re.compile(r'[0-9][a-zA-Z0-9.+-]*')
@@ -288,6 +288,7 @@ class Card(Static, can_focus=True):
 
     def on_click(self):
         self.focus()
+        self.app.action_open()
 
     def show(self):
         h, now = self.host, time.monotonic()
@@ -327,9 +328,15 @@ class Card(Static, can_focus=True):
         self.set_classes(h.status)
 
 
-class Menu(ModalScreen):
+class Dialog(ModalScreen):
     BINDINGS = [('escape', 'dismiss', 'Close')]
 
+    def on_click(self, event):
+        if event.widget is self:  # clicked the dimmed backdrop
+            self.dismiss()
+
+
+class Menu(Dialog):
     def __init__(self, title, options):
         super().__init__()
         self.heading, self.options = title, options
@@ -338,15 +345,13 @@ class Menu(ModalScreen):
         with Vertical():
             yield Static(self.heading, classes='heading')
             yield OptionList(*(Option(label, id=key) for key, label in self.options))
-            yield Static('↑↓ choose · enter run · esc cancel', classes='hint')
+            yield Static('click or ↑↓ + enter to choose · esc cancel', classes='hint')
 
     def on_option_list_option_selected(self, event):
         self.dismiss(event.option.id)
 
 
-class VersionPrompt(ModalScreen):
-    BINDINGS = [('escape', 'dismiss', 'Close')]
-
+class VersionPrompt(Dialog):
     def __init__(self, current):
         super().__init__()
         self.current = current
@@ -380,6 +385,12 @@ class ServersEditor(ModalScreen):
             if unused:
                 yield Static(f'From ~/.ssh/config: {", ".join(unused)}', classes='hint')
             yield Static('one SSH host per line · ctrl+s save · esc cancel', classes='hint')
+            with Horizontal():
+                yield Button('Save', variant='primary', id='save')
+                yield Button('Cancel', id='cancel')
+
+    def on_button_pressed(self, event):
+        self.action_save() if event.button.id == 'save' else self.dismiss()
 
     def action_save(self):
         text = self.query_one(TextArea).text
@@ -413,12 +424,15 @@ class T3Up(App):
     Menu, VersionPrompt, ServersEditor { align: center middle; background: #0b1120 70%; }
     Menu > Vertical, VersionPrompt > Vertical, ServersEditor > Vertical { width: 60; height: auto;
               padding: 1 2; border: round #818cf8; background: #111827; }
-    ServersEditor TextArea { height: 14; }
+    ServersEditor TextArea { height: 8; }
     .heading { text-style: bold; margin-bottom: 1; }
     .hint { color: #64748b; margin-top: 1; }
     OptionList { height: auto; border: none; background: #111827; }
+    ServersEditor Horizontal { height: auto; margin-top: 1; }
+    ServersEditor Button { margin-right: 2; }
     '''
     BINDINGS = [
+        Binding('enter', 'open', 'Actions'),
         Binding('r', 'refresh', 'Refresh'),
         Binding('u', 'update', 'Update server'),
         Binding('a', 'update_all', 'Update all'),
@@ -479,7 +493,7 @@ class T3Up(App):
         self.fit(event.size.width)
 
     def check_action(self, action, parameters):
-        return bool(self.hosts) or action not in ('refresh', 'update', 'update_all', 'logs', 'ssh', 'move')
+        return bool(self.hosts) or action not in ('open', 'refresh', 'update', 'update_all', 'logs', 'ssh', 'move')
 
     def tick(self):
         for h in self.hosts:
@@ -531,10 +545,14 @@ class T3Up(App):
             if h.status != 'running':
                 self.run_worker(run_job(h, mode, self.target, self.desktop, only, self.logs, self.emit))
 
-    def update_menu(self, hosts, title):
+    def update_menu(self, hosts, title, extra=()):
         def chosen(choice):
             if choice == 'check':
                 self.start(hosts, 'check')
+            elif choice == 'ssh':
+                self.action_ssh()
+            elif choice == 'logs':
+                self.action_logs()
             elif choice:
                 self.start(hosts, 'update', choice)
         target = self.target or 'nightly'
@@ -544,6 +562,7 @@ class T3Up(App):
             ('codex', 'Codex CLI only  → latest'),
             ('claude', 'Claude Code only  → latest'),
             ('check', 'Just check versions and health'),
+            *extra,
         ]), chosen)
 
     def action_move(self, dx, dy):
@@ -554,6 +573,13 @@ class T3Up(App):
 
     def action_refresh(self):
         self.start(self.hosts, 'check')
+
+    def action_open(self):
+        shown = self.output.has_class('shown')
+        self.update_menu([self.selected], self.selected.name, [
+            ('ssh', 'Open a terminal on this server  (type exit to come back)'),
+            ('logs', 'Hide output' if shown else 'Show output'),
+        ])
 
     def action_update(self):
         self.update_menu([self.selected], f'Update {self.selected.name}')

@@ -96,6 +96,13 @@ printf '@@t3up\\tversion\\t1.0.0\\n@@t3up\\tdone\\tHealth OK\\n@@t3up\\tcomplete
             assert app.hosts[1].status == "running" and app.hosts[0].status == "failed"
             await app.workers.wait_for_complete()
             assert app.hosts[1].mode == "update"
+            await pilot.press("enter")               # Enter opens the server's action menu
+            assert type(app.screen).__name__ == "Menu"
+            await pilot.click(offset=(0, 0))         # clicking the backdrop closes it
+            assert type(app.screen).__name__ != "Menu"
+            await pilot.click(app.cards["first"])    # clicking a card selects it and opens its menu
+            assert app.selected.name == "first" and type(app.screen).__name__ == "Menu"
+            await pilot.press("escape", "right")
             last = (root / "calls").read_text().splitlines()[-1]
             assert last.startswith("second sh -s -- update ") and last.endswith(" t3"), last
             app.save_screenshot("/tmp/t3up-wide.svg")
@@ -124,7 +131,7 @@ printf '@@t3up\\tversion\\t1.0.0\\n@@t3up\\tdone\\tHealth OK\\n@@t3up\\tcomplete
             await pilot.press("ctrl+s")
             assert (root / "servers").read_text().endswith("second"), "invalid list was saved"
             editor.text = "second\nfourth # new"
-            await pilot.press("ctrl+s")
+            await pilot.click("#save")
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert (root / "servers").read_text() == "second\nfourth # new\n"
