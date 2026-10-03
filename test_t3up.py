@@ -138,4 +138,60 @@ printf '@@t3up\\tversion\\t1.0.0\\n@@t3up\\tdone\\tHealth OK\\n@@t3up\\tcomplete
             await pilot.pause()
             assert type(app.screen).__name__ == "ServersEditor"
     asyncio.run(empty())
-print("PASS: parallel headless run, argument validation, interactive refresh/update/resize/logs/servers")
+
+    # The real REMOTE script under dash, with fake tools first on its PATH ($HOME/.local/bin),
+    # so no real installer on this machine can ever run.
+    home = root / "home"
+    bin_ = home / ".local/bin"
+    bin_.mkdir(parents=True)
+    def tool(name, body):
+        (bin_ / name).write_text("#!/bin/sh\n" + body + "\n")
+        (bin_ / name).chmod(0o755)
+    tool("ssh", 'while [ "$1" = -o ]; do shift 2; done; exec dash -c "$2"')
+    tool("codex", '[ "$1" = --version ] && echo "codex-cli $(cat $HOME/codex)"')
+    tool("npm", 'sleep 1; head -c 100000 /dev/zero | tr "\\0" x; echo; echo "added 1 package"; echo 0.2.0 > $HOME/codex')
+    tool("claude", 'case $1 in --version) echo "$(cat $HOME/claude) (Claude Code)";;\n'
+                   'update) sleep 1; [ -f $HOME/claude-broken ] && { echo "disk full" >&2; exit 3; }\n'
+                   '  echo 2.0.0 > $HOME/claude;; esac')
+    tool("t3", 'case $1 in --version) echo x >> $HOME/t3-calls; echo "t3 v$(cat $HOME/t3)";;\n'
+               'update) sleep 1; echo 0.0.2 > $HOME/t3;; esac')
+    tool("curl", "exit 0")
+    tool("systemctl", "exit 1")
+    def reset_tools():
+        for name, value in (("codex", "0.1.0"), ("claude", "1.0.0"), ("t3", "0.0.1")):
+            (home / name).write_text(value)
+        for name in ("t3-calls", "claude-broken"):
+            (home / name).unlink(missing_ok=True)
+    os.environ.update(HOME=str(home), PATH=f"{bin_}:{os.environ['PATH']}")
+
+    async def remote(mode, only="all"):
+        h, events = m["Host"]("box"), []
+        await m["run_job"](h, mode, "", "", only, root / "remote-logs", lambda h, k, t: events.append((k, t)))
+        return h
+
+    reset_tools()
+    h = asyncio.run(remote("check"))
+    assert h.status == "ok", (h.error, list(h.lines))
+    assert (home / "t3-calls").read_text().count("x") == 1, "check must call t3 --version once"
+    assert [h.steps[s][1] for s in ("Codex", "Claude", "T3")] == ["0.1.0", "1.0.0", "0.0.1"]
+
+    reset_tools()
+    started = time.monotonic()
+    h = asyncio.run(remote("update"))
+    assert h.status == "ok", (h.error, list(h.lines))
+    assert time.monotonic() - started < 2.5, "components did not update in parallel"
+    assert [h.steps[s][1] for s in ("Codex", "Claude", "T3")] == ["0.1.0 → 0.2.0", "1.0.0 → 2.0.0", "0.0.1 → 0.0.2"]
+    assert "Codex: added 1 package" in h.lines, list(h.lines)
+    assert max(map(len, h.lines)) < 4000, "long lines must be cut below PIPE_BUF"
+
+    reset_tools()
+    h = asyncio.run(remote("update", "codex"))
+    assert [h.steps[s][1] for s in ("Codex", "Claude", "T3")] == ["0.1.0 → 0.2.0", "1.0.0", "0.0.1"]
+
+    reset_tools()
+    (home / "claude-broken").touch()
+    h = asyncio.run(remote("update"))
+    assert h.status == "failed" and h.steps["Claude"] == ("fail", "disk full"), h.steps
+    assert h.steps["Codex"][0] == "done" and h.steps["T3"][0] == "done" and "Health" not in h.steps
+    assert h.error == "Claude: disk full", h.error
+print("PASS: parallel hosts and components, remote script under dash, argument validation, TUI, servers editor")

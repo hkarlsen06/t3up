@@ -37,25 +37,28 @@ npm_global() {
   else sudo -n npm install -g "$@"; fi
 }
 command -v t3 >/dev/null
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
 # npm is installation tooling, not an update target. Its latest release may
 # require a newer Node than this host has; keep the working bundled version.
-event begin Codex
-if command -v codex >/dev/null; then
-  before=$(codex --version)
+codex_step() {
+  if ! command -v codex >/dev/null; then event skip 'Codex: not installed'; return; fi
+  before=$(codex --version) after=$before
   if want codex; then
     case $(command -v codex) in
       "$HOME"/.local/*) npm install --prefix "$HOME/.local" -g @openai/codex@latest ;;
       *) npm_global @openai/codex@latest ;;
     esac
+    after=$(codex --version)
   fi
-  event done "Codex: $before -> $(codex --version)"
-else event skip 'Codex: not installed'; fi
-event begin Claude
-if command -v claude >/dev/null; then
-  before=$(claude --version)
-  if want claude; then claude update; fi
-  event done "Claude: $before -> $(claude --version)"
-else event skip 'Claude: not installed'; fi
+  event done "Codex: $before -> $after"
+}
+claude_step() {
+  if ! command -v claude >/dev/null; then event skip 'Claude: not installed'; return; fi
+  before=$(claude --version) after=$before
+  if want claude; then claude update; after=$(claude --version); fi
+  event done "Claude: $before -> $after"
+}
 t3_binary() {
   state="$HOME/.t3/runtime/service-state.json"
   if [ -f "$state" ] && systemctl --user cat t3code.service >/dev/null 2>&1; then
@@ -65,24 +68,50 @@ t3_binary() {
     printf '%s\n' "$binary"
   else command -v t3; fi
 }
-event begin T3
-binary=$(t3_binary)
-before=$("$binary" --version | sed 's/^t3 v//')
-if want t3; then
-  if systemctl cat t3.service >/dev/null 2>&1; then
-    npm_global "t3@${version:-nightly}"
-    sudo -n systemctl restart t3.service
-  elif [ -n "$version" ]; then "$binary" update --yes --allow-downgrade "$version"
-  else "$binary" update --yes --channel nightly; fi
+t3_step() {
+  binary=$(t3_binary)
+  before=$("$binary" --version | sed 's/^t3 v//') server=$before
+  if want t3; then
+    if systemctl cat t3.service >/dev/null 2>&1; then
+      npm_global "t3@${version:-nightly}"
+      sudo -n systemctl restart t3.service
+    elif [ -n "$version" ]; then "$binary" update --yes --allow-downgrade "$version"
+    else "$binary" update --yes --channel nightly; fi
+    binary=$(t3_binary)
+    if [ "$binary" != "$(command -v t3)" ]; then
+      mkdir -p "$HOME/.local/bin"
+      ln -sfn "$binary" "$HOME/.local/bin/t3"
+    fi
+    server=$("$binary" --version | sed 's/^t3 v//')
+  fi
+  printf '%s' "$server" > "$tmp/server"
+  event version "$server"
+  event done "T3: $before -> $server"
+}
+# Run a step in the background with errexit, tag its output, record its status.
+# Lines are cut to 3000 bytes so each printf is one write under PIPE_BUF (4096):
+# longer writes from parallel steps could interleave and split a @@t3up event.
+step() {
+  event begin "$1"
+  ( set +e; ( set -e; "$2" ); echo $? > "$tmp/$1" ) 2>&1 |
+    while IFS= read -r line || [ -n "$line" ]; do printf '%s| %.3000s\n' "$1" "$line"; done &
+}
+step Codex codex_step
+codex_pid=$!
+step Claude claude_step
+# Concurrent `npm install -g` into one prefix can corrupt it: if Codex and T3
+# would both install into the global prefix, let Codex finish first.
+if want codex && want t3 && systemctl cat t3.service >/dev/null 2>&1; then
+  case $(command -v codex || true) in "$HOME"/.local/*|'') ;; *) wait "$codex_pid" ;; esac
 fi
-binary=$(t3_binary)
-if want t3 && [ "$binary" != "$(command -v t3)" ]; then
-  mkdir -p "$HOME/.local/bin"
-  ln -sfn "$binary" "$HOME/.local/bin/t3"
-fi
-server=$("$binary" --version | sed 's/^t3 v//')
-event version "$server"
-event done "T3: $before -> $server"
+step T3 t3_step
+wait
+failed=0
+for name in Codex Claude T3; do
+  if [ "$(cat "$tmp/$name" 2>/dev/null)" != 0 ]; then event fail "$name"; failed=1; fi
+done
+[ "$failed" = 0 ] || exit 1
+server=$(cat "$tmp/server")
 event begin 'Health and desktop compatibility'
 healthy=0
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
@@ -154,7 +183,7 @@ class Host:
         self.status = 'idle'
 
     def reset(self, mode):
-        self.mode, self.status, self.stage, self.steps = mode, 'running', 'Connecting', {}
+        self.mode, self.status, self.steps = mode, 'running', {}
         self.error, self.version, self.log = '', '—', None
         self.started, self.elapsed = time.monotonic(), 0.0
 
@@ -186,7 +215,8 @@ async def run_job(h, mode, version, app, only, logs, emit):
     command = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2', h.name,
                shlex.join(['sh', '-s', '--', mode, version, app, only])]
-    complete, last, status = False, '', None
+    complete, status = False, None
+    last = {}  # latest output line per step tag ('' = untagged)
     process = None
     try:
         process = await asyncio.create_subprocess_exec(*command, stdin=PIPE, stdout=PIPE, stderr=STDOUT)
@@ -202,23 +232,28 @@ async def run_job(h, mode, version, app, only, logs, emit):
                 log.write(line)
                 log.flush()
                 text = clean(line)
+                # Parallel steps prefix their output with 'Codex| ', 'Claude| ' or 'T3| '.
+                tagged = re.match(r'(Codex|Claude|T3)\| ?(.*)', text)
+                tag, text = (tagged[1], tagged[2]) if tagged else ('', text)
                 if not text.startswith('@@t3up\t'):
                     if text:
-                        last = text
-                        h.lines.append(text)
-                        emit(h, 'line', text)
+                        last[tag] = last[''] = text
+                        h.lines.append(f'{tag}: {text}' if tag else text)
+                        emit(h, 'line', h.lines[-1])
                     continue
                 _, event, detail = text.split('\t', 2)
+                step = 'Health' if detail.startswith('Health') else detail.split(':', 1)[0]
                 if event == 'begin':
-                    h.stage = detail
-                    emit(h, 'stage', detail)
-                elif event in ('done', 'skip'):
-                    step = 'Health' if detail.startswith('Health') else detail.split(':', 1)[0]
-                    value = version_text(detail)
-                    if step == 'Health':
+                    h.steps[step] = ('begin', '')
+                    emit(h, 'stage', step)
+                elif event in ('done', 'skip', 'fail'):
+                    value = last.get(step, 'Failed') if event == 'fail' else version_text(detail)
+                    if event == 'done' and step == 'Health':
                         value = 'Online · desktop matches' if app else 'Online · desktop not detected'
+                    if event == 'fail':
+                        h.error = f'{step}: {value}'
                     h.steps[step] = (event, value)
-                    h.lines.append(f'{"✓" if event == "done" else "–"} {step}  {value}')
+                    h.lines.append(f'{ {"done": "✓", "skip": "–", "fail": "✗"}[event]} {step}  {value}')
                     emit(h, 'step', h.lines[-1])
                 elif event == 'version':
                     h.version = detail
@@ -226,14 +261,14 @@ async def run_job(h, mode, version, app, only, logs, emit):
                     complete = True
         status = await process.wait()
     except Exception as error:  # not CancelledError: quitting still propagates
-        last = f'{type(error).__name__}: {error}'
+        last[''] = f'{type(error).__name__}: {error}'
     finally:
         if process and process.returncode is None:
             process.terminate()
     ok = status == 0 and complete
     h.status, h.elapsed = ('ok' if ok else 'failed'), time.monotonic() - h.started
     if not ok:
-        h.error = last or f'Failed during {h.stage}'
+        h.error = h.error or last.get('') or 'Failed'
     emit(h, 'done', h.error)
 
 
@@ -262,19 +297,18 @@ class Card(Static, can_focus=True):
         table.add_column(width=6, style='#cbd5e1')
         table.add_column(ratio=1, no_wrap=True, overflow='ellipsis')
         for step in STEPS:
-            entry = h.steps.get(step)
-            current = h.stage.startswith(step)
-            if entry:
-                row = ('–', '#64748b', entry[1]) if entry[0] == 'skip' else ('✓', '#34d399', entry[1])
-            elif running and current:
+            event, value = h.steps.get(step, ('', ''))
+            if event == 'begin' and running:
                 row = (SPIN[int(now * 10) % 10], '#a5b4fc', 'Updating…' if h.mode == 'update' else 'Checking…')
-            elif h.status == 'failed' and current:
-                row = ('✗', '#fb7185', 'Failed')
+            elif event == 'begin' or event == 'fail':
+                row = ('✗', '#fb7185', value or 'Did not finish')
+            elif event:
+                row = ('–', '#64748b', value) if event == 'skip' else ('✓', '#34d399', value)
             else:
                 row = ('·', '#475569', '—')
             icon, style, value = row
             table.add_row(Text(icon, style=style), step,
-                          Text(value, style='#e2e8f0' if entry and entry[0] == 'done' else style))
+                          Text(value, style='#e2e8f0' if event == 'done' else style))
         if h.error:
             table.add_row(Text('!', style='#fb7185'), 'Error', Text(h.error, style='#fb7185'))
         elif running:
