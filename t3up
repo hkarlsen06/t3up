@@ -6,6 +6,7 @@ from asyncio.subprocess import PIPE, STDOUT
 from collections import Counter, deque
 from datetime import datetime
 import os
+import platform
 from pathlib import Path
 import plistlib
 import re
@@ -17,12 +18,14 @@ from rich.table import Table
 from rich.text import Text
 from textual.app import App, SystemCommand
 from textual.binding import Binding
-from textual.containers import Grid, Horizontal, Vertical
+from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Input, OptionList, RichLog, Static, TextArea
+from textual.theme import Theme
+from textual.widgets import Button, Footer, Input, OptionList, RichLog, Static
 from textual.widgets.option_list import Option
 
 VERSION = re.compile(r'[0-9][a-zA-Z0-9.+-]*')
+LOCAL = platform.node().split('.')[0]  # this machine, e.g. 'Ganz-Harbour'
 HOST = re.compile(r'[a-zA-Z0-9_][a-zA-Z0-9_.@:-]*')
 
 REMOTE = r'''set -eu
@@ -41,23 +44,38 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 # npm is installation tooling, not an update target. Its latest release may
 # require a newer Node than this host has; keep the working bundled version.
+# Missing tools are installed per user (~/.local/bin, no sudo) when selected for update.
+# Each step then reports whether the tool is signed in; t3up runs the login itself.
 codex_step() {
-  if ! command -v codex >/dev/null; then event skip 'Codex: not installed'; return; fi
-  before=$(codex --version) after=$before
-  if want codex; then
-    case $(command -v codex) in
-      "$HOME"/.local/*) npm install --prefix "$HOME/.local" -g @openai/codex@latest ;;
-      *) npm_global @openai/codex@latest ;;
-    esac
-    after=$(codex --version)
+  if ! command -v codex >/dev/null; then
+    want codex || { event skip 'Codex: not installed'; return; }
+    npm install --prefix "$HOME/.local" -g @openai/codex@latest
+    event done "Codex: none -> $(codex --version)"
+  else
+    before=$(codex --version) after=$before
+    if want codex; then
+      case $(command -v codex) in
+        "$HOME"/.local/*) npm install --prefix "$HOME/.local" -g @openai/codex@latest ;;
+        *) npm_global @openai/codex@latest ;;
+      esac
+      after=$(codex --version)
+    fi
+    event done "Codex: $before -> $after"
   fi
-  event done "Codex: $before -> $after"
+  codex login status </dev/null >/dev/null 2>&1 || event auth Codex
 }
 claude_step() {
-  if ! command -v claude >/dev/null; then event skip 'Claude: not installed'; return; fi
-  before=$(claude --version) after=$before
-  if want claude; then claude update; after=$(claude --version); fi
-  event done "Claude: $before -> $after"
+  if ! command -v claude >/dev/null; then
+    want claude || { event skip 'Claude: not installed'; return; }
+    curl -fsSL https://claude.ai/install.sh -o "$tmp/claude-install.sh"
+    bash "$tmp/claude-install.sh"
+    event done "Claude: none -> $(claude --version)"
+  else
+    before=$(claude --version) after=$before
+    if want claude; then claude update; after=$(claude --version); fi
+    event done "Claude: $before -> $after"
+  fi
+  claude auth status --json </dev/null 2>/dev/null | grep -q '"loggedIn": *true' || event auth Claude
 }
 t3_binary() {
   state="$HOME/.t3/runtime/service-state.json"
@@ -127,6 +145,13 @@ event done 'Health: OK; desktop version matches (when available)'
 event complete OK
 '''
 
+# Interactive sign-in per tool: Codex shows a code to enter in your browser, Claude asks for one.
+LOGIN = {'Codex': 'codex login --device-auth', 'Claude': 'claude auth login'}
+
+
+def login_command(name):
+    return f'PATH="$HOME/.local/bin:/usr/local/bin:$PATH" {LOGIN[name]}'
+
 
 def desktop_version():
     processes = subprocess.run(['ps', '-Ao', 'comm='], capture_output=True, text=True).stdout
@@ -168,12 +193,29 @@ def clean(text):
     return ''.join(c for c in text if c >= ' ' or c == '\t').strip()
 
 
+def short(version):
+    """'0.0.46-nightly.20261003.2623' -> '0.0.46-nightly': date and build number are noise."""
+    return re.sub(r'(-nightly)\.\d{8}\.\d+$', r'\1', version)
+
+
 def version_text(detail):
     """'Codex: codex-cli 1.0.0 -> codex-cli 1.1.0' -> '1.0.0 → 1.1.0'; unchanged -> '1.0.0'."""
     versions = re.findall(r'\d+\.\d+\.\d+(?:[-+][a-zA-Z0-9.+-]+)?', detail)
-    if len(versions) >= 2:
-        return versions[-1] if versions[0] == versions[-1] else f'{versions[0]} → {versions[-1]}'
-    return detail.split(': ', 1)[-1]
+    if len(versions) == 1 and ': none -> ' in detail:  # just installed
+        return f'new → {short(versions[0])}'
+    if len(versions) < 2:
+        return short(versions[0]) if versions else detail.split(': ', 1)[-1]
+    old, new = versions[0], versions[-1]
+    if old == new:
+        return short(new)
+    nightlies = [re.fullmatch(r'(.*-nightly)\.(\d{8})\.(\d+)', v) for v in (old, new)]
+    if short(old) != short(new) or not all(nightlies):
+        return f'{short(old)} → {short(new)}'
+    # Same version, different nightly: the fewest trailing digits that tell the builds apart.
+    (base, d1, b1), (_, d2, b2) = (m.groups() for m in nightlies)
+    a, b = (b1, b2) if b1 != b2 else (d1, d2)
+    k = next(k for k in range(1, len(a) + len(b)) if a[-k:] != b[-k:])
+    return f'{base} (…{a[-k:]} → …{b[-k:]})'
 
 
 class Host:
@@ -182,8 +224,8 @@ class Host:
         self.reset('')
         self.status = 'idle'
 
-    def reset(self, mode):
-        self.mode, self.status, self.steps = mode, 'running', {}
+    def reset(self, mode, only='all'):
+        self.mode, self.only, self.status, self.steps, self.auth = mode, only, 'running', {}, []
         self.error, self.version, self.log = '', '—', None
         self.started, self.elapsed = time.monotonic(), 0.0
 
@@ -207,7 +249,7 @@ async def read_lines(stream, limit=1 << 16):
 
 async def run_job(h, mode, version, app, only, logs, emit):
     """Run the remote script on one host; emit(host, kind, text) on every change."""
-    h.reset(mode)
+    h.reset(mode, only)
     logs.mkdir(parents=True, exist_ok=True)
     h.log = logs / f'{h.name}-{time.strftime("%H%M%S")}-{mode}.log'
     h.lines.append(f'── {mode}{" " + only if mode == "update" else ""} · {time.strftime("%H:%M:%S")} ──')
@@ -255,6 +297,10 @@ async def run_job(h, mode, version, app, only, logs, emit):
                     h.steps[step] = (event, value)
                     h.lines.append(f'{ {"done": "✓", "skip": "–", "fail": "✗"}[event]} {step}  {value}')
                     emit(h, 'step', h.lines[-1])
+                elif event == 'auth':
+                    h.auth.append(detail)
+                    h.lines.append(f'! {detail}  not signed in')
+                    emit(h, 'step', h.lines[-1])
                 elif event == 'version':
                     h.version = detail
                 elif event == 'complete':
@@ -275,7 +321,26 @@ async def run_job(h, mode, version, app, only, logs, emit):
 # ── Interactive app ─────────────────────────────────────────────────────────
 
 SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-STEPS = ('Codex', 'Claude', 'T3', 'Health')
+STEPS = ('T3', 'Codex', 'Claude', 'Health')
+# Graphite neutrals, one blue accent; green/amber/red only ever mean status.
+BG, SURFACE, LINE = '#16161a', '#1f1f24', '#34343c'
+TEXT, MUTED, DIM, FAINT = '#ececf1', '#a1a1ab', '#6e6e78', '#45454d'
+ACCENT, GREEN, AMBER, RED = '#82aaff', '#6fd39a', '#e5b567', '#f07178'
+THEME = Theme('t3up', primary=ACCENT, accent=ACCENT, success=GREEN, warning=AMBER, error=RED,
+              foreground=TEXT, background=BG, surface=SURFACE, panel=SURFACE, dark=True,
+              variables={'footer-key-foreground': ACCENT, 'footer-background': BG,
+                         'footer-item-background': BG, 'block-cursor-background': ACCENT + '33',
+                         'block-cursor-foreground': TEXT, 'block-cursor-text-style': 'none',
+                         'block-hover-background': ACCENT + '1a', 'border': ACCENT,
+                         'scrollbar': LINE, 'scrollbar-hover': FAINT, 'scrollbar-background': BG})
+
+
+def status(h, now):
+    """(icon, color, label) summarising a host, e.g. ('✓', GREEN, 'healthy')."""
+    if h.status == 'running':
+        return SPIN[int(now * 10) % 10], AMBER, 'updating' if h.mode == 'update' else 'checking'
+    return {'idle': ('·', DIM, 'not checked'), 'failed': ('✗', RED, 'failed'),
+            'ok': ('✓', GREEN, 'updated' if h.mode == 'update' else 'healthy')}[h.status]
 
 
 class Card(Static, can_focus=True):
@@ -295,36 +360,41 @@ class Card(Static, can_focus=True):
         running = h.status == 'running'
         table = Table.grid(expand=True, padding=(0, 1))
         table.add_column(width=1)
-        table.add_column(width=6, style='#cbd5e1')
+        table.add_column(width=6, style=MUTED)
         table.add_column(ratio=1, no_wrap=True, overflow='ellipsis')
-        for step in STEPS:
-            event, value = h.steps.get(step, ('', ''))
-            if event == 'begin' and running:
-                row = (SPIN[int(now * 10) % 10], '#a5b4fc', 'Updating…' if h.mode == 'update' else 'Checking…')
-            elif event == 'begin' or event == 'fail':
-                row = ('✗', '#fb7185', value or 'Did not finish')
-            elif event:
-                row = ('–', '#64748b', value) if event == 'skip' else ('✓', '#34d399', value)
-            else:
-                row = ('·', '#475569', '—')
-            icon, style, value = row
-            table.add_row(Text(icon, style=style), step,
-                          Text(value, style='#e2e8f0' if event == 'done' else style))
-        if h.error:
-            table.add_row(Text('!', style='#fb7185'), 'Error', Text(h.error, style='#fb7185'))
-        elif running:
-            table.add_row('', '', Text(h.lines[-1] if h.lines else '', style='#64748b'))
-        elif h.status != 'idle':
-            table.add_row('', '', Text(f'{h.mode} took {h.elapsed:.1f}s', style='#64748b'))
+        if h.status == 'failed' and not h.steps:  # never got as far as a step: just say why
+            table.add_row(Text('✗', style=RED), Text('Error', style=RED), Text(h.error, style=RED))
+            table.add_row('', '', '')
+            table.add_row('', '', Text('enter → retry or open a terminal', style=DIM))
+        else:
+            for step in STEPS:
+                event, value = h.steps.get(step, ('', ''))
+                if event == 'begin' and running:
+                    icon, style, value = SPIN[int(now * 10) % 10], AMBER, 'updating…' if h.mode == 'update' else 'checking…'
+                elif event in ('begin', 'fail'):
+                    icon, style, value = '✗', RED, value or 'did not finish'
+                elif event == 'skip':
+                    icon, style = '–', DIM
+                elif event:
+                    icon, style = '✓', GREEN
+                else:
+                    icon, style, value = '·', FAINT, ''
+                old, arrow, new = value.partition(' → ')  # an update: highlight the new version
+                text = Text.assemble((old, TEXT if event == 'done' else style),
+                                     (arrow, DIM), (new, f'bold {GREEN}'))
+                if step in h.auth:
+                    text.append('  not signed in', style=AMBER)
+                table.add_row(Text(icon, style=style), step, text)
+            if h.error:
+                table.add_row(Text('!', style=RED), Text('Error', style=RED), Text(h.error, style=RED))
+            elif running and h.lines:
+                table.add_row('', '', Text(h.lines[-1], style=DIM))
         self.update(table)
+        icon, color, label = status(h, now)
         elapsed = now - h.started if running else h.elapsed
+        took = '' if h.status == 'idle' else f'  [{DIM}]{elapsed:.{0 if running else 1}f}s[/]'
         self.border_title = f' {h.name} '
-        self.border_subtitle = {
-            'idle': ' IDLE ',
-            'running': f' {"UPDATING" if h.mode == "update" else "CHECKING"} {elapsed:.0f}s ',
-            'ok': ' UPDATED ' if h.mode == 'update' else ' HEALTHY ',
-            'failed': ' FAILED ',
-        }[h.status]
+        self.border_subtitle = f' [{color}]{icon} {label}[/]{took} '
         self.set_classes(h.status)
 
 
@@ -337,15 +407,25 @@ class Dialog(ModalScreen):
 
 
 class Menu(Dialog):
-    def __init__(self, title, options):
+    """Options are (id, icon, label, detail) tuples; a plain string starts a section."""
+    def __init__(self, heading, options):
         super().__init__()
-        self.heading, self.options = title, options
+        self.heading, self.options = heading, options
 
     def compose(self):
+        def row(item):
+            if isinstance(item, str):
+                gap = '' if item is self.options[0] else '\n'
+                return Option(Text(gap + item.upper(), style=f'bold {DIM}'), disabled=True)
+            key, icon, label, detail = item
+            return Option(Text.assemble((f'{icon} ', ACCENT), (f'{label:<16}', 'bold'), (detail, MUTED)), id=key)
         with Vertical():
             yield Static(self.heading, classes='heading')
-            yield OptionList(*(Option(label, id=key) for key, label in self.options))
-            yield Static('click or ↑↓ + enter to choose · esc cancel', classes='hint')
+            yield OptionList(*map(row, self.options))
+            yield Static('↑↓ move · enter choose · esc close', classes='hint')
+
+    def on_mount(self):
+        self.query_one(OptionList).action_first()  # skip the section header
 
     def on_option_list_option_selected(self, event):
         self.dismiss(event.option.id)
@@ -370,75 +450,127 @@ class VersionPrompt(Dialog):
             self.dismiss(value)
 
 
-class ServersEditor(ModalScreen):
-    BINDINGS = [('escape', 'dismiss', 'Close'), ('ctrl+s', 'save', 'Save')]
+class ServersEditor(Dialog):
+    """Add/remove servers. Each change is written straight to the servers file, editing only
+    that host's line, so the file's own comments survive. Closing applies the list."""
+    def __init__(self):
+        super().__init__()
+        try:
+            self.text = servers_file().read_text()
+        except OSError:
+            self.text = '# t3up servers: one SSH alias or user@host per line.\n'
+        self.hosts = parse_servers(self.text)
 
     def compose(self):
-        try:
-            text = servers_file().read_text()
-        except OSError:
-            text = '# One SSH alias or user@host per line. Blank lines and # comments are ignored.\n'
-        unused = [h for h in ssh_hosts() if h not in text.split()]
+        unused = [h for h in ssh_hosts() if h not in self.hosts]
         with Vertical():
-            yield Static(f'Servers · {servers_file()}', classes='heading')
-            yield TextArea(text, soft_wrap=False)
+            yield Static(Text.assemble(('Servers', 'bold'), (f'   {len(self.hosts)}', DIM)), classes='heading')
+            with VerticalScroll(id='server-list'):
+                for host in self.hosts:
+                    with Horizontal(classes='server'):
+                        yield Static(host)
+                        yield Button('✕ Remove', name=host, classes='remove', compact=True)
+                if not self.hosts:
+                    yield Static('No servers yet. Add one below.', classes='hint')
+            with Horizontal(id='add-row'):
+                yield Input(placeholder='SSH alias or user@host', id='new-server')
+                yield Button('+ Add', variant='primary', id='add', compact=True)
             if unused:
-                yield Static(f'From ~/.ssh/config: {", ".join(unused)}', classes='hint')
-            yield Static('one SSH host per line · ctrl+s save · esc cancel', classes='hint')
-            with Horizontal():
-                yield Button('Save', variant='primary', id='save')
-                yield Button('Cancel', id='cancel')
+                with Horizontal(id='suggestions'):
+                    yield Static('From ~/.ssh/config', classes='hint')
+                    for host in unused:
+                        yield Button(f'+ {host}', name=host, classes='suggest', compact=True)
+            yield Static('esc or click outside when done', classes='hint')
 
-    def on_button_pressed(self, event):
-        self.action_save() if event.button.id == 'save' else self.dismiss()
+    def on_mount(self):
+        self.query_one(Input).focus()
 
-    def action_save(self):
-        text = self.query_one(TextArea).text
-        try:
-            hosts = parse_servers(text)
-        except ValueError as error:
-            self.notify(str(error), severity='error')
-            return
+    def write(self, text):
         path = servers_file()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text.rstrip('\n') + '\n')
-        self.dismiss(hosts)
+        self.text, self.hosts = text, parse_servers(text)
+        self.refresh(recompose=True)
+        self.call_after_refresh(lambda: self.query_one(Input).focus())
+
+    def add(self, host):
+        host = host.strip()
+        if not HOST.fullmatch(host):
+            self.notify(f'{host!r} is not an SSH host', severity='error')
+        elif host in self.hosts:
+            self.notify(f'{host} is already in the list', severity='warning')
+        else:
+            self.write(self.text.rstrip('\n') + '\n' + host)
+
+    def on_input_submitted(self, event):
+        self.add(event.value)
+
+    def on_button_pressed(self, event):
+        button = event.button
+        if button.id == 'add':
+            self.add(self.query_one(Input).value)
+        elif button.has_class('suggest'):
+            self.add(button.name)
+        elif button.has_class('remove'):
+            self.write('\n'.join(line for line in self.text.splitlines()
+                                 if line.split('#', 1)[0].strip() != button.name))
+
+    def dismiss(self, result=None):  # esc, backdrop click: always hand back the list
+        return super().dismiss(self.hosts)
 
 
 class T3Up(App):
     TITLE = 't3up'
     CSS = '''
-    Screen { background: #0b1120; }
-    #top { height: 3; padding: 1 2; background: #111827; }
+    #bar { height: 3; padding: 0 2; background: $surface; }
+    #top { width: 1fr; padding-top: 1; }
+    #update-all, #update-all:hover, #update-all:focus, #update-all.-active {
+        min-width: 26; margin-left: 3; border: round $accent; background: transparent; color: $accent;
+        text-style: bold; tint: transparent; }
+    #update-all:hover { border: round $accent-lighten-2; color: $accent-lighten-2; }
+    #update-all:disabled { border: round $panel-lighten-2; color: $text-disabled; }
     #cards { grid-size: 1; grid-gutter: 1 2; grid-rows: 7; padding: 1 2; height: 1fr; overflow-y: auto;
              scrollbar-size-vertical: 1; }
-    Card { height: 7; padding: 0 1; border: round #475569; border-title-color: #e2e8f0;
-           border-title-style: bold; border-subtitle-color: #64748b; }
-    Card.running { border: round #818cf8; border-subtitle-color: #a5b4fc; }
-    Card.ok { border: round #34d399; border-subtitle-color: #34d399; }
-    Card.failed { border: round #fb7185; border-subtitle-color: #fb7185; }
-    Card:focus { border: round #f59e0b; border-title-color: #f59e0b; }
-    RichLog { height: 45%; margin: 0 2; border: round #475569; border-title-color: #94a3b8;
-              background: #0b1120; display: none; }
+    Card { height: 7; padding: 0 1; border: round $panel-lighten-2; border-title-color: $foreground;
+           border-title-style: bold; }
+    Card.failed { border: round $error 60%; }
+    Card:focus { border: round $accent; border-title-color: $accent; }
+    RichLog { height: 45%; margin: 0 2; border: round $panel-lighten-2; border-title-color: $text-muted;
+              display: none; }
     RichLog.shown { display: block; }
-    Menu, VersionPrompt, ServersEditor { align: center middle; background: #0b1120 70%; }
-    Menu > Vertical, VersionPrompt > Vertical, ServersEditor > Vertical { width: 60; height: auto;
-              padding: 1 2; border: round #818cf8; background: #111827; }
-    ServersEditor TextArea { height: 8; }
+    Menu, VersionPrompt, ServersEditor { align: center middle; background: $background 70%; }
+    Menu > Vertical, VersionPrompt > Vertical, ServersEditor > Vertical { width: 64; height: auto;
+              padding: 1 2; border: round $accent 50%; background: $surface; }
+    #server-list { height: auto; max-height: 12; }
+    .server { height: 1; padding: 0 1; }
+    .server:hover { background: $boost; }
+    .server Static { width: 1fr; }
+    ServersEditor Button.remove { color: #6e6e78; background: transparent; text-style: none; }
+    ServersEditor Button.remove:hover, ServersEditor Button.remove:focus { color: $error; }
+    #add-row, #suggestions { height: auto; margin-top: 1; }
+    Input { border: round $panel-lighten-2; background: transparent; }
+    Input:focus { border: round $accent; }
+    #add-row Input { width: 1fr; }
+    ServersEditor #add, ServersEditor #add:hover, ServersEditor #add:focus {
+        margin-left: 1; height: 3; min-width: 10; border: round $accent; background: transparent;
+        color: $accent; text-style: bold; }
+    #suggestions .hint { width: auto; margin: 0 1 0 0; }
+    ServersEditor Button.suggest { margin-right: 1; background: transparent; color: $accent; }
+    ServersEditor Button.suggest:hover { text-style: bold underline; }
     .heading { text-style: bold; margin-bottom: 1; }
-    .hint { color: #64748b; margin-top: 1; }
-    OptionList { height: auto; border: none; background: #111827; }
-    ServersEditor Horizontal { height: auto; margin-top: 1; }
-    ServersEditor Button { margin-right: 2; }
+    .hint { color: #6e6e78; margin-top: 1; }
+    OptionList, OptionList:focus { height: auto; border: none; padding: 0; background: $surface;
+                                   background-tint: transparent; }
+    OptionList > .option-list--option { padding: 0 1; }
     '''
     BINDINGS = [
         Binding('enter', 'open', 'Actions'),
         Binding('r', 'refresh', 'Refresh'),
-        Binding('u', 'update', 'Update server'),
+        Binding('u', 'update', 'Update server', show=False),
         Binding('a', 'update_all', 'Update all'),
         Binding('v', 'version', 'T3 version'),
-        Binding('l', 'logs', 'Output'),
-        Binding('s', 'ssh', 'SSH'),
+        Binding('l', 'logs', 'Output', show=False),
+        Binding('s', 'ssh', 'SSH', show=False),
         Binding('e', 'servers', 'Servers'),
         Binding('q', 'quit', 'Quit'),
         Binding('ctrl+c', 'quit', show=False, priority=True),
@@ -450,21 +582,28 @@ class T3Up(App):
 
     def __init__(self, names, logs):
         super().__init__()
+        self.register_theme(THEME)
+        self.theme = 't3up'
         self.names, self.hosts, self.cards = names, [], {}
         self.logs, self.target, self.desktop = logs, '', desktop_version()
         self.selected, self.quit_armed = None, 0.0
         # Direct refs, so the 0.1s tick can't hit a NoMatches while the app tears down.
         self.top, self.grid = Static(id='top'), Grid(id='cards')
+        self.update_all = Button('↑  Update all servers', variant='primary', id='update-all')
+        self.update_all.can_focus = False  # keyboard stays on the cards; 'a' does the same
         self.output = RichLog(wrap=True, markup=False, highlight=False)
         self.output.can_focus = False
 
     def compose(self):
-        yield self.top
+        with Horizontal(id='bar'):
+            yield self.top
+            yield self.update_all
         yield self.grid
         yield self.output
         yield Footer()
 
     async def on_mount(self):
+        self.terminal_lock = asyncio.Lock()  # here, not __init__: Python 3.9 binds locks to the current loop
         self.set_interval(0.1, self.tick)
         await self.set_hosts(self.names)
         if not self.hosts:
@@ -480,6 +619,7 @@ class T3Up(App):
         for card in self.cards.values():
             card.show()
         self.fit(self.size.width)
+        self.update_all.disabled = not self.hosts
         if self.hosts:
             if self.selected not in self.hosts:
                 self.selected = self.hosts[0]
@@ -500,12 +640,13 @@ class T3Up(App):
             if h.status == 'running':
                 self.cards[h.name].show()
         counts = Counter(h.status for h in self.hosts)
-        left = Text.assemble((' T3 ', 'bold white on #6366f1'), (' UP ', 'bold #a5b4fc'),
-                             (f'  desktop {self.desktop or "not detected"}  ·  target {self.target or "nightly"}', '#94a3b8'))
+        left = Text.assemble((' t3up ', f'bold {BG} on {ACCENT}'), ('   On ', DIM), (LOCAL, TEXT),
+                             ('   Desktop ', DIM), (short(self.desktop) or 'not detected', TEXT),
+                             *((('   Installs ', DIM), (self.target, AMBER)) if self.target else ()))  # pinned only
         right = Text()
-        for status, style in (('running', '#a5b4fc'), ('ok', '#34d399'), ('failed', '#fb7185')):
-            if counts[status]:
-                right.append(f'  ● {counts[status]} {status}', style=style)
+        for key, style, label in (('running', AMBER, 'busy'), ('ok', GREEN, 'ok'), ('failed', RED, 'failed')):
+            if counts[key]:
+                right.append(f'  ● {counts[key]} {label}', style=style)
         top = Table.grid(expand=True)
         top.add_column(ratio=1, no_wrap=True, overflow='ellipsis')
         top.add_column(justify='right', no_wrap=True)
@@ -529,6 +670,9 @@ class T3Up(App):
             elif kind in ('line', 'step'):
                 self.output.write(text)
         if kind == 'done':
+            logins = [name for name in h.auth if h.mode == 'update' and h.only in ('all', name.lower())]
+            if logins:
+                self.run_worker(self.sign_in(h, logins))
             if h.status == 'failed':
                 self.notify(f'{h.name}: {h.error}', title='Failed', severity='error', timeout=8)
             elif h.mode == 'update':
@@ -545,7 +689,7 @@ class T3Up(App):
             if h.status != 'running':
                 self.run_worker(run_job(h, mode, self.target, self.desktop, only, self.logs, self.emit))
 
-    def update_menu(self, hosts, title, extra=()):
+    def update_menu(self, hosts, heading, extra=()):
         def chosen(choice):
             if choice == 'check':
                 self.start(hosts, 'check')
@@ -555,15 +699,21 @@ class T3Up(App):
                 self.action_logs()
             elif choice:
                 self.start(hosts, 'update', choice)
-        target = self.target or 'nightly'
-        self.push_screen(Menu(title, [
-            ('all', f'Everything  (T3 → {target}, Codex, Claude)'),
-            ('t3', f'T3 server only  → {target}'),
-            ('codex', 'Codex CLI only  → latest'),
-            ('claude', 'Claude Code only  → latest'),
-            ('check', 'Just check versions and health'),
+        target = self.target or 'latest nightly'
+        self.push_screen(Menu(heading, [
+            'Update',
+            ('all', '↑', 'Everything', 'T3, Codex and Claude'),
+            ('t3', '↑', 'T3 server', f'→ {target}'),
+            ('codex', '↑', 'Codex CLI', '→ latest'),
+            ('claude', '↑', 'Claude Code', '→ latest'),
+            'Inspect',
+            ('check', '↻', 'Check again', 'versions and health, changes nothing'),
             *extra,
         ]), chosen)
+
+    def on_button_pressed(self, event):
+        if event.button is self.update_all:
+            self.action_update_all()
 
     def action_move(self, dx, dy):
         # Spatial grid movement: up/down jump a whole row, clamped to the first/last card.
@@ -575,17 +725,18 @@ class T3Up(App):
         self.start(self.hosts, 'check')
 
     def action_open(self):
-        shown = self.output.has_class('shown')
-        self.update_menu([self.selected], self.selected.name, [
-            ('ssh', 'Open a terminal on this server  (type exit to come back)'),
-            ('logs', 'Hide output' if shown else 'Show output'),
+        h = self.selected
+        icon, color, label = status(h, time.monotonic())
+        self.update_menu([h], Text.assemble((h.name, 'bold'), '   ', (f'{icon} {label}', color)), [
+            ('logs', '≡', 'Hide output' if self.output.has_class('shown') else 'Show output', 'live log below'),
+            ('ssh', '›', 'Terminal', 'ssh in · type exit to return'),
         ])
 
     def action_update(self):
-        self.update_menu([self.selected], f'Update {self.selected.name}')
+        self.update_menu([self.selected], Text(self.selected.name, style='bold'))
 
     def action_update_all(self):
-        self.update_menu(self.hosts, f'Update all {len(self.hosts)} servers in parallel')
+        self.update_menu(self.hosts, Text.assemble(('All servers', 'bold'), (f'   {len(self.hosts)} in parallel', MUTED)))
 
     def action_version(self):
         def chosen(value):
@@ -596,9 +747,8 @@ class T3Up(App):
 
     def action_servers(self):
         async def saved(names):
-            if names is not None:
+            if names != [h.name for h in self.hosts]:
                 await self.set_hosts(names)
-                self.notify(f'Saved {len(names)} server(s)')
         self.push_screen(ServersEditor(), saved)
 
     def action_logs(self):
@@ -611,9 +761,22 @@ class T3Up(App):
         self.run_worker(self.ssh_session(host.name))
 
     async def ssh_session(self, name):
-        # Jobs keep reading output meanwhile; batch_update stops redraws over the shell.
-        with self.batch_update(), self.suspend():
-            await (await asyncio.create_subprocess_exec('ssh', name)).wait()
+        await self.terminal('ssh', name)
+
+    async def sign_in(self, h, names):
+        for name in names:
+            await self.terminal('ssh', '-t', h.name, login_command(name),
+                                banner=f'Sign in to {name} on {h.name}. You come back here when it finishes.')
+        self.start([h], 'check')  # show the new sign-in state
+
+    async def terminal(self, *command, banner=''):
+        """Hand the real terminal to command; one at a time, so logins on several servers queue up."""
+        async with self.terminal_lock:
+            # Jobs keep reading output meanwhile; batch_update stops redraws over the shell.
+            with self.batch_update(), self.suspend():
+                if banner:
+                    print(f'\n  {banner}\n', flush=True)
+                await (await asyncio.create_subprocess_exec(*command)).wait()
 
     def action_quit(self):
         busy = sum(h.status == 'running' for h in self.hosts)
@@ -646,10 +809,14 @@ async def headless(names, args, app, logs):
             print(f'{h.name:<{width}}  {text}', flush=True)
         elif kind == 'done' and h.status == 'failed':
             print(f'{h.name:<{width}}  ✗ {h.error}\n{h.name:<{width}}  log: {h.log}', flush=True)
+        if kind == 'done':
+            for name in h.auth:
+                print(f'{h.name:<{width}}  ! {name} not signed in; run: '
+                      f'ssh -t {h.name} {shlex.quote(login_command(name))}', flush=True)
 
     hosts = [Host(name) for name in names]
     mode = 'check' if args.check else 'update'
-    print(f'\nT3UP · {mode} · {len(hosts)} servers in parallel\n')
+    print(f'\nT3UP · {mode} · {len(hosts)} servers in parallel · from {LOCAL}\n')
     await asyncio.gather(*(run_job(h, mode, args.version, app, args.only or 'all', logs, emit) for h in hosts))
     print('\nRESULTS')
     for h in hosts:
