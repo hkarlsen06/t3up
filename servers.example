@@ -1,0 +1,4 @@
+# One SSH alias or user@host per line. Blank lines and # comments are ignored.
+# Add a server here after configuring key-based SSH access.
+my-server
+user@203.0.113.10

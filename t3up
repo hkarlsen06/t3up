@@ -1,0 +1,563 @@
+#!/Users/hkarlsen06/.local/share/t3up/venv/bin/python
+"""t3up: full-screen dashboard for checking and updating T3 coding servers over SSH."""
+import argparse
+import asyncio
+from asyncio.subprocess import PIPE, STDOUT
+from collections import Counter, deque
+from datetime import datetime
+import os
+from pathlib import Path
+import plistlib
+import re
+import shlex
+import subprocess
+import sys
+import time
+from rich.table import Table
+from rich.text import Text
+from textual.app import App, SystemCommand
+from textual.binding import Binding
+from textual.containers import Grid, Vertical
+from textual.screen import ModalScreen
+from textual.widgets import Footer, Input, OptionList, RichLog, Static
+from textual.widgets.option_list import Option
+
+VERSION = re.compile(r'[0-9][a-zA-Z0-9.+-]*')
+
+REMOTE = r'''set -eu
+PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+export PATH
+mode=$1 version=$2 app=$3 only=${4:-all}
+# Update a component only in update mode and when it was selected.
+want() { [ "$mode" = update ] && case ",$only," in *,all,*|*",$1,"*) true ;; *) false ;; esac; }
+event() { printf '\n@@t3up\t%s\t%s\n' "$1" "$2"; }
+npm_global() {
+  if [ -w "$(npm prefix -g)" ]; then npm install -g "$@"
+  else sudo -n npm install -g "$@"; fi
+}
+command -v t3 >/dev/null
+# npm is installation tooling, not an update target. Its latest release may
+# require a newer Node than this host has; keep the working bundled version.
+event begin Codex
+if command -v codex >/dev/null; then
+  before=$(codex --version)
+  if want codex; then
+    case $(command -v codex) in
+      "$HOME"/.local/*) npm install --prefix "$HOME/.local" -g @openai/codex@latest ;;
+      *) npm_global @openai/codex@latest ;;
+    esac
+  fi
+  event done "Codex: $before -> $(codex --version)"
+else event skip 'Codex: not installed'; fi
+event begin Claude
+if command -v claude >/dev/null; then
+  before=$(claude --version)
+  if want claude; then claude update; fi
+  event done "Claude: $before -> $(claude --version)"
+else event skip 'Claude: not installed'; fi
+t3_binary() {
+  state="$HOME/.t3/runtime/service-state.json"
+  if [ -f "$state" ] && systemctl --user cat t3code.service >/dev/null 2>&1; then
+    active=$(node -e 'const s=require(process.argv[1]); if (!/^[0-9][a-zA-Z0-9.+-]*$/.test(s.activeVersion)) process.exit(1); process.stdout.write(s.activeVersion)' "$state")
+    binary="$HOME/.t3/runtime/versions/$active/t3"
+    [ -x "$binary" ] || { echo 'Active T3 executable is missing' >&2; return 1; }
+    printf '%s\n' "$binary"
+  else command -v t3; fi
+}
+event begin T3
+binary=$(t3_binary)
+before=$("$binary" --version | sed 's/^t3 v//')
+if want t3; then
+  if systemctl cat t3.service >/dev/null 2>&1; then
+    npm_global "t3@${version:-nightly}"
+    sudo -n systemctl restart t3.service
+  elif [ -n "$version" ]; then "$binary" update --yes --allow-downgrade "$version"
+  else "$binary" update --yes --channel nightly; fi
+fi
+binary=$(t3_binary)
+if want t3 && [ "$binary" != "$(command -v t3)" ]; then
+  mkdir -p "$HOME/.local/bin"
+  ln -sfn "$binary" "$HOME/.local/bin/t3"
+fi
+server=$("$binary" --version | sed 's/^t3 v//')
+event version "$server"
+event done "T3: $before -> $server"
+event begin 'Health and desktop compatibility'
+healthy=0
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  if curl --max-time 3 -fsS -o /dev/null http://127.0.0.1:3773/ 2>/dev/null; then healthy=1; break; fi
+  sleep 1
+done
+[ "$healthy" -eq 1 ] || { echo 'T3 health check failed on localhost:3773' >&2; exit 1; }
+if [ -n "$app" ] && [ "$server" != "$app" ]; then
+  echo "Desktop $app differs from server $server. Update the desktop or run t3up $app." >&2
+  exit 1
+fi
+event done 'Health: OK; desktop version matches (when available)'
+event complete OK
+'''
+
+
+def desktop_version():
+    processes = subprocess.run(['ps', '-Ao', 'comm='], capture_output=True, text=True).stdout
+    match = re.search(r'^(/Applications/T3 Code[^/]*\.app)', processes, re.M)
+    bundle = match[1] if match else '/Applications/T3 Code (Nightly).app'
+    try:
+        with open(bundle + '/Contents/Info.plist', 'rb') as file:
+            return plistlib.load(file).get('CFBundleShortVersionString', '')
+    except (OSError, plistlib.InvalidFileException):
+        return ''
+
+
+def clean(text):
+    text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
+    return ''.join(c for c in text if c >= ' ' or c == '\t').strip()
+
+
+def version_text(detail):
+    """'Codex: codex-cli 1.0.0 -> codex-cli 1.1.0' -> '1.0.0 → 1.1.0'; unchanged -> '1.0.0'."""
+    versions = re.findall(r'\d+\.\d+\.\d+(?:[-+][a-zA-Z0-9.+-]+)?', detail)
+    if len(versions) >= 2:
+        return versions[-1] if versions[0] == versions[-1] else f'{versions[0]} → {versions[-1]}'
+    return detail.split(': ', 1)[-1]
+
+
+class Host:
+    def __init__(self, name):
+        self.name, self.lines = name, deque(maxlen=2000)
+        self.reset('')
+        self.status = 'idle'
+
+    def reset(self, mode):
+        self.mode, self.status, self.stage, self.steps = mode, 'running', 'Connecting', {}
+        self.error, self.version, self.log = '', '—', None
+        self.started, self.elapsed = time.monotonic(), 0.0
+
+
+async def read_lines(stream, limit=1 << 16):
+    """Yield output lines split on \\n or \\r; overlong lines are cut, never fatal."""
+    buffer = b''
+    while True:
+        chunk = await stream.read(limit)
+        if not chunk:
+            break
+        *lines, buffer = re.split(rb'[\r\n]', buffer + chunk)
+        if len(buffer) > limit:
+            lines.append(buffer)
+            buffer = b''
+        for line in lines:
+            yield line
+    if buffer:
+        yield buffer
+
+
+async def run_job(h, mode, version, app, only, logs, emit):
+    """Run the remote script on one host; emit(host, kind, text) on every change."""
+    h.reset(mode)
+    logs.mkdir(parents=True, exist_ok=True)
+    h.log = logs / f'{h.name}-{time.strftime("%H%M%S")}-{mode}.log'
+    h.lines.append(f'── {mode}{" " + only if mode == "update" else ""} · {time.strftime("%H:%M:%S")} ──')
+    emit(h, 'start', h.lines[-1])
+    command = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+               '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2', h.name,
+               shlex.join(['sh', '-s', '--', mode, version, app, only])]
+    complete, last, status = False, '', None
+    process = None
+    try:
+        process = await asyncio.create_subprocess_exec(*command, stdin=PIPE, stdout=PIPE, stderr=STDOUT)
+        try:
+            process.stdin.write(REMOTE.encode())
+            await process.stdin.drain()
+            process.stdin.close()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        with h.log.open('w') as log:
+            async for raw in read_lines(process.stdout):
+                line = raw.decode(errors='replace') + '\n'
+                log.write(line)
+                log.flush()
+                text = clean(line)
+                if not text.startswith('@@t3up\t'):
+                    if text:
+                        last = text
+                        h.lines.append(text)
+                        emit(h, 'line', text)
+                    continue
+                _, event, detail = text.split('\t', 2)
+                if event == 'begin':
+                    h.stage = detail
+                    emit(h, 'stage', detail)
+                elif event in ('done', 'skip'):
+                    step = 'Health' if detail.startswith('Health') else detail.split(':', 1)[0]
+                    value = version_text(detail)
+                    if step == 'Health':
+                        value = 'Online · desktop matches' if app else 'Online · desktop not detected'
+                    h.steps[step] = (event, value)
+                    h.lines.append(f'{"✓" if event == "done" else "–"} {step}  {value}')
+                    emit(h, 'step', h.lines[-1])
+                elif event == 'version':
+                    h.version = detail
+                elif event == 'complete':
+                    complete = True
+        status = await process.wait()
+    except Exception as error:  # not CancelledError: quitting still propagates
+        last = f'{type(error).__name__}: {error}'
+    finally:
+        if process and process.returncode is None:
+            process.terminate()
+    ok = status == 0 and complete
+    h.status, h.elapsed = ('ok' if ok else 'failed'), time.monotonic() - h.started
+    if not ok:
+        h.error = last or f'Failed during {h.stage}'
+    emit(h, 'done', h.error)
+
+
+# ── Interactive app ─────────────────────────────────────────────────────────
+
+SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+STEPS = ('Codex', 'Claude', 'T3', 'Health')
+
+
+class Card(Static, can_focus=True):
+    def __init__(self, host):
+        super().__init__()
+        self.host = host
+
+    def on_focus(self):
+        self.app.select(self.host)
+
+    def on_click(self):
+        self.focus()
+
+    def show(self):
+        h, now = self.host, time.monotonic()
+        running = h.status == 'running'
+        table = Table.grid(expand=True, padding=(0, 1))
+        table.add_column(width=1)
+        table.add_column(width=6, style='#cbd5e1')
+        table.add_column(ratio=1, no_wrap=True, overflow='ellipsis')
+        for step in STEPS:
+            entry = h.steps.get(step)
+            current = h.stage.startswith(step)
+            if entry:
+                row = ('–', '#64748b', entry[1]) if entry[0] == 'skip' else ('✓', '#34d399', entry[1])
+            elif running and current:
+                row = (SPIN[int(now * 10) % 10], '#a5b4fc', 'Updating…' if h.mode == 'update' else 'Checking…')
+            elif h.status == 'failed' and current:
+                row = ('✗', '#fb7185', 'Failed')
+            else:
+                row = ('·', '#475569', '—')
+            icon, style, value = row
+            table.add_row(Text(icon, style=style), step,
+                          Text(value, style='#e2e8f0' if entry and entry[0] == 'done' else style))
+        if h.error:
+            table.add_row(Text('!', style='#fb7185'), 'Error', Text(h.error, style='#fb7185'))
+        elif running:
+            table.add_row('', '', Text(h.lines[-1] if h.lines else '', style='#64748b'))
+        elif h.status != 'idle':
+            table.add_row('', '', Text(f'{h.mode} took {h.elapsed:.1f}s', style='#64748b'))
+        self.update(table)
+        elapsed = now - h.started if running else h.elapsed
+        self.border_title = f' {h.name} '
+        self.border_subtitle = {
+            'idle': ' IDLE ',
+            'running': f' {"UPDATING" if h.mode == "update" else "CHECKING"} {elapsed:.0f}s ',
+            'ok': ' UPDATED ' if h.mode == 'update' else ' HEALTHY ',
+            'failed': ' FAILED ',
+        }[h.status]
+        self.set_classes(h.status)
+
+
+class Menu(ModalScreen):
+    BINDINGS = [('escape', 'dismiss', 'Close')]
+
+    def __init__(self, title, options):
+        super().__init__()
+        self.heading, self.options = title, options
+
+    def compose(self):
+        with Vertical():
+            yield Static(self.heading, classes='heading')
+            yield OptionList(*(Option(label, id=key) for key, label in self.options))
+            yield Static('↑↓ choose · enter run · esc cancel', classes='hint')
+
+    def on_option_list_option_selected(self, event):
+        self.dismiss(event.option.id)
+
+
+class VersionPrompt(ModalScreen):
+    BINDINGS = [('escape', 'dismiss', 'Close')]
+
+    def __init__(self, current):
+        super().__init__()
+        self.current = current
+
+    def compose(self):
+        with Vertical():
+            yield Static('T3 version to install', classes='heading')
+            yield Input(self.current, placeholder='blank = latest nightly')
+            yield Static('e.g. 0.0.46-nightly.20261003.2623 · enter save · esc cancel', classes='hint')
+
+    def on_input_submitted(self, event):
+        value = event.value.strip()
+        if value and not VERSION.fullmatch(value):
+            self.notify('Not a valid version', severity='error')
+        else:
+            self.dismiss(value)
+
+
+class T3Up(App):
+    TITLE = 't3up'
+    CSS = '''
+    Screen { background: #0b1120; }
+    #top { height: 3; padding: 1 2; background: #111827; }
+    #cards { grid-size: 1; grid-gutter: 1 2; grid-rows: 7; padding: 1 2; height: 1fr; overflow-y: auto;
+             scrollbar-size-vertical: 1; }
+    Card { height: 7; padding: 0 1; border: round #475569; border-title-color: #e2e8f0;
+           border-title-style: bold; border-subtitle-color: #64748b; }
+    Card.running { border: round #818cf8; border-subtitle-color: #a5b4fc; }
+    Card.ok { border: round #34d399; border-subtitle-color: #34d399; }
+    Card.failed { border: round #fb7185; border-subtitle-color: #fb7185; }
+    Card:focus { border: round #f59e0b; border-title-color: #f59e0b; }
+    RichLog { height: 45%; margin: 0 2; border: round #475569; border-title-color: #94a3b8;
+              background: #0b1120; display: none; }
+    RichLog.shown { display: block; }
+    Menu, VersionPrompt { align: center middle; background: #0b1120 70%; }
+    Menu > Vertical, VersionPrompt > Vertical { width: 60; height: auto; padding: 1 2;
+              border: round #818cf8; background: #111827; }
+    .heading { text-style: bold; margin-bottom: 1; }
+    .hint { color: #64748b; margin-top: 1; }
+    OptionList { height: auto; border: none; background: #111827; }
+    '''
+    BINDINGS = [
+        Binding('r', 'refresh', 'Refresh'),
+        Binding('u', 'update', 'Update server'),
+        Binding('a', 'update_all', 'Update all'),
+        Binding('v', 'version', 'T3 version'),
+        Binding('l', 'logs', 'Output'),
+        Binding('s', 'ssh', 'SSH'),
+        Binding('q', 'quit', 'Quit'),
+        Binding('ctrl+c', 'quit', show=False, priority=True),
+        Binding('left', 'move(-1, 0)', show=False),
+        Binding('right', 'move(1, 0)', show=False),
+        Binding('up,k', 'move(0, -1)', show=False),
+        Binding('down,j', 'move(0, 1)', show=False),
+    ]
+
+    def __init__(self, names, logs):
+        super().__init__()
+        self.hosts = [Host(name) for name in names]
+        self.cards = {h.name: Card(h) for h in self.hosts}
+        self.logs, self.target, self.desktop = logs, '', desktop_version()
+        self.selected, self.quit_armed = self.hosts[0], 0.0
+        # Direct refs, so the 0.1s tick can't hit a NoMatches while the app tears down.
+        self.top, self.grid = Static(id='top'), Grid(*self.cards.values(), id='cards')
+        self.output = RichLog(wrap=True, markup=False, highlight=False)
+        self.output.can_focus = False
+
+    def compose(self):
+        yield self.top
+        yield self.grid
+        yield self.output
+        yield Footer()
+
+    def on_mount(self):
+        for card in self.cards.values():
+            card.show()
+        self.cards[self.selected.name].focus()
+        self.set_interval(0.1, self.tick)
+        self.action_refresh()
+
+    def on_resize(self, event):
+        self.grid.styles.grid_size_columns = max(1, min(len(self.hosts), (event.size.width - 4) // 44))
+
+    def tick(self):
+        for h in self.hosts:
+            if h.status == 'running':
+                self.cards[h.name].show()
+        counts = Counter(h.status for h in self.hosts)
+        left = Text.assemble((' T3 ', 'bold white on #6366f1'), (' UP ', 'bold #a5b4fc'),
+                             (f'  desktop {self.desktop or "not detected"}  ·  target {self.target or "nightly"}', '#94a3b8'))
+        right = Text()
+        for status, style in (('running', '#a5b4fc'), ('ok', '#34d399'), ('failed', '#fb7185')):
+            if counts[status]:
+                right.append(f'  ● {counts[status]} {status}', style=style)
+        top = Table.grid(expand=True)
+        top.add_column(ratio=1, no_wrap=True, overflow='ellipsis')
+        top.add_column(justify='right', no_wrap=True)
+        top.add_row(left, right)
+        self.top.update(top)
+
+    def select(self, host):
+        self.selected = host
+        log = self.output
+        log.border_title = f' {host.name} output · {host.log.name if host.log else "no runs yet"} '
+        log.clear()
+        for line in host.lines:
+            log.write(line)
+
+    def emit(self, h, kind, text):
+        self.cards[h.name].show()
+        if h is self.selected:
+            if kind == 'start':
+                self.select(h)
+            elif kind in ('line', 'step'):
+                self.output.write(text)
+        if kind == 'done':
+            if h.status == 'failed':
+                self.notify(f'{h.name}: {h.error}', title='Failed', severity='error', timeout=8)
+            elif h.mode == 'update':
+                self.notify(f'{h.name} updated in {h.elapsed:.0f}s', title='Done')
+
+    def start(self, hosts, mode, only='all'):
+        busy = [h.name for h in hosts if h.status == 'running']
+        if busy:
+            self.notify(f'Already running: {", ".join(busy)}', severity='warning')
+        self.desktop = desktop_version()
+        for h in hosts:
+            if h.status != 'running':
+                self.run_worker(run_job(h, mode, self.target, self.desktop, only, self.logs, self.emit))
+
+    def update_menu(self, hosts, title):
+        def chosen(choice):
+            if choice == 'check':
+                self.start(hosts, 'check')
+            elif choice:
+                self.start(hosts, 'update', choice)
+        target = self.target or 'nightly'
+        self.push_screen(Menu(title, [
+            ('all', f'Everything  (T3 → {target}, Codex, Claude)'),
+            ('t3', f'T3 server only  → {target}'),
+            ('codex', 'Codex CLI only  → latest'),
+            ('claude', 'Claude Code only  → latest'),
+            ('check', 'Just check versions and health'),
+        ]), chosen)
+
+    def action_move(self, dx, dy):
+        # Spatial grid movement: up/down jump a whole row, clamped to the first/last card.
+        columns = self.grid.styles.grid_size_columns
+        index = self.hosts.index(self.selected) + dx + dy * columns
+        self.cards[self.hosts[max(0, min(len(self.hosts) - 1, index))].name].focus()
+
+    def action_refresh(self):
+        self.start(self.hosts, 'check')
+
+    def action_update(self):
+        self.update_menu([self.selected], f'Update {self.selected.name}')
+
+    def action_update_all(self):
+        self.update_menu(self.hosts, f'Update all {len(self.hosts)} servers in parallel')
+
+    def action_version(self):
+        def chosen(value):
+            if value is not None:
+                self.target = value
+                self.notify(f'Updates will install T3 {value or "latest nightly"}')
+        self.push_screen(VersionPrompt(self.target), chosen)
+
+    def action_logs(self):
+        self.output.toggle_class('shown')
+
+    def action_ssh(self, host=None):
+        host = host or self.selected
+        self.cards[host.name].focus()
+        self.select(host)
+        self.run_worker(self.ssh_session(host.name))
+
+    async def ssh_session(self, name):
+        # Jobs keep reading output meanwhile; batch_update stops redraws over the shell.
+        with self.batch_update(), self.suspend():
+            await (await asyncio.create_subprocess_exec('ssh', name)).wait()
+
+    def action_quit(self):
+        busy = sum(h.status == 'running' for h in self.hosts)
+        if busy and time.monotonic() - self.quit_armed > 3:
+            self.quit_armed = time.monotonic()
+            self.notify(f'{busy} server(s) still running. Press q again to stop them and quit.', severity='warning')
+            return
+        self.exit()
+
+    def get_system_commands(self, screen):
+        yield from super().get_system_commands(screen)
+        yield SystemCommand('Refresh', 'Check every server', self.action_refresh)
+        for key, label in (('all', 'everything'), ('t3', 'T3'), ('codex', 'Codex'), ('claude', 'Claude')):
+            yield SystemCommand(f'Update {label} on all servers', 'Runs in parallel',
+                                lambda key=key: self.start(self.hosts, 'update', key))
+        yield SystemCommand('Set T3 version', 'Pin the T3 version updates install', self.action_version)
+        for h in self.hosts:
+            yield SystemCommand(f'SSH into {h.name}', 'Open a shell; exit to come back',
+                                lambda h=h: self.action_ssh(h))
+
+
+# ── Headless mode ───────────────────────────────────────────────────────────
+
+async def headless(names, args, app, logs):
+    width = max(map(len, names))
+
+    def emit(h, kind, text):
+        if kind == 'step' or (kind == 'line' and args.verbose):
+            print(f'{h.name:<{width}}  {text}', flush=True)
+        elif kind == 'done' and h.status == 'failed':
+            print(f'{h.name:<{width}}  ✗ {h.error}\n{h.name:<{width}}  log: {h.log}', flush=True)
+
+    hosts = [Host(name) for name in names]
+    mode = 'check' if args.check else 'update'
+    print(f'\nT3UP · {mode} · {len(hosts)} servers in parallel\n')
+    await asyncio.gather(*(run_job(h, mode, args.version, app, args.only or 'all', logs, emit) for h in hosts))
+    print('\nRESULTS')
+    for h in hosts:
+        ok = h.status == 'ok'
+        print(f'  {"✓" if ok else "✗"} {h.name:<16} {"OK" if ok else "FAILED":<7} {h.version:<35} {h.elapsed:.1f}s')
+    failures = sum(h.status != 'ok' for h in hosts)
+    print(f'\n{len(hosts) - failures}/{len(hosts)} passed · Logs: {logs}\n')
+    return int(bool(failures))
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Interactive dashboard for your T3 coding servers. '
+        'Run without options to open it; use --check/--update for scripts.',
+        epilog='Add servers to ~/.config/t3up/servers: one SSH alias or user@host per line.')
+    parser.add_argument('version', nargs='?', default='', help='headless update to this exact T3 version')
+    parser.add_argument('--check', action='store_true', help='headless: check versions and health')
+    parser.add_argument('--update', action='store_true', help='headless: update servers')
+    parser.add_argument('--only', choices=['all', 't3', 'codex', 'claude'],
+                        help='headless update: only this component (default all)')
+    parser.add_argument('--host', action='append', metavar='HOST', help='only this configured host (repeatable)')
+    parser.add_argument('--list', action='store_true', help='list configured hosts and exit')
+    parser.add_argument('--verbose', '-v', action='store_true', help='headless: show installer output')
+    args = parser.parse_args()
+    if args.version and not VERSION.fullmatch(args.version):
+        parser.error('VERSION must be an exact version, for example 0.0.46-nightly.20261003.2623')
+    if args.check and (args.version or args.update or args.only):
+        parser.error('--check does not update')
+    config = Path(os.environ.get('T3UP_SERVERS_FILE', str(Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 't3up/servers')))
+    try:
+        hosts = list(dict.fromkeys(line.split('#', 1)[0].strip() for line in config.read_text().splitlines()))
+    except OSError as error:
+        parser.error(str(error))
+    hosts = [host for host in hosts if host]
+    if not hosts or any(not re.fullmatch(r'[a-zA-Z0-9_][a-zA-Z0-9_.@:-]*', host) for host in hosts):
+        parser.error(f'Empty or invalid server list: {config}')
+    if args.host:
+        if set(args.host) - set(hosts):
+            parser.error('Unknown host; add it to ' + str(config))
+        hosts = [host for host in hosts if host in args.host]
+    if args.list:
+        print('\n'.join(hosts))
+        return 0
+    os.umask(0o077)
+    logs = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 't3up' / datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+    if args.check or args.update or args.version or args.only:
+        return asyncio.run(headless(hosts, args, desktop_version(), logs))
+    if not sys.stdout.isatty():
+        parser.error('no terminal; use --check or --update')
+    T3Up(hosts, logs).run()
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print('\nInterrupted. An in-flight remote installer may still be running.', file=sys.stderr)
+        sys.exit(130)
