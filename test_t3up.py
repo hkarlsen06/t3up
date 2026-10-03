@@ -66,7 +66,7 @@ printf '@@t3up\\tauth\\tCodex\\n@@t3up\\tversion\\t1.0.0\\n@@t3up\\tdone\\tHealt
     if pid == 0:
         os.execv(command, [command])
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
-    def pump(seconds, send=b""):
+    def pump(seconds, send=b"", until=None):
         if send: os.write(fd, send)
         end = time.monotonic() + seconds
         while time.monotonic() < end:
@@ -75,7 +75,10 @@ printf '@@t3up\\tauth\\tCodex\\n@@t3up\\tversion\\t1.0.0\\n@@t3up\\tdone\\tHealt
                 except OSError: return
                 if b"\x1b[c" in out:  # answer the logo probe's device query, as a terminal does
                     os.write(fd, b"\x1b[?62;22c")
-    pump(0.3); pump(4.5, b"s"); pump(1.0, b"q")
+                if until and until in out:
+                    return
+    # Keys typed during the logo probe are eaten by it: wait for Textual's alternate screen.
+    pump(30, until=b"\x1b[?1049h"); pump(4.5, b"s"); pump(1.0, b"q")
     del os.environ["DELAY"]
     _, code = os.waitpid(pid, 0)
     assert code == 0, code
