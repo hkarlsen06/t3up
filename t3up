@@ -11,6 +11,7 @@ from asyncio.subprocess import PIPE, STDOUT
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+import hashlib
 import io
 import os
 import json
@@ -19,8 +20,10 @@ from pathlib import Path
 import plistlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from rich.align import Align
@@ -223,6 +226,15 @@ def numbers(version):
     return [int(n) for n in re.findall(r'\d+', version)]
 
 
+def desktop_outdated(desktop, hosts, latest, target=''):
+    """A newer T3 than this machine's desktop app: what a server runs or, when no version is pinned,
+    the newest nightly. '' when the app is up to date or not installed."""
+    newer = [desktop_behind(desktop, hosts)]
+    if desktop and not target and latest.get('T3') and numbers(latest['T3']) > numbers(desktop):
+        newer.append(latest['T3'])
+    return max(filter(None, newer), key=numbers, default='')
+
+
 def desktop_behind(desktop, hosts):
     """The newest T3 a server runs, if this machine's T3 Code desktop app is older: update the app."""
     newest = max((h.current['T3'] for h in hosts if 'T3' in h.current), key=numbers, default='')
@@ -250,15 +262,116 @@ def compact(new, current):
     return short(new).replace('-nightly', '')
 
 
-def desktop_version():
+def desktop_app():
+    """The T3 Code desktop app on this machine: the running one, else the nightly, if installed."""
     processes = subprocess.run(['ps', '-Ao', 'comm='], capture_output=True, text=True).stdout
-    match = re.search(r'^(/Applications/T3 Code[^/]*\.app)', processes, re.M)
-    bundle = match[1] if match else '/Applications/T3 Code (Nightly).app'
+    match = re.search(r'^(/Applications/T3 Code[^/]*\.app)/', processes, re.M)
+    return Path(match[1] if match else '/Applications/T3 Code (Nightly).app')
+
+
+def bundle_info(app):
     try:
-        with open(bundle + '/Contents/Info.plist', 'rb') as file:
-            return plistlib.load(file).get('CFBundleShortVersionString', '')
+        with open(app / 'Contents/Info.plist', 'rb') as file:
+            return plistlib.load(file)
     except (OSError, plistlib.InvalidFileException):
+        return {}
+
+
+def desktop_version():
+    return bundle_info(desktop_app()).get('CFBundleShortVersionString', '')
+
+
+def team(app):
+    """The Apple developer team that signed an app, or '' if it is not validly signed."""
+    if subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], capture_output=True).returncode:
         return ''
+    details = subprocess.run(['codesign', '-dv', str(app)], capture_output=True, text=True).stderr
+    match = re.search(r'^TeamIdentifier=([A-Z0-9]{10})$', details, re.M)  # 'not set' when ad hoc signed
+    return match[1] if match else ''
+
+
+def desktop_release(app):
+    """(version, zip URL, base64 SHA-512) of the newest release on the app's own update channel,
+    read from its app-update.yml (a GitHub repo and channel) and the channel's release manifest."""
+    config = dict(re.findall(r'^(\w+): *(\S+)', (app / 'Contents/Resources/app-update.yml').read_text(), re.M))
+    owner, repo, channel = config['owner'], config['repo'], config.get('channel', 'latest')
+    manifest, github = f'{channel}-mac.yml', f'https://github.com/{owner}/{repo}/releases'
+    if channel == 'latest':
+        base = f'{github}/latest/download'
+    else:  # newest release that carries this channel's manifest
+        request = urllib.request.Request(f'https://api.github.com/repos/{owner}/{repo}/releases?per_page=30',
+                                         headers={'User-Agent': 't3up'})
+        with urllib.request.urlopen(request, timeout=20) as response:
+            tag = next((r['tag_name'] for r in json.load(response) if any(a['name'] == manifest for a in r['assets'])), None)
+        if not tag:
+            raise RuntimeError(f'no release on the {channel} channel')
+        base = f'{github}/download/{tag}'
+    with urllib.request.urlopen(f'{base}/{manifest}', timeout=20) as response:
+        return mac_zip(response.read().decode(), base)
+
+
+def mac_zip(manifest, base):
+    """The release manifest's version, and URL and SHA-512 of the zip for this machine's chip."""
+    version = re.search(r"^version: *'?([^'\s]+)", manifest, re.M)[1]
+    arch = 'arm64' if platform.machine() == 'arm64' else 'x64'
+    asset = re.search(rf'- url: (\S+-{arch}\.zip)\s+sha512: (\S+)', manifest)
+    if not asset:
+        raise RuntimeError(f'release {version} has no {arch} zip')
+    return version, f'{base}/{asset[1]}', asset[2]
+
+
+def update_desktop(say):
+    """Install the newest release of the T3 Code desktop app the way its own updater would: the zip
+    from its GitHub release channel, checked against the release's SHA-512 and the installed app's
+    signing team, swapped in while the app is quit, then reopened. Blocking: run it in a thread.
+    Returns the installed version; raises RuntimeError with a reason."""
+    app = desktop_app()
+    info = bundle_info(app)
+    if platform.system() != 'Darwin' or not info:
+        raise RuntimeError('T3 Code desktop is not installed in /Applications')
+    version, url, sha512 = desktop_release(app)
+    if version == info.get('CFBundleShortVersionString'):
+        return version
+    # In the app's own folder: same volume, so the swap is two renames.
+    with tempfile.TemporaryDirectory(dir=app.parent, prefix='.t3up-') as work:
+        work = Path(work)
+        say(f'Downloading T3 Code {version}')
+        digest = hashlib.sha512()
+        with urllib.request.urlopen(url, timeout=60) as response, open(work / 'app.zip', 'wb') as file:
+            while chunk := response.read(1 << 20):
+                digest.update(chunk)
+                file.write(chunk)
+        if base64.b64encode(digest.digest()).decode() != sha512:
+            raise RuntimeError('download does not match the release checksum')
+        subprocess.run(['ditto', '-x', '-k', str(work / 'app.zip'), str(work / 'new')], check=True, capture_output=True)
+        new = next((work / 'new').glob('*.app'))
+        if not team(new) or team(new) != team(app):
+            raise RuntimeError('the new app is not signed by the same developer as the installed one')
+        def busy(*programs):
+            commands = subprocess.run(['ps', '-Ao', 'command='], capture_output=True, text=True).stdout.splitlines()
+            return any(line.startswith(programs) for line in commands)
+        running = busy(f'{app}/Contents/MacOS/')
+        if running:
+            say('Quitting T3 Code to install the update')
+            subprocess.run(['osascript', '-e', f'tell application id "{info["CFBundleIdentifier"]}" to quit'],
+                           capture_output=True)
+        for _ in range(120):  # the app, then any install its own updater (Squirrel's ShipIt) started on quit
+            if not busy(f'{app}/Contents/MacOS/') and 'ShipIt' not in subprocess.run(
+                    ['ps', '-Ao', 'comm='], capture_output=True, text=True).stdout:
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError('T3 Code did not quit')
+        if bundle_info(app).get('CFBundleShortVersionString') != version:  # its own updater may have done it
+            os.rename(app, work / 'old.app')
+            try:
+                os.rename(new, app)
+            except OSError:
+                os.rename(work / 'old.app', app)
+                raise
+        if running:
+            subprocess.run(['open', str(app)])
+    return version
 
 
 def servers_file():
@@ -401,7 +514,8 @@ async def run_job(h, mode, version, only, logs, emit):
                     if event == 'fail':
                         h.error = f'{step}: {value}'
                     h.steps[step] = (event, value)
-                    (h.installed.discard if event == 'skip' else h.installed.add)(step)
+                    if step in COMPONENTS:
+                        (h.installed.discard if event == 'skip' else h.installed.add)(step)
                     if event == 'done' and (found := RAW_VERSION.findall(detail)):
                         h.current[step] = found[-1]
                     h.lines.append(f'{ {"done": "✓", "skip": "–", "fail": "✗"}[event]} {step}  {value}')
@@ -679,7 +793,7 @@ class T3Up(App):
     #bar { height: 3; padding: 0 2; background: $surface; }
     #top { width: 1fr; padding-top: 1; }
     #update-all, #update-all:hover, #update-all:focus, #update-all.-active {
-        min-width: 26; margin-left: 3; border: round $accent; background: transparent; color: $accent;
+        min-width: 16; margin-left: 3; border: round $accent; background: transparent; color: $accent;
         text-style: bold; tint: transparent; }
     #update-all:hover { border: round $accent-lighten-2; color: $accent-lighten-2; }
     #update-all:disabled { border: round $panel-lighten-2; color: $text-disabled; }
@@ -726,6 +840,7 @@ class T3Up(App):
         Binding('l', 'logs', 'Output', show=False),
         Binding('s', 'ssh', 'SSH', show=False),
         Binding('e', 'servers', 'Servers'),
+        Binding('d', 'desktop', 'Update desktop', show=False),
         Binding('q', 'quit', 'Quit'),
         Binding('ctrl+c', 'quit', show=False, priority=True),
         Binding('left', 'move(-1, 0)', show=False),
@@ -741,13 +856,14 @@ class T3Up(App):
         self.names, self.hosts, self.cards = names, [], {}
         self.logs, self.target, self.desktop = logs, '', desktop_version()
         self.selected, self.quit_armed = None, 0.0
+        self.desktop_updating = False
         self.latest = {}  # newest release per tool, refreshed with every check
         self.tools = ['T3']  # tools found on any server: each card's slots, in order
         self.logos = load_logos()
         self.terminal_lock = asyncio.Lock()
         # Direct refs, so the 0.1s tick can't hit a NoMatches while the app tears down.
         self.top, self.grid = Static(id='top'), Grid(id='cards')
-        self.update_all = Button('↑  Update all servers', variant='primary', id='update-all')
+        self.update_all = Button('↑  Update all', variant='primary', id='update-all')
         self.update_all.can_focus = False  # keyboard stays on the cards; 'a' does the same
         self.output = RichLog(wrap=True, markup=False, highlight=False)
         self.output.can_focus = False
@@ -770,12 +886,16 @@ class T3Up(App):
         """Show these servers, keeping state of ones already shown; check the new ones."""
         old = {h.name: h for h in self.hosts}
         self.hosts = [old.get(name) or Host(name) for name in names]
+        known = self.known_tools()
+        for h in self.hosts:
+            if h.name not in old:  # start with last run's slots, so cards don't widen as tools report in
+                h.installed |= set(known.get(h.name, ())) & set(COMPONENTS)
         self.cards = {h.name: Card(h) for h in self.hosts}
+        self.fit(self.size.width)  # slots first: cards never draw with fewer and then jump
         await self.grid.remove_children()
         await self.grid.mount_all(self.cards.values())
         for card in self.cards.values():
             card.show()
-        self.fit(self.size.width)
         self.update_all.disabled = not self.hosts
         if self.hosts:
             if self.selected not in self.hosts:
@@ -783,10 +903,25 @@ class T3Up(App):
             self.cards[self.selected.name].focus()
         self.start([h for h in self.hosts if h.name not in old], 'check')
 
+    @property
+    def tools_file(self):
+        return self.logs.parent / 'tools.json'  # beside the per-run log directories
+
+    def known_tools(self):
+        """{host: [tools]} as last seen, kept across runs."""
+        try:
+            return json.loads(self.tools_file.read_text())
+        except (OSError, ValueError):
+            return {}
+
     def fit(self, width):
         """Cards exactly as wide as their tiles (a slot per tool any server has, in one line), as many
         side by side as fit. Too narrow for even one: a single card as wide as the screen, tiles wrapped."""
-        self.tools = [name for name in COMPONENTS if any(name in h.installed for h in self.hosts)] or ['T3']
+        tools = [name for name in COMPONENTS if any(name in h.installed for h in self.hosts)] or ['T3']
+        if tools != self.tools:
+            self.tools = tools
+            for card in self.cards.values():
+                card.show()
         # + border and padding; at least wide enough for the status on its bottom border
         card = max(36, len(self.tools) * (TILE + GAP) - GAP + 4)
         columns = max(1, min(len(self.hosts), (width - 4 + 2) // (card + 2)))  # grid padding 2+2, gutter 2
@@ -795,9 +930,6 @@ class T3Up(App):
 
     def on_resize(self, event):
         self.fit(event.size.width)
-        narrow = event.size.width < 90
-        self.update_all.label = '↑ Update all' if narrow else '↑  Update all servers'
-        self.update_all.styles.min_width = 16 if narrow else 26
 
     def check_action(self, action, parameters):
         return bool(self.hosts) or action not in ('open', 'refresh', 'update', 'update_all', 'logs', 'ssh', 'move')
@@ -811,10 +943,12 @@ class T3Up(App):
         badge = (' t3up ', f'bold {BG} on {ACCENT}')
         on = [('   On ', DIM), (LOCAL, TEXT)]
         pinned = [('   Installs ', DIM), (self.target, AMBER)] if self.target else []
-        behind = desktop_behind(self.desktop, self.hosts)  # the app on this machine, not a server, needs updating
-        if behind:  # never dropped, only shortened: it is the one thing to do on this machine
+        behind = desktop_outdated(self.desktop, self.hosts, self.latest, self.target)  # this machine's app, not a server
+        if self.desktop_updating:
+            desktops = [[('   updating desktop…', AMBER)]] * 2
+        elif behind:  # never dropped, only shortened: it is the one thing to do on this machine
             bump = compact(behind, self.desktop)
-            desktops = [[('   Desktop ', DIM), (short(self.desktop), AMBER), (f' → {bump} · update the app', AMBER)],
+            desktops = [[('   Desktop ', DIM), (short(self.desktop), AMBER), (f' → {bump} · d to update', AMBER)],
                         [('   update desktop → ', AMBER), (bump, AMBER)]]
         else:
             desktops = [[('   Desktop ', DIM), (short(self.desktop) or 'not detected', TEXT)], []]
@@ -860,6 +994,10 @@ class T3Up(App):
                 self.output.write(text)
         if kind == 'done':
             self.fit(self.size.width)  # a tool found or removed changes how wide cards must be
+            known = self.known_tools()
+            if known.get(h.name) != sorted(h.installed):
+                known[h.name] = sorted(h.installed)
+                self.tools_file.write_text(json.dumps(known))
             only = h.only.split(',')
             logins = [name for name in h.auth if h.mode == 'update' and ('all' in only or name.lower() in only)]
             if logins:
@@ -887,6 +1025,7 @@ class T3Up(App):
             card.show()
 
     def update_menu(self, hosts, heading, extra=()):
+        desktop = hosts is self.hosts and desktop_outdated(self.desktop, self.hosts, self.latest, self.target)
         def chosen(choice):
             if choice == 'check':
                 self.start(hosts, 'check')
@@ -894,8 +1033,12 @@ class T3Up(App):
                 self.action_ssh()
             elif choice == 'logs':
                 self.action_logs()
+            elif choice == 'desktop':
+                self.action_desktop()
             elif choice:
                 self.start(hosts, 'update', choice)
+                if choice == 'all' and hosts is self.hosts and desktop and not self.desktop_updating:
+                    self.run_worker(self.update_desktop())  # update all: this machine's app too
         def detail(name):
             if name == 'T3':
                 return f'→ {self.target or "latest nightly"}'
@@ -904,7 +1047,7 @@ class T3Up(App):
                     f'→ latest · installs on {missing} missing' if missing else '→ latest')
         self.push_screen(Menu(heading, [
             'Update',
-            ('all', '↑', 'Everything', 'T3 and every installed provider'),
+            ('all', '↑', 'Everything', 'T3, every installed provider' + (', desktop app' if desktop else '')),
             *((name.lower(), '↑', label, detail(name)) for name, label in COMPONENTS.items()),
             'Inspect',
             ('check', '↻', 'Check again', 'versions and health, changes nothing'),
@@ -936,7 +1079,35 @@ class T3Up(App):
         self.update_menu([self.selected], Text(self.selected.name, style='bold'))
 
     def action_update_all(self):
-        self.update_menu(self.hosts, Text.assemble(('All servers', 'bold'), (f'   {len(self.hosts)} in parallel', MUTED)))
+        behind = desktop_outdated(self.desktop, self.hosts, self.latest, self.target)
+        self.update_menu(self.hosts, Text.assemble(('All servers', 'bold'), (f'   {len(self.hosts)} in parallel', MUTED)),
+                         [('desktop', '↑', 'Desktop app', f'this machine · → {compact(behind, self.desktop)}')] if behind else [])
+
+    def action_desktop(self):
+        if self.desktop_updating:
+            self.notify('The desktop app is already updating', severity='warning')
+            return
+        def chosen(choice):
+            if choice == 'go':
+                self.run_worker(self.update_desktop())
+        self.push_screen(Menu(Text.assemble(('T3 Code desktop', 'bold'), (f'   {short(self.desktop) or "not detected"}', MUTED)), [
+            'This machine',
+            ('go', '↑', 'Quit and update', 'newest release, then reopens'),
+        ]), chosen)
+
+    async def update_desktop(self):
+        self.desktop_updating = True
+        def say(text):
+            self.call_from_thread(self.notify, text, title='Desktop')
+        try:
+            version = await asyncio.to_thread(update_desktop, say)
+        except Exception as error:  # network, disk, signature: say why, the old app stays
+            self.notify(str(error) or type(error).__name__, title='Desktop update failed', severity='error', timeout=10)
+        else:
+            self.notify(f'T3 Code desktop {short(version)}', title='Desktop up to date')
+        finally:
+            self.desktop_updating = False
+            self.desktop = desktop_version()
 
     def action_version(self):
         def chosen(value):
@@ -994,6 +1165,7 @@ class T3Up(App):
                                 lambda key=key: self.start(self.hosts, 'update', key))
         yield SystemCommand('Set T3 version', 'Pin the T3 version updates install', self.action_version)
         yield SystemCommand('Edit servers', 'Add, remove or rename SSH hosts', self.action_servers)
+        yield SystemCommand('Update T3 Code desktop', 'Quit, update and reopen the app on this machine', self.action_desktop)
         for h in self.hosts:
             yield SystemCommand(f'SSH into {h.name}', 'Open a shell; exit to come back',
                                 lambda h=h: self.action_ssh(h))
@@ -1026,7 +1198,7 @@ async def headless(names, args, app, logs):
         print(f'  {"✓" if ok else "✗"} {h.name:<16} {"OK" if ok else "FAILED":<7} {h.version:<35} {h.elapsed:.1f}s'
               + (f'   update available: {new}' if new and ok else ''))
     if behind := desktop_behind(app, hosts):
-        print(f'\n! T3 Code on this machine is {app}, older than the servers ({behind}): update the app.')
+        print(f'\n! T3 Code on this machine is {app}, older than the servers ({behind}): run t3up --desktop.')
     failures = sum(h.status != 'ok' for h in hosts)
     print(f'\n{len(hosts) - failures}/{len(hosts)} passed · Logs: {logs}\n')
     return int(bool(failures))
@@ -1046,7 +1218,15 @@ def main():
     parser.add_argument('--host', action='append', metavar='HOST', help='only this configured host (repeatable)')
     parser.add_argument('--list', action='store_true', help='list configured hosts and exit')
     parser.add_argument('--verbose', '-v', action='store_true', help='headless: show installer output')
+    parser.add_argument('--desktop', action='store_true',
+                        help='update the T3 Code desktop app on this machine (quits and reopens it), then exit')
     args = parser.parse_args()
+    if args.desktop:
+        try:
+            print(f'T3 Code desktop {update_desktop(print)}')
+            return 0
+        except Exception as error:
+            parser.exit(1, f'Desktop update failed: {error or type(error).__name__}\n')
     if args.version and not VERSION.fullmatch(args.version):
         parser.error('VERSION must be an exact version, for example 0.0.46-nightly.20261003.2623')
     if args.check and (args.version or args.update or args.only):

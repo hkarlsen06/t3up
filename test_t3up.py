@@ -3,6 +3,8 @@
 never contacts a server (fake ssh on PATH)."""
 import asyncio
 import fcntl
+import io
+import json
 import os
 import pty
 import select
@@ -103,6 +105,12 @@ printf '@@t3up\\tauth\\tCodex\\n@@t3up\\tversion\\t1.0.0\\n@@t3up\\tdone\\tHealt
         assert len(lines) == m["LOGO_LINES"] and 0 < max(sum(s.cell_length for s in l) for l in lines) <= 2 * m["TILE"], name
     assert m["compact"]("0.0.46-nightly.20261003.2632", "0.0.46-nightly.20261003.2623") == "#2632"
     assert m["compact"]("0.0.47-nightly.20261004.2701", "0.0.46-nightly.20261003.2623") == "0.0.47"
+    manifest = ("version: '0.0.46-nightly.20261003.2632'\nfiles:\n  - url: T3-Code-0.0.46-arm64.zip\n    sha512: AAA==\n"
+                "  - url: T3-Code-0.0.46-arm64.dmg\n    sha512: BBB==\n  - url: T3-Code-0.0.46-x64.zip\n    sha512: CCC==\n")
+    import platform
+    zip_sha = "AAA==" if platform.machine() == "arm64" else "CCC=="
+    assert m["mac_zip"](manifest, "https://x")[0] == "0.0.46-nightly.20261003.2632"
+    assert m["mac_zip"](manifest, "https://x")[2] == zip_sha, "the zip for this machine's chip, never the dmg"
     box = m["Host"]("box")
     box.current = {"Codex": "1.2.0", "T3": "0.0.46-nightly.20261003.2632", "OpenCode": "2.0.1"}
     latest = {"Codex": "1.2.0", "T3": "0.0.46-nightly.20261003.2632", "OpenCode": "1.18.34", "OpenCode 2": "2.0.22"}
@@ -110,6 +118,10 @@ printf '@@t3up\\tauth\\tCodex\\n@@t3up\\tversion\\t1.0.0\\n@@t3up\\tdone\\tHealt
     assert m["updates"](box, latest, "0.0.45") == {"OpenCode": "2.0.22", "T3": "0.0.45"}, "a pinned T3 target wins"
     assert m["desktop_behind"]("0.0.46-nightly.20261003.2623", [box]) == "0.0.46-nightly.20261003.2632"
     assert m["desktop_behind"]("0.0.46-nightly.20261003.2632", [box]) == "" == m["desktop_behind"]("", [box])
+    newest = {"T3": "0.0.46-nightly.20261003.2640"}
+    assert m["desktop_outdated"]("0.0.46-nightly.20261003.2632", [box], newest) == newest["T3"], "a newer nightly"
+    assert m["desktop_outdated"]("0.0.46-nightly.20261003.2632", [box], newest, "0.0.45") == "", "pinned: servers only"
+    assert m["desktop_outdated"]("0.0.46-nightly.20261003.2623", [box], {}) == "0.0.46-nightly.20261003.2632"
     assert m["versions_tooltip"](box, {"OpenCode": "2.0.22"}).splitlines() == [
         "T3        0.0.46-nightly.20261003.2632", "Codex     1.2.0", "OpenCode  2.0.1  →  2.0.22"]
 
@@ -124,6 +136,8 @@ printf '@@t3up\\tauth\\tCodex\\n@@t3up\\tversion\\t1.0.0\\n@@t3up\\tdone\\tHealt
             await pilot.pause()
             assert [h.status for h in app.hosts] == ["failed", "ok"]
             assert m["updates"](app.hosts[1], app.latest) == {"Codex": "1.2.0"}, app.latest
+            assert json.loads((root / "tools.json").read_text())["second"] == ["Codex", "T3"]
+            assert m["T3Up"](["second"], root / "logs").known_tools()["second"] == ["Codex", "T3"]
             assert "1 to update" in str(app.cards["second"].border_subtitle)
             assert all("check" in l for l in (root / "calls").read_text().splitlines())
             assert app.grid.styles.grid_size_columns == 2
@@ -192,6 +206,14 @@ printf '@@t3up\\tauth\\tCodex\\n@@t3up\\tversion\\t1.0.0\\n@@t3up\\tdone\\tHealt
             assert app.hosts[1].status == "ok" and app.selected.name == "second"
     asyncio.run(drive())
 
+    async def remembered():  # cards open with last run's slots, before any check reports in
+        app = m["T3Up"](["second"], root / "logs")
+        app.start = lambda *a, **k: None
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            assert app.tools == ["T3", "Codex"], app.tools
+    asyncio.run(remembered())
+
     async def narrow():  # an outdated desktop app stays in the header, just shorter
         from rich.console import Console
         app = m["T3Up"](["box"], root / "logs")
@@ -200,7 +222,7 @@ printf '@@t3up\\tauth\\tCodex\\n@@t3up\\tversion\\t1.0.0\\n@@t3up\\tdone\\tHealt
             await pilot.pause()
             app.desktop, app.hosts[0].current = "0.0.46-nightly.20261003.2623", {"T3": "0.0.46-nightly.20261003.2632"}
             app.tick()
-            console = Console(width=app.top.size.width, record=True)
+            console = Console(width=app.top.size.width, record=True, file=io.StringIO())
             console.print(app.top.content)
             assert "update desktop → #2632" in console.export_text(), console.export_text()
     asyncio.run(narrow())
