@@ -1,0 +1,36 @@
+name: test
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: sudo apt-get install -y dash
+        if: runner.os == 'Linux'
+      - run: ./t3up --help  # builds the script's environment, so the timed test runs warm
+      - run: ./test_t3up.py
+
+  windows:
+    # Windows can't run the pty-based test: check that t3up starts and a failing host reports cleanly.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv run --script t3up --help
+      - shell: bash
+        run: |
+          printf 'nobody@127.0.0.1\n' > servers
+          export T3UP_SERVERS_FILE=servers
+          uv run --script t3up --list | grep -qx 'nobody@127.0.0.1'
+          set +e; uv run --script t3up --check > out.txt; code=$?; set -e
+          cat out.txt
+          test "$code" = 1
+          grep -q '0/1 passed' out.txt
