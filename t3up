@@ -19,10 +19,11 @@ from textual.app import App, SystemCommand
 from textual.binding import Binding
 from textual.containers import Grid, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Footer, Input, OptionList, RichLog, Static
+from textual.widgets import Footer, Input, OptionList, RichLog, Static, TextArea
 from textual.widgets.option_list import Option
 
 VERSION = re.compile(r'[0-9][a-zA-Z0-9.+-]*')
+HOST = re.compile(r'[a-zA-Z0-9_][a-zA-Z0-9_.@:-]*')
 
 REMOTE = r'''set -eu
 PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
@@ -107,6 +108,30 @@ def desktop_version():
             return plistlib.load(file).get('CFBundleShortVersionString', '')
     except (OSError, plistlib.InvalidFileException):
         return ''
+
+
+def servers_file():
+    config = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config'))
+    return Path(os.environ.get('T3UP_SERVERS_FILE', config / 't3up/servers'))
+
+
+def parse_servers(text):
+    """One SSH alias or user@host per line; blank lines and # comments ignored."""
+    hosts = [h for h in dict.fromkeys(line.split('#', 1)[0].strip() for line in text.splitlines()) if h]
+    for host in hosts:
+        if not HOST.fullmatch(host):
+            raise ValueError(f'invalid server {host!r}')
+    return hosts
+
+
+def ssh_hosts():
+    """Concrete Host aliases from ~/.ssh/config, offered as suggestions."""
+    try:
+        text = (Path.home() / '.ssh/config').read_text()
+    except OSError:
+        return []
+    return [host for line in text.splitlines() if (words := line.split()) and words[0].lower() == 'host'
+            for host in words[1:] if HOST.fullmatch(host)]
 
 
 def clean(text):
@@ -306,6 +331,35 @@ class VersionPrompt(ModalScreen):
             self.dismiss(value)
 
 
+class ServersEditor(ModalScreen):
+    BINDINGS = [('escape', 'dismiss', 'Close'), ('ctrl+s', 'save', 'Save')]
+
+    def compose(self):
+        try:
+            text = servers_file().read_text()
+        except OSError:
+            text = '# One SSH alias or user@host per line. Blank lines and # comments are ignored.\n'
+        unused = [h for h in ssh_hosts() if h not in text.split()]
+        with Vertical():
+            yield Static(f'Servers · {servers_file()}', classes='heading')
+            yield TextArea(text, soft_wrap=False)
+            if unused:
+                yield Static(f'From ~/.ssh/config: {", ".join(unused)}', classes='hint')
+            yield Static('one SSH host per line · ctrl+s save · esc cancel', classes='hint')
+
+    def action_save(self):
+        text = self.query_one(TextArea).text
+        try:
+            hosts = parse_servers(text)
+        except ValueError as error:
+            self.notify(str(error), severity='error')
+            return
+        path = servers_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text.rstrip('\n') + '\n')
+        self.dismiss(hosts)
+
+
 class T3Up(App):
     TITLE = 't3up'
     CSS = '''
@@ -322,9 +376,10 @@ class T3Up(App):
     RichLog { height: 45%; margin: 0 2; border: round #475569; border-title-color: #94a3b8;
               background: #0b1120; display: none; }
     RichLog.shown { display: block; }
-    Menu, VersionPrompt { align: center middle; background: #0b1120 70%; }
-    Menu > Vertical, VersionPrompt > Vertical { width: 60; height: auto; padding: 1 2;
-              border: round #818cf8; background: #111827; }
+    Menu, VersionPrompt, ServersEditor { align: center middle; background: #0b1120 70%; }
+    Menu > Vertical, VersionPrompt > Vertical, ServersEditor > Vertical { width: 60; height: auto;
+              padding: 1 2; border: round #818cf8; background: #111827; }
+    ServersEditor TextArea { height: 14; }
     .heading { text-style: bold; margin-bottom: 1; }
     .hint { color: #64748b; margin-top: 1; }
     OptionList { height: auto; border: none; background: #111827; }
@@ -336,6 +391,7 @@ class T3Up(App):
         Binding('v', 'version', 'T3 version'),
         Binding('l', 'logs', 'Output'),
         Binding('s', 'ssh', 'SSH'),
+        Binding('e', 'servers', 'Servers'),
         Binding('q', 'quit', 'Quit'),
         Binding('ctrl+c', 'quit', show=False, priority=True),
         Binding('left', 'move(-1, 0)', show=False),
@@ -346,12 +402,11 @@ class T3Up(App):
 
     def __init__(self, names, logs):
         super().__init__()
-        self.hosts = [Host(name) for name in names]
-        self.cards = {h.name: Card(h) for h in self.hosts}
+        self.names, self.hosts, self.cards = names, [], {}
         self.logs, self.target, self.desktop = logs, '', desktop_version()
-        self.selected, self.quit_armed = self.hosts[0], 0.0
+        self.selected, self.quit_armed = None, 0.0
         # Direct refs, so the 0.1s tick can't hit a NoMatches while the app tears down.
-        self.top, self.grid = Static(id='top'), Grid(*self.cards.values(), id='cards')
+        self.top, self.grid = Static(id='top'), Grid(id='cards')
         self.output = RichLog(wrap=True, markup=False, highlight=False)
         self.output.can_focus = False
 
@@ -361,15 +416,36 @@ class T3Up(App):
         yield self.output
         yield Footer()
 
-    def on_mount(self):
+    async def on_mount(self):
+        self.set_interval(0.1, self.tick)
+        await self.set_hosts(self.names)
+        if not self.hosts:
+            self.action_servers()
+
+    async def set_hosts(self, names):
+        """Show these servers, keeping state of ones already shown; check the new ones."""
+        old = {h.name: h for h in self.hosts}
+        self.hosts = [old.get(name) or Host(name) for name in names]
+        self.cards = {h.name: Card(h) for h in self.hosts}
+        await self.grid.remove_children()
+        await self.grid.mount_all(self.cards.values())
         for card in self.cards.values():
             card.show()
-        self.cards[self.selected.name].focus()
-        self.set_interval(0.1, self.tick)
-        self.action_refresh()
+        self.fit(self.size.width)
+        if self.hosts:
+            if self.selected not in self.hosts:
+                self.selected = self.hosts[0]
+            self.cards[self.selected.name].focus()
+        self.start([h for h in self.hosts if h.name not in old], 'check')
+
+    def fit(self, width):
+        self.grid.styles.grid_size_columns = max(1, min(len(self.hosts), (width - 4) // 44))
 
     def on_resize(self, event):
-        self.grid.styles.grid_size_columns = max(1, min(len(self.hosts), (event.size.width - 4) // 44))
+        self.fit(event.size.width)
+
+    def check_action(self, action, parameters):
+        return bool(self.hosts) or action not in ('refresh', 'update', 'update_all', 'logs', 'ssh', 'move')
 
     def tick(self):
         for h in self.hosts:
@@ -397,7 +473,8 @@ class T3Up(App):
             log.write(line)
 
     def emit(self, h, kind, text):
-        self.cards[h.name].show()
+        if h.name in self.cards:  # a server removed mid-run finishes off-screen
+            self.cards[h.name].show()
         if h is self.selected:
             if kind == 'start':
                 self.select(h)
@@ -410,6 +487,8 @@ class T3Up(App):
                 self.notify(f'{h.name} updated in {h.elapsed:.0f}s', title='Done')
 
     def start(self, hosts, mode, only='all'):
+        if not hosts:
+            return
         busy = [h.name for h in hosts if h.status == 'running']
         if busy:
             self.notify(f'Already running: {", ".join(busy)}', severity='warning')
@@ -455,6 +534,13 @@ class T3Up(App):
                 self.notify(f'Updates will install T3 {value or "latest nightly"}')
         self.push_screen(VersionPrompt(self.target), chosen)
 
+    def action_servers(self):
+        async def saved(names):
+            if names is not None:
+                await self.set_hosts(names)
+                self.notify(f'Saved {len(names)} server(s)')
+        self.push_screen(ServersEditor(), saved)
+
     def action_logs(self):
         self.output.toggle_class('shown')
 
@@ -484,6 +570,7 @@ class T3Up(App):
             yield SystemCommand(f'Update {label} on all servers', 'Runs in parallel',
                                 lambda key=key: self.start(self.hosts, 'update', key))
         yield SystemCommand('Set T3 version', 'Pin the T3 version updates install', self.action_version)
+        yield SystemCommand('Edit servers', 'Add, remove or rename SSH hosts', self.action_servers)
         for h in self.hosts:
             yield SystemCommand(f'SSH into {h.name}', 'Open a shell; exit to come back',
                                 lambda h=h: self.action_ssh(h))
@@ -516,7 +603,8 @@ async def headless(names, args, app, logs):
 def main():
     parser = argparse.ArgumentParser(description='Interactive dashboard for your T3 coding servers. '
         'Run without options to open it; use --check/--update for scripts.',
-        epilog='Add servers to ~/.config/t3up/servers: one SSH alias or user@host per line.')
+        epilog='Servers live in ~/.config/t3up/servers, one SSH alias or user@host per line. '
+        'Press e in the dashboard to edit them.')
     parser.add_argument('version', nargs='?', default='', help='headless update to this exact T3 version')
     parser.add_argument('--check', action='store_true', help='headless: check versions and health')
     parser.add_argument('--update', action='store_true', help='headless: update servers')
@@ -530,14 +618,14 @@ def main():
         parser.error('VERSION must be an exact version, for example 0.0.46-nightly.20261003.2623')
     if args.check and (args.version or args.update or args.only):
         parser.error('--check does not update')
-    config = Path(os.environ.get('T3UP_SERVERS_FILE', str(Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 't3up/servers')))
+    config = servers_file()
     try:
-        hosts = list(dict.fromkeys(line.split('#', 1)[0].strip() for line in config.read_text().splitlines()))
-    except OSError as error:
-        parser.error(str(error))
-    hosts = [host for host in hosts if host]
-    if not hosts or any(not re.fullmatch(r'[a-zA-Z0-9_][a-zA-Z0-9_.@:-]*', host) for host in hosts):
-        parser.error(f'Empty or invalid server list: {config}')
+        hosts = parse_servers(config.read_text() if config.exists() else '')
+    except (OSError, ValueError) as error:
+        parser.error(f'{config}: {error}')
+    headless_run = args.check or args.update or args.version or args.only
+    if not hosts and (headless_run or args.host):
+        parser.error(f'No servers in {config}; run t3up and press e to add some')
     if args.host:
         if set(args.host) - set(hosts):
             parser.error('Unknown host; add it to ' + str(config))
@@ -547,7 +635,7 @@ def main():
         return 0
     os.umask(0o077)
     logs = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 't3up' / datetime.now().strftime('%Y%m%d-%H%M%S-%f')
-    if args.check or args.update or args.version or args.only:
+    if headless_run:
         return asyncio.run(headless(hosts, args, desktop_version(), logs))
     if not sys.stdout.isatty():
         parser.error('no terminal; use --check or --update')

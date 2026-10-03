@@ -116,5 +116,26 @@ printf '@@t3up\\tversion\\t1.0.0\\n@@t3up\\tdone\\tHealth OK\\n@@t3up\\tcomplete
             assert app.query_one("RichLog").has_class("shown")
             app.save_screenshot(str(root / "shot.svg"))
             os.system(f"cp {root}/shot.svg /tmp/t3up-shot.svg")
+
+            # Servers editor: rejects bad hosts, keeps state of kept hosts, checks new ones.
+            await pilot.press("e")
+            editor = app.screen.query_one("TextArea")
+            editor.text = "bad;host"
+            await pilot.press("ctrl+s")
+            assert (root / "servers").read_text().endswith("second"), "invalid list was saved"
+            editor.text = "second\nfourth # new"
+            await pilot.press("ctrl+s")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert (root / "servers").read_text() == "second\nfourth # new\n"
+            assert [h.name for h in app.hosts] == ["second", "fourth"] and app.hosts[0].mode == "update"
+            assert app.hosts[1].status == "ok" and app.selected.name == "second"
     asyncio.run(drive())
-print("PASS: parallel headless run, argument validation, interactive refresh/update/resize/logs")
+
+    async def empty():  # no servers yet: dashboard opens straight into the editor
+        app = m["T3Up"]([], root / "logs")
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            assert type(app.screen).__name__ == "ServersEditor"
+    asyncio.run(empty())
+print("PASS: parallel headless run, argument validation, interactive refresh/update/resize/logs/servers")
