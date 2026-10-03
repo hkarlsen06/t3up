@@ -1,5 +1,6 @@
-#!/Users/hkarlsen06/.local/share/t3up/venv/bin/python
-"""Run with ./test_t3up.py; never contacts a server (fake ssh on PATH)."""
+#!/usr/bin/env -S uv run --with-requirements t3up python3
+"""Run with ./test_t3up.py from the repo root (shares t3up's pinned dependencies);
+never contacts a server (fake ssh on PATH)."""
 import asyncio
 import fcntl
 import os

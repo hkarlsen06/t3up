@@ -1,4 +1,8 @@
-#!/Users/hkarlsen06/.local/share/t3up/venv/bin/python
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["textual==8.2.8"]
+# ///
 """t3up: full-screen dashboard for checking and updating T3 coding servers over SSH."""
 import argparse
 import asyncio
@@ -145,6 +149,9 @@ event done 'Health: OK; desktop version matches (when available)'
 event complete OK
 '''
 
+# What each server runs, in card order: step name -> menu label. The --only key is the
+# lowercased name. Adding one: a <name>_step in REMOTE, its `step` line and status loop, and here.
+COMPONENTS = {'T3': 'T3 server', 'Codex': 'Codex CLI', 'Claude': 'Claude Code'}
 # Interactive sign-in per tool: Codex shows a code to enter in your browser, Claude asks for one.
 LOGIN = {'Codex': 'codex login --device-auth', 'Claude': 'claude auth login'}
 
@@ -275,7 +282,7 @@ async def run_job(h, mode, version, app, only, logs, emit):
                 log.flush()
                 text = clean(line)
                 # Parallel steps prefix their output with 'Codex| ', 'Claude| ' or 'T3| '.
-                tagged = re.match(r'(Codex|Claude|T3)\| ?(.*)', text)
+                tagged = re.match(rf'({"|".join(COMPONENTS)})\| ?(.*)', text)
                 tag, text = (tagged[1], tagged[2]) if tagged else ('', text)
                 if not text.startswith('@@t3up\t'):
                     if text:
@@ -321,7 +328,7 @@ async def run_job(h, mode, version, app, only, logs, emit):
 # ── Interactive app ─────────────────────────────────────────────────────────
 
 SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-STEPS = ('T3', 'Codex', 'Claude', 'Health')
+STEPS = (*COMPONENTS, 'Health')
 # Graphite neutrals, one blue accent; green/amber/red only ever mean status.
 BG, SURFACE, LINE = '#16161a', '#1f1f24', '#34343c'
 TEXT, MUTED, DIM, FAINT = '#ececf1', '#a1a1ab', '#6e6e78', '#45454d'
@@ -587,6 +594,7 @@ class T3Up(App):
         self.names, self.hosts, self.cards = names, [], {}
         self.logs, self.target, self.desktop = logs, '', desktop_version()
         self.selected, self.quit_armed = None, 0.0
+        self.terminal_lock = asyncio.Lock()
         # Direct refs, so the 0.1s tick can't hit a NoMatches while the app tears down.
         self.top, self.grid = Static(id='top'), Grid(id='cards')
         self.update_all = Button('↑  Update all servers', variant='primary', id='update-all')
@@ -603,7 +611,6 @@ class T3Up(App):
         yield Footer()
 
     async def on_mount(self):
-        self.terminal_lock = asyncio.Lock()  # here, not __init__: Python 3.9 binds locks to the current loop
         self.set_interval(0.1, self.tick)
         await self.set_hosts(self.names)
         if not self.hosts:
@@ -702,10 +709,9 @@ class T3Up(App):
         target = self.target or 'latest nightly'
         self.push_screen(Menu(heading, [
             'Update',
-            ('all', '↑', 'Everything', 'T3, Codex and Claude'),
-            ('t3', '↑', 'T3 server', f'→ {target}'),
-            ('codex', '↑', 'Codex CLI', '→ latest'),
-            ('claude', '↑', 'Claude Code', '→ latest'),
+            ('all', '↑', 'Everything', ', '.join(COMPONENTS)),
+            *((name.lower(), '↑', label, f'→ {target if name == "T3" else "latest"}')
+              for name, label in COMPONENTS.items()),
             'Inspect',
             ('check', '↻', 'Check again', 'versions and health, changes nothing'),
             *extra,
@@ -789,7 +795,7 @@ class T3Up(App):
     def get_system_commands(self, screen):
         yield from super().get_system_commands(screen)
         yield SystemCommand('Refresh', 'Check every server', self.action_refresh)
-        for key, label in (('all', 'everything'), ('t3', 'T3'), ('codex', 'Codex'), ('claude', 'Claude')):
+        for key, label in (('all', 'everything'), *((name.lower(), name) for name in COMPONENTS)):
             yield SystemCommand(f'Update {label} on all servers', 'Runs in parallel',
                                 lambda key=key: self.start(self.hosts, 'update', key))
         yield SystemCommand('Set T3 version', 'Pin the T3 version updates install', self.action_version)
@@ -835,7 +841,7 @@ def main():
     parser.add_argument('version', nargs='?', default='', help='headless update to this exact T3 version')
     parser.add_argument('--check', action='store_true', help='headless: check versions and health')
     parser.add_argument('--update', action='store_true', help='headless: update servers')
-    parser.add_argument('--only', choices=['all', 't3', 'codex', 'claude'],
+    parser.add_argument('--only', choices=['all', *map(str.lower, COMPONENTS)],
                         help='headless update: only this component (default all)')
     parser.add_argument('--host', action='append', metavar='HOST', help='only this configured host (repeatable)')
     parser.add_argument('--list', action='store_true', help='list configured hosts and exit')
