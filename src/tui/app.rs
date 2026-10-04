@@ -130,6 +130,7 @@ pub enum Choice {
     Pair,
     SignIn(String),
     Installer,
+    Remove(String),
     /// What's new for one tool.
     ChangesOf(String),
     Changes,
@@ -195,6 +196,7 @@ pub enum Cmd {
     Pair(String),
     SignIn(String, String),
     Installer(Vec<String>),
+    Remove(String, String),
     Changes(String),
     Output,
 }
@@ -243,8 +245,10 @@ pub struct Confirm {
     pub desktop: bool,
     /// (host, agents live)
     pub busy: Vec<(String, u32)>,
-    /// 0 = Update anyway, 1 = Cancel.
+    /// 0 = go ahead, 1 = Cancel.
     pub cursor: usize,
+    /// Removing `only` instead of updating.
+    pub remove: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -574,7 +578,8 @@ impl App {
             .filter_map(|h| h.busy.filter(|&n| n > 0).map(|n| (h.name.clone(), n)))
             .collect();
         if touches_t3 && !busy.is_empty() {
-            self.open_modal(Modal::Confirm(Confirm { names, only: only.into(), desktop, busy, cursor: 1 }));
+            let only = only.into();
+            self.open_modal(Modal::Confirm(Confirm { names, only, desktop, busy, cursor: 1, remove: false }));
             return;
         }
         self.run_update(names, only, desktop);
@@ -659,6 +664,10 @@ impl App {
             }
         } else if failed {
             self.toast(Sev::Error, "Failed", format!("{}: {}", h.name, h.error));
+        }
+        if !failed && h.mode == Mode::Remove {
+            let what: Vec<&str> = COMPONENTS.iter().filter(|(n, _)| h.picked(n)).map(|(_, l)| *l).collect();
+            self.toast(Sev::Info, "Removed", format!("{} from {}", what.join(", "), h.name));
         }
         if !failed && h.mode == Mode::Update {
             self.toast(Sev::Info, "Done", format!("{} updated in {:.0}s", h.name, h.elapsed.as_secs_f64()));
@@ -770,6 +779,14 @@ impl App {
             ));
         }
         items.push(row(Choice::Check, "↻", "Check again".into(), "versions and health, changes nothing".into()));
+        if name != "T3" && h.installed.contains(name) {
+            items.push(row(
+                Choice::Remove(name.into()),
+                "−",
+                format!("Remove {label}"),
+                "keeps its settings and sign-in".into(),
+            ));
+        }
         let version = current.as_deref().map(short).unwrap_or_default();
         let heading = Line::from(vec![
             Span::styled(label.to_string(), bold(TEXT)),
@@ -778,6 +795,24 @@ impl App {
         let mut menu = Menu::new(heading, items, vec![h.name.clone()], false);
         menu.logo = Some(name);
         self.open_modal(Modal::Menu(menu));
+    }
+
+    /// Removing a provider asks first (Cancel is the default), with any agents running there.
+    pub fn ask_remove(&mut self, host: &str, tool: &str) {
+        let Some(h) = self.hosts.iter().find(|h| h.name == host) else { return };
+        let busy = h.busy.filter(|&n| n > 0).map(|n| vec![(h.name.clone(), n)]).unwrap_or_default();
+        let only = tool.to_lowercase();
+        let confirm = Confirm { names: vec![host.into()], only, desktop: false, busy, cursor: 1, remove: true };
+        self.open_modal(Modal::Confirm(confirm));
+    }
+
+    /// The confirm dialog's go-ahead: the update it held back, or the removal.
+    fn confirmed(&mut self, c: Confirm) {
+        if c.remove {
+            self.start(c.names, Mode::Remove, &c.only);
+        } else {
+            self.run_update(c.names, &c.only, c.desktop);
+        }
     }
 
     // ── the installer ──────────────────────────────────────────────────────
@@ -1153,6 +1188,9 @@ impl App {
         }
         for h in &self.hosts {
             items.push((format!("Installer on {}", h.name), Cmd::Installer(vec![h.name.clone()])));
+            for (name, label) in COMPONENTS.iter().skip(1).filter(|(n, _)| h.installed.contains(*n)) {
+                items.push((format!("Remove {label} from {}", h.name), Cmd::Remove(h.name.clone(), name.to_string())));
+            }
         }
         items.push(("Toggle output".into(), Cmd::Output));
         self.open_modal(Modal::Palette(Palette { input: Input::default(), items, cursor: 0 }));
@@ -1174,6 +1212,7 @@ impl App {
             Cmd::Changes(host) => self.open_changes(&host),
             Cmd::Output => self.toggle_output(),
             Cmd::Installer(names) => self.open_installer(names),
+            Cmd::Remove(host, tool) => self.ask_remove(&host, &tool),
         }
     }
 
@@ -1209,6 +1248,11 @@ impl App {
                 }
             }
             Choice::Installer => self.open_installer(hosts),
+            Choice::Remove(tool) => {
+                if let Some(name) = hosts.first() {
+                    self.ask_remove(name, &tool);
+                }
+            }
             Choice::ChangesOf(tool) => {
                 if let Some(name) = hosts.first() {
                     self.open_changes_of(name, Some(&tool));
@@ -1497,7 +1541,7 @@ impl App {
             Modal::Confirm(mut c) => match key.code {
                 KeyCode::Esc | KeyCode::Char('n') => None,
                 KeyCode::Char('y') => {
-                    self.run_update(c.names, &c.only, c.desktop);
+                    self.confirmed(c);
                     None
                 }
                 KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('h' | 'l') => {
@@ -1506,7 +1550,7 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if c.cursor == 0 {
-                        self.run_update(c.names, &c.only, c.desktop);
+                        self.confirmed(c);
                     }
                     None
                 }
@@ -1707,7 +1751,7 @@ impl App {
             Modal::Confirm(c) => match hit {
                 Some(Hit::Row(i)) => {
                     if i == 0 {
-                        self.run_update(c.names, &c.only, c.desktop);
+                        self.confirmed(c);
                     }
                     None
                 }
@@ -1981,6 +2025,32 @@ mod tests {
         // The first row signs in, in its window.
         code(&mut a, KeyCode::Enter);
         assert!(matches!(&a.modal, Some(Modal::Flow(f)) if f.tool == "Codex" && f.host == "two"));
+    }
+
+    #[test]
+    fn removing_a_provider_asks_first() {
+        let mut a = app(&["box"]);
+        settle(&mut a);
+        a.hosts[0].busy = Some(2);
+        // T3 has no Remove; Codex does.
+        a.open_tool(0, "T3");
+        assert!(!menu(&a).items.iter().any(|i| matches!(i, Item::Row { choice: Choice::Remove(_), .. })));
+        a.modal = None;
+        a.open_tool(0, "Codex");
+        let at = menu(&a).items.iter().position(|i| matches!(i, Item::Row { choice: Choice::Remove(_), .. })).unwrap();
+        if let Some(Modal::Menu(m)) = &mut a.modal {
+            m.cursor = at;
+        }
+        code(&mut a, KeyCode::Enter);
+        // It asks, Cancel first, with the agents running there.
+        let Some(Modal::Confirm(c)) = &a.modal else { panic!("no confirm") };
+        assert!(c.remove && c.cursor == 1 && c.only == "codex" && c.busy == vec![("box".to_string(), 2)]);
+        code(&mut a, KeyCode::Enter);
+        assert!(a.modal.is_none() && jobs(a.take_effects()).is_empty(), "Cancel removes nothing");
+        a.ask_remove("box", "Codex");
+        code(&mut a, KeyCode::Left);
+        code(&mut a, KeyCode::Enter);
+        assert_eq!(jobs(a.take_effects()), vec![("box".into(), Mode::Remove, "codex".into())]);
     }
 
     #[test]

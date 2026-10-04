@@ -197,7 +197,12 @@ fn spinner(t: Duration) -> char {
 pub fn status(h: &Host, queued: bool, t: Duration) -> (String, ratatui::style::Color, &'static str) {
     match h.status {
         Status::Running => {
-            (spinner(t).to_string(), AMBER, if h.mode == crate::model::Mode::Update { "updating" } else { "checking" })
+            let doing = match h.mode {
+                crate::model::Mode::Check => "checking",
+                crate::model::Mode::Update => "updating",
+                crate::model::Mode::Remove => "removing",
+            };
+            (spinner(t).to_string(), AMBER, doing)
         }
         _ if queued => ("◌".into(), DIM, "queued"),
         Status::Ok if crate::model::no_t3(h) => ("○".into(), AMBER, "no T3"),
@@ -422,7 +427,13 @@ fn footer(app: &App, buf: &mut Buffer) {
     let running: Vec<&Host> = app.hosts.iter().filter(|h| h.running()).collect();
     let mut status = vec![];
     if !running.is_empty() {
-        let verb = if running.iter().any(|h| h.mode == crate::model::Mode::Update) { "Updating" } else { "Checking" };
+        let verb = if running.iter().any(|h| h.mode == crate::model::Mode::Update) {
+            "Updating"
+        } else if running.iter().any(|h| h.mode == crate::model::Mode::Remove) {
+            "Removing from"
+        } else {
+            "Checking"
+        };
         let n = running.len();
         let secs = running.iter().map(|h| h.took().as_secs()).max().unwrap_or(0);
         status = vec![
@@ -613,7 +624,7 @@ fn draw_card(
         .title_bottom(Line::from(sub).right_aligned())
         .render(buf.area, buf);
     if app.motion.on && h.running() {
-        let update = h.mode == crate::model::Mode::Update;
+        let update = h.mode != crate::model::Mode::Check; // a change: two amber lights
         let secs = t.as_secs_f32() + i as f32 * 0.37; // cards out of step, not marching together
         motion::comet(buf, secs, motion::running_color(update), if update { 2 } else { 1 }, 42.0, 1.0);
         let bottom = buf.area.bottom() - 1;
@@ -832,6 +843,7 @@ fn modal(app: &mut App, buf: &mut Buffer, logos: &Logos) {
         Modal::Menu(m) => menu(app, buf, &m, logos),
         Modal::Version(input) => version(app, buf, &input),
         Modal::Servers(s) => servers(app, buf, &s),
+        Modal::Confirm(c) if c.remove => confirm_remove(app, buf, &c, logos),
         Modal::Confirm(c) => confirm(app, buf, &c),
         Modal::Changes(c) => changes(app, buf, c),
         Modal::Help { scroll } => help(app, buf, scroll),
@@ -1421,6 +1433,34 @@ fn confirm(app: &mut App, buf: &mut Buffer, c: &Confirm) {
     let y = inner.bottom().saturating_sub(3);
     let (a, b) = (Rect::new(inner.x, y, 18, 3), Rect::new(inner.x + 20, y, 12, 3));
     button(buf, a, "Update anyway", if c.cursor == 0 { AMBER } else { DIM }, c.cursor == 0);
+    button(buf, b, "Cancel", if c.cursor == 1 { ACCENT } else { DIM }, c.cursor == 1);
+    app.hits.push((a, Hit::Row(0)));
+    app.hits.push((b, Hit::Row(1)));
+}
+
+/// Removing a provider: what goes, what stays, and Cancel first.
+fn confirm_remove(app: &mut App, buf: &mut Buffer, c: &Confirm, logos: &Logos) {
+    let (name, label) = COMPONENTS.iter().find(|(n, _)| n.to_lowercase() == c.only).copied().unwrap_or(("", ""));
+    let host = c.names.first().cloned().unwrap_or_default();
+    let h = 4 + 2 + 1 + 2 + c.busy.len() as u16 * 2 + 1 + 3;
+    let (_, inner) = panel(app, buf, 62, h);
+    let heading = Line::styled(format!("Remove {label}?"), bold(TEXT));
+    let place = Some(Line::styled(format!("from {host}"), fg(MUTED)));
+    logo_heading(buf, logos, name, (inner.x, inner.y, inner.width), &heading, place);
+    let mut y = inner.y + 3;
+    let keep = format!("Its settings and sign-in stay, so the Installer can put {label} back as it was.");
+    for line in wrap(&keep, inner.width as usize) {
+        put(buf, inner.x, y, inner.width, &Line::styled(line, fg(MUTED)));
+        y += 1;
+    }
+    for (_, n) in &c.busy {
+        y += 1;
+        let live = format!("● {n} agent{} live on {host}: sessions using {label} stop", if *n == 1 { "" } else { "s" });
+        put(buf, inner.x, y, inner.width, &clip(vec![Span::styled(live, fg(AMBER))], inner.width as usize));
+    }
+    let y = inner.bottom().saturating_sub(3);
+    let (a, b) = (Rect::new(inner.x, y, 12, 3), Rect::new(inner.x + 14, y, 12, 3));
+    button(buf, a, "Remove", if c.cursor == 0 { RED } else { DIM }, c.cursor == 0);
     button(buf, b, "Cancel", if c.cursor == 1 { ACCENT } else { DIM }, c.cursor == 1);
     app.hits.push((a, Hit::Row(0)));
     app.hits.push((b, Hit::Row(1)));

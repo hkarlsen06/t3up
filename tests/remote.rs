@@ -169,6 +169,8 @@ trap 'rmdir "$HOME/npm-active"' EXIT
 sleep 1
 head -c 100000 /dev/zero | tr '\0' x; echo; echo 'added 1 package'
 case "$*" in
+uninstall*@openai/codex*) rm -f "$HOME/.local/bin/codex";;
+uninstall*pi-coding-agent*) rm -f "$HOME/.local/bin/pi";;
 *@openai/codex@*) echo 0.2.0 > "$HOME/codex"; ln -sf "$HOME/{CODEX}" "$HOME/.local/bin/codex";;
 *pi-coding-agent@*) echo 0.6.0 > "$HOME/pi"; ln -sf "$HOME/{PI}" "$HOME/.local/bin/pi";;
 *t3@nightly*) echo 0.0.2 > "$HOME/t3";;
@@ -429,6 +431,54 @@ exec /bin/sleep "$@""#,
     assert_eq!(h.steps["Codex"].0, StepState::Fail);
     assert!(h.error.contains("update it by hand"));
     assert_eq!(h.steps["Health"].0, StepState::Done);
+
+    // Removing: the way each was installed, settings and sign-in kept; nothing else changes.
+    reset(&home);
+    let (h, _) = remote(&home, Mode::Remove, "codex").await; // npm owns this one
+    ok(&h);
+    assert_eq!(h.steps["Codex"], (StepState::Skip, "removed".into()));
+    assert!(!h.installed.contains("Codex"));
+    assert_eq!(
+        fs::read_to_string(home.join("npm-calls")).unwrap(),
+        format!("uninstall -g --prefix {} @openai/codex\n", home.join(".local").display())
+    );
+    assert_eq!([value(&h, "Claude"), value(&h, "T3")], ["1.0.0", "0.0.1"], "removing updates nothing");
+    assert!(!home.join("update-calls").exists());
+    // Codex's and Claude's own installs come apart; ~/.codex and ~/.claude stay.
+    reset(&home);
+    link(&home, "codex", CODEX_STANDALONE);
+    fs::write(home.join(".codex/config.toml"), "model = 'x'\n").unwrap();
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::write(home.join(".claude/settings.json"), "{}").unwrap();
+    let (h, _) = remote(&home, Mode::Remove, "codex,claude").await;
+    ok(&h);
+    assert_eq!([value(&h, "Codex"), value(&h, "Claude")], ["removed", "removed"]);
+    assert!(!home.join(".codex/packages/standalone").exists() && !home.join(".local/share/claude").exists());
+    assert!(!home.join(".local/bin/codex").exists() && !home.join(".local/bin/claude").exists());
+    assert!(home.join(".codex/config.toml").exists() && home.join(".claude/settings.json").exists());
+    // Put the fakes back for what follows.
+    tool(
+        &home,
+        CODEX_STANDALONE,
+        r#"case $1 in --version) echo "codex-cli $(cat "$HOME/codex")";; login) [ -f "$HOME/codex-auth" ];; esac"#,
+    );
+    tool(
+        &home,
+        CLAUDE,
+        r#"case $1 in
+--version) echo "$(cat "$HOME/claude") (Claude Code)";;
+update) sleep 1; [ -f "$HOME/claude-broken" ] && { echo 'disk full' >&2; exit 3; }; echo 2.0.0 > "$HOME/claude";;
+auth) [ -f "$HOME/claude-auth" ] && echo '{ "loggedIn": true }' || echo '{ "loggedIn": false }';;
+esac"#,
+    );
+    // Something t3up didn't install, it won't guess at.
+    reset(&home);
+    remove(&home.join(".local/bin/codex"));
+    tool(&home, ".local/bin/codex", "echo 'codex-cli 0.1.0'");
+    let (h, _) = remote(&home, Mode::Remove, "codex").await;
+    assert_eq!(h.steps["Codex"].0, StepState::Fail);
+    assert!(h.error.contains("remove it by hand"), "{}", h.error);
+    remove(&home.join(".local/bin/codex"));
 
     reset(&home);
     fs::write(home.join("ps-output"), "1 0 init\n10 1 node /usr/bin/t3 serve\n11 10 /usr/lib/node_modules/t3/node_modules/@t3code/t3-linux-x64/t3 serve\n12 11 /usr/bin/codex --task\n13 12 /usr/bin/codex child\n14 11 /home/u/bin/claude\n15 14 node /x/codex.js\n16 11 t3-resource-monitor\n17 11 cloudflared\n18 1 /usr/bin/grok\n20 1 /home/u/.t3/runtime/versions/0.0.46-nightly.20261004.2648/t3 serve\n21 20 /usr/bin/opencode\n22 21 /usr/bin/pi\n23 20 pi --run\n24 20 node /usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js\n25 20 node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js\n26 20 node /usr/lib/node_modules/@xai-official/grok/dist/index.js\n27 26 node /usr/lib/node_modules/@xai-official/grok/dist/index.js\n").unwrap();

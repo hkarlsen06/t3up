@@ -24,6 +24,10 @@ struct Cli {
     /// missing provider. Default all: T3 and every installed provider
     #[arg(long, value_name = "NAMES", value_parser = model::parse_only)]
     only: Option<String>,
+    /// Headless: remove these providers, comma-separated (codex,claude,opencode,grok,pi); their
+    /// settings and sign-in stay
+    #[arg(long, value_name = "NAMES", value_parser = model::parse_providers)]
+    remove: Option<String>,
     /// Only this configured host (repeatable)
     #[arg(long, value_name = "HOST")]
     host: Vec<String>,
@@ -67,8 +71,11 @@ async fn main() -> ExitCode {
     if cli.check && (!version.is_empty() || cli.update || cli.only.is_some()) {
         usage(ErrorKind::ArgumentConflict, "--check does not update");
     }
+    if cli.remove.is_some() && (cli.check || cli.update || cli.only.is_some() || !version.is_empty()) {
+        usage(ErrorKind::ArgumentConflict, "--remove goes alone: it neither checks nor updates");
+    }
     let (_, mut hosts) = config::read_servers().unwrap_or_else(|e| usage(ErrorKind::Io, e));
-    let headless_run = cli.check || cli.update || !version.is_empty() || cli.only.is_some();
+    let headless_run = cli.check || cli.update || !version.is_empty() || cli.only.is_some() || cli.remove.is_some();
     if hosts.is_empty() && (headless_run || !cli.host.is_empty()) {
         usage(
             ErrorKind::InvalidValue,
@@ -95,9 +102,15 @@ async fn main() -> ExitCode {
     if headless_run {
         let opts = headless::Options {
             hosts,
-            mode: if cli.check { model::Mode::Check } else { model::Mode::Update },
+            mode: if cli.check {
+                model::Mode::Check
+            } else if cli.remove.is_some() {
+                model::Mode::Remove
+            } else {
+                model::Mode::Update
+            },
             version,
-            only: cli.only.unwrap_or_else(|| "all".into()),
+            only: cli.remove.or(cli.only).unwrap_or_else(|| "all".into()),
             verbose: cli.verbose,
             canary: !cli.all_at_once,
         };

@@ -82,7 +82,7 @@ Run `t3up` with no arguments to open the dashboard.
 | Key | Action |
 | --- | --- |
 | <kbd>Enter</kbd> / click | Actions for the selected server: update, check again, what's new, output, terminal |
-| Click a tool | That tool on that server: sign in, update, what's new (T3: pairing link) |
+| Click a tool | That tool on that server: sign in, update, what's new, remove (T3: pairing link) |
 | <kbd>←</kbd> <kbd>↑</kbd> <kbd>↓</kbd> <kbd>→</kbd> / <kbd>j</kbd> <kbd>k</kbd> | Move between servers |
 | <kbd>u</kbd> | Update menu for the selected server |
 | <kbd>a</kbd> | Update all servers (the first one alone first) |
@@ -107,6 +107,9 @@ T3 and any of the five providers, each set up with its own official installer (C
 and Pi all have one), so a new machine needs nothing but SSH and curl. Pi needs Node.js, so t3up adds the official build for it
 (checked against its SHA-256); T3 needs `libatomic`, which t3up adds with `apt`/`dnf` when sudo needs no password.
 
+To remove a provider, click it on its card and choose **Remove**. It goes the way it came (its package manager,
+or its own uninstaller), and its settings and sign-in stay, so the Installer can put it back as it was.
+
 ### Headless
 
 ```sh
@@ -116,6 +119,7 @@ t3up --update --all-at-once        # skip the canary: every server at once
 t3up --only codex,claude           # update just these (installs them where missing)
 t3up --update --host build-01      # just one server (repeatable)
 t3up 0.0.46-nightly.20261003.2632  # install this exact T3 version
+t3up --remove grok,pi --host box   # remove providers; their settings and sign-in stay
 t3up --desktop                     # update the macOS desktop app, then exit
 ```
 

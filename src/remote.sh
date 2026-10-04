@@ -7,28 +7,32 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 # One npm install at a time: parallel `npm install -g` into one prefix can corrupt it.
 # npm is installation tooling, not an update target: keep the host's working version.
-npm_into() {  # prefix package
+npm_into() {  # prefix package [verb: install]
   waited=0
   until mkdir "$tmp/npm-lock" 2>/dev/null; do  # its holder may have been killed
     waited=$((waited + 1))
     [ "$waited" -lt 900 ] || { echo 'Gave up waiting 15 minutes for another npm install' >&2; return 1; }
     sleep 1
   done
-  if [ -w "$1" ]; then set -- npm install -g --prefix "$1" "$2"
-  else set -- sudo -n npm install -g --prefix "$1" "$2"; fi
+  if [ -w "$1" ]; then set -- npm "${3:-install}" -g --prefix "$1" "$2"
+  else set -- sudo -n npm "${3:-install}" -g --prefix "$1" "$2"; fi
   if "$@"; then rmdir "$tmp/npm-lock"; else s=$?; rmdir "$tmp/npm-lock"; return "$s"; fi
 }
 # Update a provider CLI the way T3 Code's own provider updater does: with the tool's
 # native updater when it installed itself, else with the package manager that owns it.
-upgrade() {  # Name bin npm-package native-real-path-glob native-update-args
-  real=$(command -v "$2")
-  real=$(readlink -f "$real" 2>/dev/null || printf '%s' "$real")
-  case $real in $4) "$2" $5; return ;; esac
-  pkg=$3  # the package that owns the path wins: OpenCode 1.x and 2.x are different packages
+# Where a tool's command really lives ($real) and the npm package that owns it ($pkg).
+owner() {  # bin npm-package
+  path=$(command -v "$1")
+  real=$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")
+  pkg=$2  # the package that owns the path wins: OpenCode 1.x and 2.x are different packages
   case $real in */node_modules/*)
     pkg=${real##*/node_modules/}  # @scope/name/bin/x or name/bin/x
     case $pkg in @*/*/*) scope=${pkg%%/*} pkg=${pkg#*/} pkg=$scope/${pkg%%/*} ;; *) pkg=${pkg%%/*} ;; esac
   esac
+}
+upgrade() {  # Name bin npm-package native-real-path-glob native-update-args
+  owner "$2" "$3"
+  case $real in $4) "$2" $5; return ;; esac
   case $real in
     */.bun/*) bun add -g "$pkg@latest" ;;
     */pnpm/*) pnpm add -g "$pkg@latest" ;;
@@ -39,6 +43,49 @@ upgrade() {  # Name bin npm-package native-real-path-glob native-update-args
     *) echo "$1 at $real was not installed by npm, bun, pnpm, Homebrew or its own installer; update it by hand" >&2
        return 1 ;;
   esac
+}
+# Remove a provider the way it was installed. Its settings and sign-in stay, so the Installer can
+# put it back as it was. A package manager's install goes through it; a tool's own install (the glob)
+# is taken apart by `<bin>_remove`, last, since Grok's glob matches anything.
+uninstall() {  # Name bin npm-package native-real-path-glob
+  owner "$2" "$3"
+  case $real in
+    */.bun/*) bun remove -g "$pkg" ;;
+    */pnpm/*) pnpm remove -g "$pkg" ;;
+    */lib/node_modules/*) prefix=${real%%/lib/node_modules/*}; npm_into "${prefix:-/}" "$pkg" uninstall ;;
+    */Cellar/*|*/Caskroom/*)
+      keg=${real#*/Cellar/} keg=${keg#*/Caskroom/}
+      case $real in */Caskroom/*) brew uninstall --cask "${keg%%/*}" ;; *) brew uninstall "${keg%%/*}" ;; esac ;;
+    $4) "$2_remove" ;;
+    *) echo "$1 at $real was not installed by npm, bun, pnpm, Homebrew or its own installer; remove it by hand" >&2
+       return 1 ;;
+  esac
+}
+# A link of ours in $1 that points into $2: remove it (never someone else's file).
+unlink_into() {  # link dir
+  case $(readlink "$1" 2>/dev/null) in "$2"/*) rm -f "$1" ;; esac
+}
+codex_remove() {  # ~/.codex keeps its config and sign-in
+  rm -rf "${CODEX_HOME:-$HOME/.codex}/packages/standalone"
+  unlink_into "$path" "${CODEX_HOME:-$HOME/.codex}"
+  rm -f "$HOME/.local/bin/codex-code-mode-host"
+}
+claude_remove() {  # ~/.claude keeps its settings and sign-in
+  rm -rf "$HOME/.local/share/claude"
+  unlink_into "$path" "$HOME/.local/share/claude"
+}
+opencode_remove() {  # its uninstaller clears caches, then leaves the binary for you to delete
+  opencode uninstall --keep-config --keep-data --force </dev/null
+  rm -f "$HOME/.opencode/bin/opencode"
+  rmdir "$HOME/.opencode/bin" "$HOME/.opencode" 2>/dev/null || true
+}
+grok_remove() {  # its installer linked grok and agent; ~/.grok keeps the rest
+  for link in "$HOME/.local/bin/grok" "$HOME/.local/bin/agent"; do unlink_into "$link" "$HOME/.grok/bin"; done
+  rm -rf "$HOME/.grok/bin"
+}
+pi_remove() {  # ~/.pi/agent keeps its settings
+  unlink_into "$path" "$HOME/.pi/agent"
+  rm -rf "$HOME/.pi/agent/install" "$HOME/.pi/agent/bin"
 }
 # A Node.js for tools that need one (Pi): the official LTS build for this machine, checked against
 # its published SHA-256, per user, no sudo. It goes where Pi's own installer puts a standalone Node.
@@ -85,6 +132,13 @@ tool() {  # Name bin npm-package native-real-path-glob native-update-args [insta
     exit 0  # leaves the step's subshell: nothing else to check
   fi
   before=$("$2" --version </dev/null) after=$before
+  if [ "$mode" = remove ] && picked "$2"; then
+    uninstall "$@"
+    hash -r 2>/dev/null || true
+    if command -v "$2" >/dev/null; then echo "$1 is still on the PATH at $(command -v "$2")" >&2; return 1; fi
+    event skip "$1: removed"
+    exit 0  # nothing left to sign in to
+  fi
   if want "$2"; then upgrade "$@"; after=$("$2" --version </dev/null); fi
   event done "$1: $before -> $after"
 }

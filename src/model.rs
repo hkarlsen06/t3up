@@ -102,6 +102,8 @@ static DIGITS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+").unwrap());
 pub enum Mode {
     Check,
     Update,
+    /// Remove the providers in ONLY (their settings stay).
+    Remove,
 }
 
 impl Mode {
@@ -109,6 +111,7 @@ impl Mode {
         match self {
             Mode::Check => "check",
             Mode::Update => "update",
+            Mode::Remove => "remove",
         }
     }
 }
@@ -238,7 +241,7 @@ impl Host {
         self.rollback.clear();
         self.complete = false;
         self.last.clear();
-        let what = if mode == Mode::Update { format!("update {only}") } else { "check".into() };
+        let what = if mode == Mode::Check { "check".into() } else { format!("{} {only}", mode.as_str()) };
         let header = format!("── {what} · {} ──", chrono::Local::now().format("%H:%M:%S"));
         self.push(header.clone());
         header
@@ -480,6 +483,16 @@ pub fn versions_detail(h: &Host, new: &[(String, String)]) -> Vec<String> {
             line
         })
         .collect()
+}
+
+/// 'codex,claude' -> Ok(itself) if every name is a provider: removing takes no 'all', and never T3.
+pub fn parse_providers(value: &str) -> Result<String, String> {
+    let names: Vec<String> = COMPONENTS.iter().skip(1).map(|(n, _)| n.to_lowercase()).collect();
+    if value.split(',').all(|v| names.iter().any(|n| n == v)) {
+        Ok(value.to_string())
+    } else {
+        Err(format!("choose from {}", names.join(", ")))
+    }
 }
 
 /// 'codex,claude' -> Ok(itself) if every name is a component (or 'all').
