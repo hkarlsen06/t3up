@@ -84,6 +84,7 @@ printf '@@t3up\tversion\t1.0.0\n@@t3up\tdone\tHealth OK\n@@t3up\tcomplete\tOK\n'
         ("XDG_STATE_HOME", dir.join("state").to_str().unwrap()),
         ("CALLS", dir.join("calls").to_str().unwrap()),
         ("T3UP_REGISTRY", "file:///nonexistent"),
+        ("T3UP_RELEASES_API", "off"),
         ("HOME", dir.to_str().unwrap()),
         ("TERM", "xterm-256color"),
     ] {
@@ -174,6 +175,7 @@ exec /bin/sleep 30
             ("T3UP_SERVERS_FILE", dir.join("servers").to_str().unwrap()),
             ("XDG_STATE_HOME", dir.join("state").to_str().unwrap()),
             ("T3UP_REGISTRY", "file:///nonexistent"),
+            ("T3UP_RELEASES_API", "off"),
             ("HOME", dir.to_str().unwrap()),
             ("TERM", "xterm-256color"),
             ("T3UP_NO_IMAGES", "1"),

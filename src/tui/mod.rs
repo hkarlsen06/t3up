@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::model::Event;
-use crate::{changelog, config, desktop, job, registry};
+use crate::{changelog, config, desktop, job, registry, selfupdate};
 use app::{App, Effect, Res};
 use logos::Logos;
 
@@ -306,14 +306,24 @@ fn run_effect(
                 task.abort(); // and with it ssh, killed on drop
             }
         }
+        Effect::CheckSelf => blocking(res_tx, selfupdate::available, |v| Res::SelfAvailable(v.flatten())),
+        Effect::SelfUpdate(version) => {
+            let say = res_tx.clone();
+            blocking(
+                res_tx,
+                move || selfupdate::update(&version, &|text| drop(say.send(Res::SelfSay(text.to_string())))),
+                |r| Res::SelfUpdated(r.unwrap_or_else(|| Err("internal error".into()))),
+            );
+        }
         Effect::Copy(text) => copy(&text),
         Effect::Open(url) => open(&url),
-        Effect::Terminal { .. } | Effect::Quit => {}
+        Effect::Terminal { .. } | Effect::Quit | Effect::Restart => {}
     }
 }
 
-/// Open the dashboard on these servers; returns when the user quits.
-pub async fn run(hosts: Vec<String>, logs: PathBuf) -> anyhow::Result<()> {
+/// Open the dashboard on these servers; returns when the user quits: true to start t3up again
+/// (it just updated itself).
+pub async fn run(hosts: Vec<String>, logs: PathBuf) -> anyhow::Result<bool> {
     panic_hook();
     let known = config::known_tools(logs.parent().unwrap_or(&logs));
     enter()?;
@@ -333,6 +343,7 @@ pub async fn run(hosts: Vec<String>, logs: PathBuf) -> anyhow::Result<()> {
     let (res_tx, mut res_rx) = unbounded_channel::<Res>();
     let mut jobs: Vec<JoinHandle<()>> = vec![];
     let mut flows = Flows::new();
+    let mut restart = false;
     let mut app = App::new(hosts, logs.clone(), known);
     app.motion = motion::Motion::new(std::env::var_os("T3UP_NO_MOTION").is_none());
     app.desktop = tokio::task::spawn_blocking(desktop::desktop_version).await.unwrap_or_default();
@@ -382,6 +393,10 @@ pub async fn run(hosts: Vec<String>, logs: PathBuf) -> anyhow::Result<()> {
         for effect in app.take_effects() {
             match effect {
                 Effect::Quit => break 'main,
+                Effect::Restart => {
+                    restart = true;
+                    break 'main;
+                }
                 Effect::Terminal { command, banner } => {
                     if handoff(&mut term, &picker, &mut logos, &mut app, &command, &banner, &mut signals).await? {
                         break 'main;
@@ -397,7 +412,7 @@ pub async fn run(hosts: Vec<String>, logs: PathBuf) -> anyhow::Result<()> {
     for job in jobs.iter().chain(flows.values().map(|(task, _)| task)) {
         job.abort();
     }
-    Ok(())
+    Ok(restart)
 }
 
 /// SIGTERM and SIGHUP end the dashboard like q does, with the terminal restored.

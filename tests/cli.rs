@@ -61,6 +61,7 @@ exit 0
             .env("T3UP_SERVERS_FILE", self.0.join("servers"))
             .env("XDG_STATE_HOME", self.0.join("state"))
             .env("T3UP_REGISTRY", format!("file://{}", self.0.join("registry").display()))
+            .env("T3UP_RELEASES_API", "off")
             .env("CALLS", self.0.join("calls"))
             .env("FAIL_FIRST", "0")
             .env("DELAY", "1")

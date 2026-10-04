@@ -25,6 +25,7 @@ pub async fn run(opts: Options, desktop: String, logs: PathBuf) -> i32 {
     let width = opts.hosts.iter().map(|n| n.len()).max().unwrap_or(0);
     let mut hosts: Vec<_> = opts.hosts.iter().map(|n| Host::new(n)).collect();
     let latest = tokio::task::spawn_blocking(registry::fetch_latest);
+    let mine = tokio::task::spawn_blocking(crate::selfupdate::available);
     let script: Arc<str> = model::remote_script().into();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let start = |h: &mut Host| {
@@ -128,6 +129,9 @@ pub async fn run(opts: Options, desktop: String, logs: PathBuf) -> i32 {
     let behind = model::desktop_behind(&desktop, &refs);
     if !behind.is_empty() {
         println!("\n! T3 Code on this machine is {desktop}, older than the servers ({behind}): run t3up --desktop.");
+    }
+    if let Ok(Some(version)) = mine.await {
+        println!("\n! t3up {version} is out: run t3up --self-update.");
     }
     let passed = hosts.iter().filter(|h| h.status == Status::Ok).count();
     println!("\n{passed}/{} passed · Logs: {}\n", hosts.len(), logs.display());

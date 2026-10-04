@@ -56,6 +56,12 @@ pub enum Effect {
     Copy(String),
     /// Open a link in this machine's browser.
     Open(String),
+    /// Look for a newer t3up (quietly).
+    CheckSelf,
+    /// Install this version of t3up over the running one.
+    SelfUpdate(String),
+    /// Leave, and start the (new) t3up in this terminal.
+    Restart,
     /// Stop every job and leave.
     Quit,
 }
@@ -69,6 +75,9 @@ pub enum Res {
     DesktopDone(Result<String, String>),
     Changelog { key: ChangeKey, result: Result<Vec<Release>, String> },
     FlowOut { id: u64, text: String },
+    SelfAvailable(Option<String>),
+    SelfSay(String),
+    SelfUpdated(Result<String, String>),
     FlowExit { id: u64, code: Option<i32> },
 }
 
@@ -199,6 +208,7 @@ pub enum Cmd {
     Remove(String, String),
     Changes(String),
     Output,
+    UpdateSelf,
 }
 
 #[derive(Debug, Clone)]
@@ -362,6 +372,9 @@ pub struct App {
     /// Sign-ins waiting for the window: (host, tool).
     flow_queue: VecDeque<(String, String)>,
     next_flow: u64,
+    /// A newer t3up, when there is one.
+    pub self_update: Option<String>,
+    pub self_updating: bool,
 }
 
 impl App {
@@ -399,11 +412,14 @@ impl App {
             motion: Motion::new(false),
             flow_queue: VecDeque::new(),
             next_flow: 0,
+            self_update: None,
+            self_updating: false,
         };
         app.set_hosts(names);
         if app.hosts.is_empty() {
             app.open_servers();
         }
+        app.fx.push(Effect::CheckSelf);
         app
     }
 
@@ -710,6 +726,16 @@ impl App {
             Res::Changelog { key, result } => {
                 self.changelogs.insert(key, result);
             }
+            Res::SelfAvailable(version) => self.self_update = version,
+            Res::SelfSay(text) => self.toast(Sev::Info, "t3up", text),
+            Res::SelfUpdated(Ok(version)) => {
+                self.toast(Sev::Info, "Updated", format!("t3up {version}: starting it now"));
+                self.fx.push(Effect::Restart);
+            }
+            Res::SelfUpdated(Err(e)) => {
+                self.self_updating = false;
+                self.toast_for(Sev::Error, "t3up update failed", e, 10);
+            }
             Res::FlowOut { id, text } => {
                 if let Some(Modal::Flow(f)) = self.modal.as_mut()
                     && f.id == id
@@ -728,6 +754,18 @@ impl App {
                     self.toast(Sev::Info, "Signed in", format!("{tool} on {host}"));
                     self.start(vec![host], Mode::Check, "all");
                 }
+            }
+        }
+    }
+
+    /// Update t3up itself to the newer version the header mentions, then restart into it.
+    pub fn update_self(&mut self) {
+        match (&self.self_update, self.self_updating) {
+            (None, _) => self.toast(Sev::Info, "t3up", format!("t3up {} is the newest", crate::selfupdate::current())),
+            (Some(_), true) => self.toast(Sev::Warning, "t3up", "Already updating"),
+            (Some(version), false) => {
+                self.self_updating = true;
+                self.fx.push(Effect::SelfUpdate(version.clone()));
             }
         }
     }
@@ -1192,6 +1230,9 @@ impl App {
                 items.push((format!("Remove {label} from {}", h.name), Cmd::Remove(h.name.clone(), name.to_string())));
             }
         }
+        if let Some(v) = &self.self_update {
+            items.push((format!("Update t3up to {v}"), Cmd::UpdateSelf));
+        }
         items.push(("Toggle output".into(), Cmd::Output));
         self.open_modal(Modal::Palette(Palette { input: Input::default(), items, cursor: 0 }));
     }
@@ -1213,6 +1254,7 @@ impl App {
             Cmd::Output => self.toggle_output(),
             Cmd::Installer(names) => self.open_installer(names),
             Cmd::Remove(host, tool) => self.ask_remove(&host, &tool),
+            Cmd::UpdateSelf => self.update_self(),
         }
     }
 
@@ -1424,6 +1466,7 @@ impl App {
             }
             KeyCode::Char('l') => self.toggle_output(),
             KeyCode::Char('d') => self.open_desktop(),
+            KeyCode::Char('U') => self.update_self(),
             KeyCode::Char('i') => {
                 if let Some(h) = self.host() {
                     self.open_installer(vec![h.name.clone()]);
@@ -2051,6 +2094,27 @@ mod tests {
         code(&mut a, KeyCode::Left);
         code(&mut a, KeyCode::Enter);
         assert_eq!(jobs(a.take_effects()), vec![("box".into(), Mode::Remove, "codex".into())]);
+    }
+
+    #[test]
+    fn t3up_updates_itself_and_restarts() {
+        let mut a = App::new(vec!["box".into()], "/tmp/t3up-test/logs".into(), BTreeMap::new());
+        assert!(a.take_effects().contains(&Effect::CheckSelf), "it looks on launch");
+        // Nothing newer: U says so, and does nothing else.
+        press(&mut a, "U");
+        assert!(a.take_effects().is_empty());
+        a.on_result(Res::SelfAvailable(Some("9.9.9".into())));
+        frame(&mut a, 120, 30);
+        assert!(has(&frame(&mut a, 120, 30), "t3up 9.9.9 · U to update"));
+        press(&mut a, "U");
+        assert_eq!(a.take_effects(), vec![Effect::SelfUpdate("9.9.9".into())]);
+        press(&mut a, "U");
+        assert!(a.take_effects().is_empty(), "once at a time");
+        a.on_result(Res::SelfUpdated(Ok("9.9.9".into())));
+        assert_eq!(a.take_effects(), vec![Effect::Restart]);
+        // A failure says why and lets you try again.
+        a.on_result(Res::SelfUpdated(Err("no network".into())));
+        assert!(!a.self_updating && a.toasts.iter().any(|t| t.text == "no network"));
     }
 
     #[test]

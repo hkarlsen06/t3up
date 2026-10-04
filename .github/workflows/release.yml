@@ -33,7 +33,13 @@ jobs:
           [ -f "$bin.exe" ] && bin=$bin.exe
           name=t3up-${{ matrix.target }}
           mkdir "$name" && cp "$bin" README.md LICENSE "$name/"
-          if [ "$RUNNER_OS" = Windows ]; then 7z a "$name.zip" "$name" >/dev/null; else tar czf "$name.tar.gz" "$name"; fi
+          if [ "$RUNNER_OS" = Windows ]; then 7z a "$name.zip" "$name" >/dev/null; archive=$name.zip
+          else tar czf "$name.tar.gz" "$name"; archive=$name.tar.gz; fi
+          # The SHA-256 that t3up --self-update checks the download against.
+          if command -v sha256sum >/dev/null; then sha256sum "$archive"; else shasum -a 256 "$archive"; fi | awk '{ print $1 }' > "$archive.sha256"
       - uses: softprops/action-gh-release@v2
         with:
-          files: t3up-*.*
+          files: |
+            t3up-*.tar.gz
+            t3up-*.zip
+            t3up-*.sha256

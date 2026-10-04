@@ -57,6 +57,9 @@ cargo install --git https://github.com/hkarlsen06/t3up
 
 **Windows**: download `t3up-x86_64-pc-windows-msvc.zip` from the latest release. It uses the built-in OpenSSH client.
 
+t3up keeps itself current: when a new version is out, the dashboard's header says so, and <kbd>U</kbd> installs it
+(checked against the SHA-256 published with the release) and restarts into it. From a script: `t3up --self-update`.
+
 ## Set up servers
 
 Each server needs key-based SSH access (t3up runs `ssh` in batch mode, so it never asks for a password).
@@ -94,6 +97,7 @@ Run `t3up` with no arguments to open the dashboard.
 | <kbd>l</kbd> | Show or hide the live output |
 | <kbd>i</kbd> | Installer: pick what to install on the selected server |
 | <kbd>d</kbd> | Update the T3 Code desktop app on this machine (macOS) |
+| <kbd>U</kbd> | Update t3up itself, when a new version is out |
 | <kbd>Ctrl</kbd>+<kbd>P</kbd> | Command palette |
 | <kbd>?</kbd> | All keys |
 | <kbd>q</kbd> | Quit |
@@ -121,6 +125,7 @@ t3up --update --host build-01      # just one server (repeatable)
 t3up 0.0.46-nightly.20261003.2632  # install this exact T3 version
 t3up --remove grok,pi --host box   # remove providers; their settings and sign-in stay
 t3up --desktop                     # update the macOS desktop app, then exit
+t3up --self-update                 # update t3up itself to the newest release
 ```
 
 The exit code is non-zero if any server failed. Every run writes per-server logs to `~/.local/state/t3up/`.

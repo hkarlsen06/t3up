@@ -387,12 +387,23 @@ pub fn header_text(app: &App, width: usize) -> (Line<'static>, Line<'static>) {
     let cat = |parts: &[&Vec<Span<'static>>]| -> Vec<Span<'static>> {
         std::iter::once(badge.clone()).chain(parts.iter().flat_map(|p| p.iter().cloned())).collect()
     };
+    // A newer t3up: worth a word in every layout.
+    let (mine, mine_terse) = match (&app.self_update, app.self_updating) {
+        (Some(_), true) => {
+            (vec![Span::styled("   updating t3up…", fg(ACCENT))], vec![Span::styled("   updating…", fg(ACCENT))])
+        }
+        (Some(v), false) => (
+            vec![Span::styled(format!("   t3up {v} · U to update"), fg(ACCENT))],
+            vec![Span::styled("   U update t3up", fg(ACCENT))],
+        ),
+        (None, _) => (vec![], vec![]),
+    };
     let layouts = [
-        (cat(&[&on, &full, &pinned]), false),
-        (cat(&[&full, &pinned]), false),
-        (cat(&[&full, &pinned]), true),
-        (cat(&[&terse, &pinned]), true),
-        (cat(&[&terse]), true),
+        (cat(&[&on, &full, &pinned, &mine]), false),
+        (cat(&[&full, &pinned, &mine]), false),
+        (cat(&[&full, &pinned, &mine]), true),
+        (cat(&[&terse, &pinned, &mine_terse]), true),
+        (cat(&[&terse, &mine_terse]), true),
     ];
     let mut chosen = None;
     for (parts, short) in &layouts {
@@ -1466,7 +1477,7 @@ fn confirm_remove(app: &mut App, buf: &mut Buffer, c: &Confirm, logos: &Logos) {
     app.hits.push((b, Hit::Row(1)));
 }
 
-const HELP: [(&str, &str); 20] = [
+const HELP: [(&str, &str); 21] = [
     ("enter / click", "Actions for the selected server"),
     ("← ↑ ↓ → j k", "Move between servers"),
     ("u", "Update menu for the selected server"),
@@ -1480,6 +1491,7 @@ const HELP: [(&str, &str); 20] = [
     ("pgup / pgdn", "Scroll the output panel or the grid"),
     ("d", "Update the T3 Code desktop app (macOS)"),
     ("i", "Installer: pick what to install on the selected server"),
+    ("U", "Update t3up itself, when a new version is out"),
     ("ctrl+p", "Command palette"),
     ("?", "This help"),
     ("q", "Quit (press twice while servers are running)"),

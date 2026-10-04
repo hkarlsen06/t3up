@@ -6,4 +6,5 @@ pub mod headless;
 pub mod job;
 pub mod model;
 pub mod registry;
+pub mod selfupdate;
 pub mod tui;
