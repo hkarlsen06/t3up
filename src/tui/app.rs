@@ -232,7 +232,7 @@ struct Canary {
 #[derive(Debug, Clone)]
 pub struct Hover {
     pub pos: (u16, u16),
-    hit: Option<Hit>,
+    pub hit: Option<Hit>,
     header: bool,
     since: Instant,
     pub shown: bool,
@@ -367,7 +367,7 @@ impl App {
         self.motion.prune();
         self.dirty |= self.toasts.len() != before;
         if let Some(h) = self.hover.as_mut().filter(|h| !h.shown && h.since.elapsed() > Duration::from_millis(600)) {
-            h.shown = matches!(h.hit, Some(Hit::Card(_))) || h.header;
+            h.shown = matches!(h.hit, Some(Hit::Card(_))) || (h.header && h.hit.is_none());
             self.dirty |= h.shown;
         }
     }

@@ -250,6 +250,7 @@ pub fn render(app: &mut App, logos: &Logos, buf: &mut Buffer) {
     }
     footer(app, buf);
     if app.modal.is_some() {
+        toasts(app, buf);
         let since = *app.motion.modal_since.get_or_insert_with(std::time::Instant::now);
         let k = if app.motion.on { motion::ease_out(since.elapsed().as_secs_f32() / motion::FADE) } else { 1.0 };
         dim(buf, 0.65 * k);
@@ -258,8 +259,8 @@ pub fn render(app: &mut App, logos: &Logos, buf: &mut Buffer) {
     } else {
         app.motion.modal_since = None;
         tooltip(app, buf);
+        toasts(app, buf);
     }
-    toasts(app, buf);
     if let Some(t) = app.motion.intro_at() {
         let hosts: Vec<_> = app.hosts.iter().map(|h| (h.name.clone(), h.status)).collect();
         motion::intro(buf, t, &hosts);
@@ -268,38 +269,47 @@ pub fn render(app: &mut App, logos: &Logos, buf: &mut Buffer) {
 
 // ── header ─────────────────────────────────────────────────────────────────
 
+/// Space between the screen's edge and the header's and footer's content.
+const MARGIN: u16 = 2;
+
 fn header(app: &mut App, buf: &mut Buffer) {
     let w = buf.area.width;
     buf.set_style(Rect::new(0, 0, w, HEADER), Style::new().bg(SURFACE));
-    let button = Rect::new(w.saturating_sub(18), 0, 16, 3);
+    // A filled pill on the text row, like the badge on the left: padded two cells each side.
+    let label = "↑ Update all";
+    let bw = label.width() as u16 + 4;
+    let shown = w >= 40;
+    let button = Rect::new(w.saturating_sub(bw + MARGIN), 1, bw, 1);
     let enabled = !app.hosts.is_empty();
-    if w >= 40 {
-        let color = if enabled { ACCENT } else { FAINT };
-        Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(fg(color))
-            .style(Style::new().bg(SURFACE))
-            .render(button, buf);
-        let label = Line::styled("↑  Update all", bold(color));
-        let (x, line) = centered(label, 14);
-        put(buf, button.x + 1 + x, 1, 14, &line);
-        if enabled {
-            app.hits.push((button, Hit::UpdateAll));
-        }
-    }
-    let avail = if w >= 40 { w.saturating_sub(4 + 16 + 3) } else { w.saturating_sub(4) } as usize;
-    let (left, right) = header_text(app, avail);
-    let right_w = right.width() as u16;
-    put(buf, 2, 1, avail as u16, &left);
-    put(buf, 2 + avail as u16 - right_w.min(avail as u16), 1, right_w, &right);
-    if app.motion.on {
+    if shown {
         let t = app.clock().as_secs_f32();
-        motion::sweep_bg(buf, Rect::new(2, 1, 6.min(w.saturating_sub(2)), 1), t, 6.0);
+        let hovered = app.hover.as_ref().is_some_and(|h| h.hit == Some(Hit::UpdateAll));
         let waiting =
             app.hosts.iter().any(|h| h.status == Status::Ok && !updates(h, &app.latest, &app.target).is_empty());
-        if enabled && waiting && w >= 40 {
-            motion::tint_border(buf, button, motion::breathe(t));
+        let alpha = match (enabled, hovered) {
+            (false, _) => 0.0,
+            (true, true) => 0.42,
+            // Updates waiting: it breathes, gently.
+            (true, false) if waiting && app.motion.on => 0.2 + 0.12 * (0.5 + 0.5 * (t * 2.2).sin()),
+            (true, false) => 0.22,
+        };
+        let bg = if enabled { blend(ACCENT, SURFACE, alpha) } else { blend(FAINT, SURFACE, 0.35) };
+        let color = if enabled { if hovered { TEXT } else { ACCENT } } else { DIM };
+        buf.set_style(button, Style::new().bg(bg));
+        put(buf, button.x + 2, 1, bw - 2, &Line::styled(label, bold(color)));
+        if enabled {
+            // The whole height of the bar is clickable, not just the text row.
+            app.hits.push((Rect::new(button.x, 0, bw, HEADER), Hit::UpdateAll));
         }
+    }
+    let right_edge = if shown { button.x.saturating_sub(3) } else { w.saturating_sub(MARGIN) };
+    let avail = right_edge.saturating_sub(MARGIN) as usize;
+    let (left, right) = header_text(app, avail);
+    let right_w = right.width() as u16;
+    put(buf, MARGIN, 1, avail as u16, &left);
+    put(buf, right_edge - right_w.min(avail as u16), 1, right_w, &right);
+    if app.motion.on {
+        motion::sweep_bg(buf, Rect::new(MARGIN, 1, 6.min(w.saturating_sub(MARGIN)), 1), app.clock().as_secs_f32(), 6.0);
     }
 }
 
@@ -402,7 +412,7 @@ fn footer(app: &App, buf: &mut Buffer) {
         ("q", "quit"),
     ];
     let width = |keys: &[(&str, &str)]| {
-        keys.iter().map(|(k, l)| k.width() + l.width() + 1).sum::<usize>() + keys.len().saturating_sub(1) * 3 + 2
+        keys.iter().map(|(k, l)| k.width() + l.width() + 1).sum::<usize>() + keys.len().saturating_sub(1) * 3
     };
     let running: Vec<&Host> = app.hosts.iter().filter(|h| h.running()).collect();
     let mut status = vec![];
@@ -411,22 +421,25 @@ fn footer(app: &App, buf: &mut Buffer) {
         let n = running.len();
         let secs = running.iter().map(|h| h.took().as_secs()).max().unwrap_or(0);
         status = vec![
-            Span::styled(format!(" {} ", spinner(app.clock())), fg(AMBER)),
+            Span::styled(format!("{} ", spinner(app.clock())), fg(AMBER)),
             Span::styled(format!("{verb} {n} server{}", if n == 1 { "" } else { "s" }), fg(MUTED)),
-            Span::styled(format!(" · {secs}s "), fg(DIM)),
-            Span::styled("│", fg(FAINT)),
+            Span::styled(format!(" · {secs}s"), fg(DIM)),
         ];
     }
+    // The status, then three cells, then the hints; the screen's margin on both sides.
     let status_w = Line::from(status.clone()).width();
-    // The live status counts against the width too; the hints go in order of least use.
+    let lead = if status_w > 0 { status_w + 3 } else { 0 };
+    let room = (w as usize).saturating_sub(2 * MARGIN as usize);
     for drop in ["output", "servers", "T3 version", "what's new", "refresh", "update all", "actions", "help"] {
-        if width(&keys) + status_w <= w as usize {
+        if lead + width(&keys) <= room {
             break;
         }
         keys.retain(|(_, l)| *l != drop);
     }
     let mut spans = status;
-    spans.push(Span::raw(" "));
+    if lead > 0 {
+        spans.push(Span::raw("   "));
+    }
     for (i, (k, l)) in keys.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(" · ", fg(FAINT)));
@@ -434,14 +447,14 @@ fn footer(app: &App, buf: &mut Buffer) {
         spans.push(Span::styled(*k, fg(ACCENT)));
         spans.push(Span::styled(format!(" {l}"), fg(MUTED)));
     }
-    put(buf, 0, y, w, &Line::from(spans));
+    put(buf, MARGIN, y, room as u16, &Line::from(spans));
     if app.motion.on && status_w > 0 {
-        motion::shimmer(buf, Rect::new(0, y, status_w as u16, 1), y, app.clock().as_secs_f32(), 1.6);
+        motion::shimmer(buf, Rect::new(MARGIN, y, status_w as u16, 1), y, app.clock().as_secs_f32(), 1.6);
     }
-    let palette = Line::from(vec![Span::styled("^p", fg(ACCENT)), Span::styled(" palette ", fg(MUTED))]);
-    let pw = palette.width() as u16;
-    if width(&keys) as u16 + status_w as u16 + pw + 2 <= w && !app.hosts.is_empty() {
-        put(buf, w - pw, y, pw, &palette);
+    let palette = Line::from(vec![Span::styled("^p", fg(ACCENT)), Span::styled(" palette", fg(MUTED))]);
+    let pw = palette.width();
+    if lead + width(&keys) + 3 + pw <= room && !app.hosts.is_empty() {
+        put(buf, w - MARGIN - pw as u16, y, pw as u16, &palette);
     }
 }
 
@@ -561,10 +574,21 @@ fn draw_card(app: &App, g: &Geo, logos: &Logos, i: usize, buf: &mut Buffer, dim_
         }
     }
     sub.push(Span::raw(" "));
+    // What needs attention sits on the top border, opposite the name.
+    let mut alert: Vec<Span<'static>> = vec![];
+    if let Some(n) = h.busy.filter(|&n| n > 0) {
+        alert.push(Span::styled(format!(" ● {n} agent{} live ", if n == 1 { "" } else { "s" }), fg(AMBER)));
+    }
+    if !h.rollback.is_empty() {
+        alert.push(Span::styled(format!(" ↩ rolled back {} ", h.rollback), fg(AMBER)));
+    }
+    let name_w = h.name.width() + 4;
+    let alert = clip(alert, (g.card_w as usize).saturating_sub(name_w + 4));
     Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(fg(border))
         .title(Line::styled(format!(" {} ", h.name), bold(if selected { ACCENT } else { TEXT })))
+        .title(alert.right_aligned())
         .title_bottom(Line::from(sub).right_aligned())
         .render(buf.area, buf);
     if app.motion.on && h.running() {
@@ -626,19 +650,8 @@ fn draw_card(app: &App, g: &Geo, logos: &Logos, i: usize, buf: &mut Buffer, dim_
             }
         }
     }
-    // The machine on the left; what needs attention on the right; then any error.
-    let mut alert: Vec<Span<'static>> = vec![];
-    if let Some(n) = h.busy.filter(|&n| n > 0) {
-        alert.push(Span::styled(format!("● {n} agent{} live", if n == 1 { "" } else { "s" }), fg(AMBER)));
-    }
-    if !h.rollback.is_empty() {
-        let gap = if alert.is_empty() { "" } else { "  " };
-        alert.push(Span::styled(format!("{gap}↩ rolled back {}", h.rollback), fg(AMBER)));
-    }
-    let alert = clip(alert, inner_w as usize);
-    let room = (inner_w as usize).saturating_sub(alert.width() + 2);
-    put(buf, x0, top + tiles_h, inner_w, &clip(vec![Span::styled(h.sys.clone(), fg(DIM))], room));
-    put(buf, x0 + inner_w - alert.width() as u16, top + tiles_h, inner_w, &alert);
+    // The machine, then any error.
+    put(buf, x0, top + tiles_h, inner_w, &clip(vec![Span::styled(h.sys.clone(), fg(DIM))], inner_w as usize));
     if !h.error.is_empty() && !h.steps.is_empty() {
         put(
             buf,
@@ -880,10 +893,12 @@ fn button(buf: &mut Buffer, area: Rect, label: &str, color: ratatui::style::Colo
 }
 
 fn version(app: &mut App, buf: &mut Buffer, input: &super::input::Input) {
-    let (_, inner) = panel(app, buf, 64, 4 + 1 + 1 + 3 + 1 + 1);
+    let (_, inner) = panel(app, buf, 64, 4 + 1 + 1 + 3 + 1 + 2);
     put(buf, inner.x, inner.y, inner.width, &Line::styled("T3 version to install", bold(TEXT)));
     input_box(buf, Rect::new(inner.x, inner.y + 2, inner.width, 3), input, "blank = latest nightly", true);
-    hint(buf, inner, "e.g. 0.0.46-nightly.20261003.2623 · enter save · esc cancel");
+    let example = Line::styled("e.g. 0.0.46-nightly.20261003.2623", fg(DIM));
+    put(buf, inner.x, inner.bottom().saturating_sub(2), inner.width, &example);
+    hint(buf, inner, "enter save · esc cancel");
 }
 
 fn servers(app: &mut App, buf: &mut Buffer, s: &Servers) {
@@ -1010,12 +1025,15 @@ const HELP: [(&str, &str); 19] = [
 ];
 
 fn help(app: &mut App, buf: &mut Buffer, scroll: usize) {
-    let (_, inner) = panel(app, buf, 66, 4 + 2 + HELP.len() as u16 + 2);
+    let keys = HELP.iter().map(|(k, _)| k.width()).max().unwrap_or(0) + 3;
+    let wide = keys + HELP.iter().map(|(_, w)| w.width()).max().unwrap_or(0) + 6;
+    let (_, inner) = panel(app, buf, wide as u16, 4 + 2 + HELP.len() as u16 + 2);
     put(buf, inner.x, inner.y, inner.width, &Line::styled("Keys", bold(TEXT)));
     let rows = inner.height.saturating_sub(4) as usize;
     let start = scroll.min(HELP.len().saturating_sub(rows));
     for (k, (key, what)) in HELP.iter().enumerate().skip(start).take(rows) {
-        let line = Line::from(vec![Span::styled(format!("{key:<14}"), fg(ACCENT)), Span::styled(*what, fg(MUTED))]);
+        let pad = " ".repeat(keys.saturating_sub(key.width()));
+        let line = Line::from(vec![Span::styled(format!("{key}{pad}"), fg(ACCENT)), Span::styled(*what, fg(MUTED))]);
         put(buf, inner.x, inner.y + 2 + (k - start) as u16, inner.width, &line);
     }
     hint(buf, inner, "esc close");
@@ -1183,9 +1201,9 @@ fn toasts(app: &App, buf: &mut Buffer) {
     if w < 12 {
         return;
     }
-    let mut y = HEADER + 1;
+    let mut bottom = buf.area.height.saturating_sub(2); // one row of air above the footer
     let now = std::time::Instant::now();
-    for Toast { title, text, sev, born, until } in &app.toasts {
+    for Toast { title, text, sev, born, until } in app.toasts.iter().rev() {
         let color = match sev {
             Sev::Info => ACCENT,
             Sev::Warning => AMBER,
@@ -1193,9 +1211,10 @@ fn toasts(app: &App, buf: &mut Buffer) {
         };
         let rows = wrap(text, w as usize - 4);
         let h = 3 + rows.len() as u16;
-        if y + h > buf.area.height {
+        if bottom < HEADER + 1 + h {
             break;
         }
+        let y = bottom - h;
         // Slides in from the right edge, and back out just before it expires.
         let (age, left) = (now.duration_since(*born).as_secs_f32(), until.saturating_duration_since(now).as_secs_f32());
         let out = if app.motion.on {
@@ -1212,8 +1231,8 @@ fn toasts(app: &App, buf: &mut Buffer) {
         for (k, row) in rows.iter().enumerate() {
             put(&mut card, 2, 2 + k as u16, w - 4, &Line::styled(row.clone(), fg(TEXT)));
         }
-        blit(&card, buf, buf.area.width - w - 2 + out, y as i32, buf.area);
-        y += h;
+        blit(&card, buf, buf.area.width - w - MARGIN + out, y as i32, buf.area);
+        bottom = y;
     }
 }
 
@@ -1274,6 +1293,24 @@ mod tests {
         assert_eq!(buf[(card(0).x, card(0).y)].fg, ACCENT);
         assert_eq!(buf[(card(1).x, card(1).y)].fg, LINE);
         assert_eq!(cell_fg(&buf, "✗ failed").unwrap(), RED);
+    }
+
+    #[test]
+    fn update_all_button_is_padded_and_inset() {
+        let mut app = demo();
+        for w in [60u16, 91, 150] {
+            let buf = frame(&mut app, w, 24);
+            let row = &text(&buf)[1];
+            let x = row.find("↑ Update all").map(|b| row[..b].chars().count()).expect("button");
+            let end = x + "↑ Update all".chars().count();
+            let bg = buf[(x as u16, 1)].bg;
+            // Two cells of the pill on each side of the label, then the screen's margin.
+            for dx in [x - 2, x - 1, end, end + 1] {
+                assert_eq!(buf[(dx as u16, 1)].bg, bg, "pill padding at {dx} (width {w})");
+            }
+            assert_ne!(buf[(x as u16 - 3, 1)].bg, bg, "pill starts two cells before the label (width {w})");
+            assert_eq!(end + 2 + MARGIN as usize, w as usize, "right margin (width {w})");
+        }
     }
 
     #[test]
