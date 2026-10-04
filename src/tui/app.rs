@@ -106,6 +106,8 @@ pub enum Hit {
     Act(Act),
     /// The Installer's install button.
     Install,
+    /// A tool's tile on a card: (card, tool).
+    Tool(usize, &'static str),
 }
 
 /// What a sign-in or pairing window's buttons do.
@@ -128,6 +130,8 @@ pub enum Choice {
     Pair,
     SignIn(String),
     Installer,
+    /// What's new for one tool.
+    ChangesOf(String),
     Changes,
     Desktop,
     DesktopGo,
@@ -147,12 +151,14 @@ pub struct Menu {
     /// The servers a choice applies to; `all` if that is every server (updating T3 on all also updates the desktop app).
     pub hosts: Vec<String>,
     pub all: bool,
+    /// A tool's own menu shows its logo beside the heading.
+    pub logo: Option<&'static str>,
 }
 
 impl Menu {
     fn new(heading: Line<'static>, items: Vec<Item>, hosts: Vec<String>, all: bool) -> Self {
         let cursor = items.iter().position(|i| matches!(i, Item::Row { .. })).unwrap_or(0);
-        Menu { heading, items, cursor, hosts, all }
+        Menu { heading, items, cursor, hosts, all, logo: None }
     }
 
     fn step(&mut self, by: isize) {
@@ -717,6 +723,63 @@ impl App {
         }
     }
 
+    // ── one tool ───────────────────────────────────────────────────────────
+
+    /// A tool's tile, tapped: what you can do with that tool on that server. Signing in comes first
+    /// when it's signed out.
+    pub fn open_tool(&mut self, i: usize, name: &'static str) {
+        self.select(i);
+        let Some(h) = self.hosts.get(i) else { return };
+        let label = COMPONENTS.iter().find(|(n, _)| *n == name).map_or(name, |(_, l)| l);
+        let row = |choice, icon, label: String, detail: String| Item::Row { choice, icon, label, detail };
+        let current = h.current.get(name).cloned();
+        let new = updates(h, &self.latest, &self.target).into_iter().find(|(n, _)| n == name).map(|(_, v)| v);
+        let signed_out = h.auth.iter().any(|a| a == name) && name != "T3" && login_command(name).is_some();
+        let mut items = vec![];
+        if signed_out {
+            items.push(row(
+                Choice::SignIn(name.into()),
+                "→",
+                format!("Sign in to {label}"),
+                "not signed in here".into(),
+            ));
+        }
+        let detail = match (&current, &new) {
+            (Some(cur), Some(new)) => format!("{} → {}", short(cur), compact(new, cur)),
+            (Some(cur), None) => format!("{} · up to date", short(cur)),
+            (None, _) => "→ latest".into(),
+        };
+        items.push(row(Choice::Update(name.to_lowercase()), "↑", format!("Update {label}"), detail));
+        if new.is_some() && changelog::has_changelog(name) {
+            items.push(row(
+                Choice::ChangesOf(name.into()),
+                "✦",
+                "What's new".into(),
+                "release notes for the update".into(),
+            ));
+        }
+        if name == "T3" {
+            let pair = "connect a device, via Tailscale".to_string();
+            items.push(row(Choice::Pair, "⌁", "Create pairing link".into(), pair));
+        } else if !signed_out && login_command(name).is_some() {
+            items.push(row(
+                Choice::SignIn(name.into()),
+                "→",
+                "Sign in again".into(),
+                "another account, or a fresh login".into(),
+            ));
+        }
+        items.push(row(Choice::Check, "↻", "Check again".into(), "versions and health, changes nothing".into()));
+        let version = current.as_deref().map(short).unwrap_or_default();
+        let heading = Line::from(vec![
+            Span::styled(label.to_string(), bold(TEXT)),
+            Span::styled(format!("   {} · {version}", h.name), fg(MUTED)),
+        ]);
+        let mut menu = Menu::new(heading, items, vec![h.name.clone()], false);
+        menu.logo = Some(name);
+        self.open_modal(Modal::Menu(menu));
+    }
+
     // ── the installer ──────────────────────────────────────────────────────
 
     /// What each server has, from its last check, with the boxes to tick. T3 starts ticked where it's
@@ -1042,10 +1105,15 @@ impl App {
 
     /// What's new: the release notes of everything waiting on this server.
     pub fn open_changes(&mut self, name: &str) {
+        self.open_changes_of(name, None);
+    }
+
+    /// What's new on a server, for one tool or all of them.
+    pub fn open_changes_of(&mut self, name: &str, only: Option<&str>) {
         let Some(h) = self.hosts.iter().find(|h| h.name == name) else { return };
         let mut items = vec![];
         for (component, new) in updates(h, &self.latest, &self.target) {
-            if changelog::has_changelog(&component) {
+            if changelog::has_changelog(&component) && only.is_none_or(|o| o == component) {
                 items.push((component.clone(), h.current[&component].clone(), new));
             }
         }
@@ -1141,6 +1209,11 @@ impl App {
                 }
             }
             Choice::Installer => self.open_installer(hosts),
+            Choice::ChangesOf(tool) => {
+                if let Some(name) = hosts.first() {
+                    self.open_changes_of(name, Some(&tool));
+                }
+            }
             Choice::SignIn(tool) => {
                 if let Some(name) = hosts.first() {
                     self.start_flow(name, &tool);
@@ -1571,6 +1644,7 @@ impl App {
                     self.select(i);
                     self.open_actions();
                 }
+                Some(Hit::Tool(i, name)) => self.open_tool(i, name),
                 Some(Hit::UpdateAll) => self.open_update_all(),
                 _ => {}
             }
@@ -1876,6 +1950,40 @@ mod tests {
     }
 
     #[test]
+    fn tapping_a_tool_opens_its_own_menu() {
+        let mut a = app(&["one", "two"]);
+        settle(&mut a);
+        a.on_job("two", Event::Done("Codex: codex-cli 0.160.0".into()));
+        a.on_job("two", Event::Auth("Codex".into()));
+        done(&mut a, "two", true);
+        a.latest.insert("Codex".into(), "0.161.0".into());
+        a.take_effects();
+        frame(&mut a, 120, 30);
+        let tile = a.hits.iter().find(|(_, h)| *h == Hit::Tool(1, "Codex")).expect("a tile to tap").0;
+        a.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: tile.x + 1,
+            row: tile.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(a.selected, 1);
+        let m = menu(&a);
+        assert_eq!(m.logo, Some("Codex"));
+        let rows: Vec<String> = m
+            .items
+            .iter()
+            .filter_map(
+                |i| if let Item::Row { label, detail, .. } = i { Some(format!("{label}|{detail}")) } else { None },
+            )
+            .collect();
+        assert_eq!(rows[0], "Sign in to Codex CLI|not signed in here", "{rows:?}");
+        assert!(rows.contains(&"Update Codex CLI|0.160.0 → 0.161.0".to_string()), "{rows:?}");
+        // The first row signs in, in its window.
+        code(&mut a, KeyCode::Enter);
+        assert!(matches!(&a.modal, Some(Modal::Flow(f)) if f.tool == "Codex" && f.host == "two"));
+    }
+
+    #[test]
     fn claude_takes_the_code_in_the_window() {
         let mut a = app(&["box"]);
         settle(&mut a);
@@ -2075,7 +2183,7 @@ mod tests {
         // A click on a card selects it and opens its actions.
         frame(&mut a, 100, 30);
         let card = a.hits.iter().find(|(_, h)| *h == Hit::Card(1)).unwrap().0;
-        click(&mut a, card.x + 3, card.y + 2);
+        click(&mut a, card.x + 3, card.y); // its title row: a tool's tile opens that tool's menu instead
         assert_eq!(a.selected, 1);
         assert_eq!(menu(&a).hosts, vec!["second".to_string()]);
         // A click on a row chooses it; inside the panel but off the rows does nothing.

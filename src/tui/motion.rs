@@ -394,7 +394,8 @@ pub fn fade_in(buf: &mut Buffer, area: Rect, k: f32) {
     }
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
-            if let Some(cell) = buf.cell_mut((x, y)) {
+            // An image cell's foreground is the image's id: leave it be.
+            if let Some(cell) = buf.cell_mut((x, y)).filter(|c| !super::theme::is_image(c.symbol())) {
                 let (f, b) = (blend(cell.fg, BG, k), blend(cell.bg, BG, k));
                 cell.set_fg(f).set_bg(b);
             }

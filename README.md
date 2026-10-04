@@ -82,6 +82,7 @@ Run `t3up` with no arguments to open the dashboard.
 | Key | Action |
 | --- | --- |
 | <kbd>Enter</kbd> / click | Actions for the selected server: update, check again, what's new, output, terminal |
+| Click a tool | That tool on that server: sign in, update, what's new (T3: pairing link) |
 | <kbd>←</kbd> <kbd>↑</kbd> <kbd>↓</kbd> <kbd>→</kbd> / <kbd>j</kbd> <kbd>k</kbd> | Move between servers |
 | <kbd>u</kbd> | Update menu for the selected server |
 | <kbd>a</kbd> | Update all servers (the first one alone first) |

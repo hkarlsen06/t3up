@@ -256,7 +256,7 @@ pub fn render(app: &mut App, logos: &Logos, buf: &mut Buffer) {
         let since = *app.motion.modal_since.get_or_insert_with(std::time::Instant::now);
         let k = if app.motion.on { motion::ease_out(since.elapsed().as_secs_f32() / motion::FADE) } else { 1.0 };
         dim(buf, 0.65 * k);
-        modal(app, buf);
+        modal(app, buf, logos);
         motion::fade_in(buf, app.modal_rect, k);
     } else {
         app.motion.modal_since = None;
@@ -481,9 +481,16 @@ fn cards(app: &mut App, logos: &Logos, buf: &mut Buffer, dim_logos: bool) {
         }
         let mut card = Buffer::empty(Rect::new(0, 0, g.card_w, g.card_h));
         card.set_style(card.area, Style::new().bg(BG).fg(TEXT));
-        draw_card(app, &g, logos, i, &mut card, dim_logos);
+        let tiles = draw_card(app, &g, logos, i, &mut card, dim_logos);
         let visible = blit(&card, buf, x, y, g.view);
         app.hits.push((visible, Hit::Card(i)));
+        // Each tool's tile, on top of its card: tapping one opens that tool's menu.
+        for (tile, name) in tiles {
+            let top = y + tile.y as i32;
+            if top >= g.view.y as i32 && top + tile.height as i32 <= g.view.bottom() as i32 {
+                app.hits.push((Rect::new(x + tile.x, top as u16, tile.width, tile.height), Hit::Tool(i, name)));
+            }
+        }
     }
     if g.content_h > g.view.height {
         let mut state = ScrollbarState::new((g.content_h - g.view.height) as usize).position(app.scroll as usize);
@@ -549,7 +556,16 @@ fn tile_note(app: &App, h: &Host, name: &str, new: Option<&String>) -> Span<'sta
     }
 }
 
-fn draw_card(app: &App, g: &Geo, logos: &Logos, i: usize, buf: &mut Buffer, dim_logos: bool) {
+/// Draw card `i` into `buf`; returns where its tools' tiles are (in the card), to tap.
+fn draw_card(
+    app: &App,
+    g: &Geo,
+    logos: &Logos,
+    i: usize,
+    buf: &mut Buffer,
+    dim_logos: bool,
+) -> Vec<(Rect, &'static str)> {
+    let mut tiles = vec![];
     let h = &app.hosts[i];
     let t = app.clock();
     let queued = app.queued.contains(&h.name);
@@ -649,6 +665,7 @@ fn draw_card(app: &App, g: &Geo, logos: &Logos, i: usize, buf: &mut Buffer, dim_
         for (dx, row, name) in places {
             let tx = x0 + dx + if g.wrapped { 0 } else { slot.saturating_sub(TILE) / 2 };
             let ty = top + row * (TILE_ROWS + 1);
+            tiles.push((Rect::new(tx, ty, TILE, TILE_ROWS), name));
             let size = logos.size(name);
             let lx = tx + TILE.saturating_sub(size.width) / 2;
             logos.draw(name, Rect::new(lx, ty, size.width.min(TILE), size.height), buf, dim_logos);
@@ -672,6 +689,7 @@ fn draw_card(app: &App, g: &Geo, logos: &Logos, i: usize, buf: &mut Buffer, dim_
             &clip(vec![Span::styled(format!("✗ {}", h.error), fg(RED))], inner_w as usize),
         );
     }
+    tiles
 }
 
 /// What hovering a card shows: every tool's full version, and the one an update would install.
@@ -806,17 +824,17 @@ fn hint(buf: &mut Buffer, inner: Rect, text: &str) {
     put(buf, inner.x, inner.bottom().saturating_sub(1), inner.width, &Line::styled(text.to_string(), fg(DIM)));
 }
 
-fn modal(app: &mut App, buf: &mut Buffer) {
+fn modal(app: &mut App, buf: &mut Buffer, logos: &Logos) {
     let Some(modal) = app.modal.clone() else { return };
     match modal {
-        Modal::Menu(m) => menu(app, buf, &m),
+        Modal::Menu(m) => menu(app, buf, &m, logos),
         Modal::Version(input) => version(app, buf, &input),
         Modal::Servers(s) => servers(app, buf, &s),
         Modal::Confirm(c) => confirm(app, buf, &c),
         Modal::Changes(c) => changes(app, buf, c),
         Modal::Help { scroll } => help(app, buf, scroll),
         Modal::Palette(p) => palette(app, buf, &p),
-        Modal::Flow(f) => flow_window(app, buf, &f),
+        Modal::Flow(f) => flow_window(app, buf, &f, logos),
         Modal::Installer(i) => installer(app, buf, &i),
     }
 }
@@ -947,7 +965,7 @@ fn draw_qr(buf: &mut Buffer, x: u16, y: u16, rows: &[Vec<bool>]) {
     }
 }
 
-fn flow_window(app: &mut App, buf: &mut Buffer, f: &Flow) {
+fn flow_window(app: &mut App, buf: &mut Buffer, f: &Flow, logos: &Logos) {
     let t = app.clock();
     let qr = match (f.kind, &f.url) {
         (Kind::Pair, Some(url)) => super::flow::qr(url, 1),
@@ -960,11 +978,11 @@ fn flow_window(app: &mut App, buf: &mut Buffer, f: &Flow) {
     let side = qr_size > 0 && sw >= qr_size + 51 && sh >= qr_size.div_ceil(2) + 9;
     let roomy = sh >= qr_size.div_ceil(2) + 10; // a line of hints under it, too
     let (w, h) = match f.kind {
-        Kind::Pair if side => (qr_size + 49, qr_size.div_ceil(2) + if roomy { 8 } else { 7 }),
-        Kind::Pair => (64, 17),
-        Kind::Other => (72, 18),
-        Kind::Claude => (72, 18), // room for "that code didn't work" under the input
-        Kind::Codex => (72, 18),
+        Kind::Pair if side => (qr_size + 49, qr_size.div_ceil(2) + if roomy { 9 } else { 8 }),
+        Kind::Pair => (64, 18),
+        Kind::Other => (72, 19),
+        Kind::Claude => (72, 19), // room for "that code didn't work" under the input
+        Kind::Codex => (72, 19),
     };
     let (_, inner) = panel(app, buf, w, h);
     let iw = inner.width as usize;
@@ -979,10 +997,23 @@ fn flow_window(app: &mut App, buf: &mut Buffer, f: &Flow) {
         (State::Running, _) if f.sent > 0 => (format!("{} checking", spinner(t)), AMBER),
         (State::Running, _) => (format!("{} waiting for you", spinner(t)), AMBER),
     };
-    put(buf, inner.x, inner.y, inner.width, &Line::styled(f.title(), bold(TEXT)));
+    // The tool's logo, what this is, and where.
+    let (what, place) = match f.kind {
+        Kind::Pair => ("Pair a device".to_string(), format!("with {}", f.host)),
+        _ => (format!("Sign in to {}", f.tool), format!("on {}", f.host)),
+    };
+    let heading = Line::styled(what, bold(TEXT));
+    let place = Some(Line::styled(place, fg(MUTED)));
+    let rows = if COMPONENTS.iter().any(|(n, _)| *n == f.tool) {
+        logo_heading(buf, logos, &f.tool, (inner.x, inner.y, inner.width), &heading, place)
+    } else {
+        put(buf, inner.x, inner.y, inner.width, &heading);
+        put(buf, inner.x, inner.y + 1, inner.width, place.as_ref().unwrap_or(&Line::default()));
+        2
+    };
     let cw = chip.width() as u16;
     put(buf, inner.right().saturating_sub(cw), inner.y, cw, &Line::styled(chip, fg(color)));
-    let mut y = inner.y + 2;
+    let mut y = inner.y + rows + 1;
 
     if let State::Failed(why) = &f.state {
         for line in wrap(&format!("✗ {why}"), iw).into_iter().take(3) {
@@ -1154,9 +1185,29 @@ fn flow_window(app: &mut App, buf: &mut Buffer, f: &Flow) {
     }
 }
 
-fn menu(app: &mut App, buf: &mut Buffer, m: &Menu) {
+/// A logo beside a heading (two rows: the heading, then `sub`); returns the rows it took.
+fn logo_heading(
+    buf: &mut Buffer,
+    logos: &Logos,
+    name: &str,
+    (x, y, w): (u16, u16, u16),
+    heading: &Line<'static>,
+    sub: Option<Line<'static>>,
+) -> u16 {
+    let size = logos.size(name);
+    logos.draw(name, Rect::new(x, y, size.width, size.height), buf, false);
+    let tx = x + size.width + 2;
+    put(buf, tx, y, w.saturating_sub(size.width + 2), heading);
+    if let Some(sub) = sub {
+        put(buf, tx, y + 1, w.saturating_sub(size.width + 2), &sub);
+    }
+    size.height.max(1)
+}
+
+fn menu(app: &mut App, buf: &mut Buffer, m: &Menu, logos: &Logos) {
     let sections = m.items.iter().skip(1).filter(|i| matches!(i, Item::Section(_))).count();
-    let h = 4 + 1 + 1 + m.items.len() as u16 + sections as u16 + 1 + 1;
+    let extra = if m.logo.is_some() { logos::HEIGHT - 1 } else { 0 };
+    let h = 4 + 1 + 1 + m.items.len() as u16 + sections as u16 + 1 + 1 + extra;
     // Columns sized to what's in them: the widest label plus three cells, then the details.
     let rows = || {
         m.items
@@ -1166,7 +1217,12 @@ fn menu(app: &mut App, buf: &mut Buffer, m: &Menu) {
     let label_w = rows().map(|(l, _)| l.width()).max().unwrap_or(0) + 3;
     let detail_w = rows().map(|(_, d)| d.width()).max().unwrap_or(0);
     let (_, inner) = panel(app, buf, (2 + label_w + detail_w + 6).max(56) as u16, h);
-    put(buf, inner.x, inner.y, inner.width, &m.heading);
+    match m.logo {
+        Some(name) => {
+            logo_heading(buf, logos, name, (inner.x, inner.y, inner.width), &m.heading, None);
+        }
+        None => put(buf, inner.x, inner.y, inner.width, &m.heading),
+    }
     // The body as lines, then the window of them around the cursor that fits.
     let mut lines: Vec<(Line<'static>, Option<usize>)> = vec![];
     for (i, item) in m.items.iter().enumerate() {
@@ -1188,11 +1244,11 @@ fn menu(app: &mut App, buf: &mut Buffer, m: &Menu) {
             }
         }
     }
-    let room = inner.height.saturating_sub(4) as usize;
+    let room = inner.height.saturating_sub(4 + extra) as usize;
     let at = lines.iter().position(|(_, i)| *i == Some(m.cursor)).unwrap_or(0);
     let start = (at + 1).saturating_sub(room).min(lines.len().saturating_sub(room));
     for (k, (line, item)) in lines.iter().skip(start).take(room).enumerate() {
-        let y = inner.y + 2 + k as u16;
+        let y = inner.y + 2 + extra + k as u16;
         if let Some(i) = item {
             let row = Rect::new(inner.x.saturating_sub(1), y, inner.width + 2, 1);
             if *i == m.cursor {
@@ -1376,7 +1432,7 @@ const HELP: [(&str, &str); 20] = [
     ("ctrl+c", "Quit now and stop every job"),
     ("esc", "Close a window"),
     ("tab", "Next server (in the editor: next suggestion)"),
-    ("mouse", "Click cards and rows, wheel scrolls"),
+    ("mouse", "Click a card for its menu, a tool for its own; wheel scrolls"),
 ];
 
 fn help(app: &mut App, buf: &mut Buffer, scroll: usize) {

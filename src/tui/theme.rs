@@ -59,7 +59,7 @@ pub fn border() -> Color {
 
 /// Whether a cell carries an inline image (a Kitty placeholder or a raw escape sequence), which
 /// darkening must leave alone: the placeholder's foreground *is* the image id.
-fn is_image(symbol: &str) -> bool {
+pub fn is_image(symbol: &str) -> bool {
     symbol.contains('\u{10EEEE}') || symbol.contains('\x1b')
 }
 
