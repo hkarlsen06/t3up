@@ -18,7 +18,7 @@ use crate::config;
 use crate::job::{self, Job};
 use crate::model::{
     COMPONENTS, Event, HOST_RE, Host, Mode, Status, StepState, VERSION_RE, compact, desktop_outdated, login_command,
-    remote_script, short, updates,
+    no_t3, remote_script, short, updates,
 };
 
 /// Something for `tui::run` to do.
@@ -574,7 +574,11 @@ impl App {
                 if let Some(login) = login_command(name) {
                     self.fx.push(Effect::Terminal {
                         command: vec![job::ssh_program(), "-t".into(), h.name.clone(), login],
-                        banner: format!("Sign in to {name} on {}. You come back here when it finishes.", h.name),
+                        banner: if *name == "T3" {
+                            format!("Pair {} with your T3 Code app: scan the code, or open the link.", h.name)
+                        } else {
+                            format!("Sign in to {name} on {}. You come back here when it finishes.", h.name)
+                        },
                     });
                 }
             }
@@ -644,10 +648,15 @@ impl App {
     }
 
     fn detail(&self, name: &str, hosts: &[&Host]) -> String {
-        if name == "T3" {
-            return format!("→ {}", if self.target.is_empty() { "latest nightly" } else { &self.target });
-        }
         let missing = hosts.iter().filter(|h| matches!(h.steps.get(name), Some((StepState::Skip, _)))).count();
+        if name == "T3" {
+            let to = if self.target.is_empty() { "latest nightly" } else { &self.target };
+            return match missing {
+                0 => format!("→ {to}"),
+                n if n == hosts.len() => format!("not installed · install {to}"),
+                n => format!("→ {to} · installs on {n} missing"),
+            };
+        }
         match missing {
             0 => "→ latest".into(),
             n if n == hosts.len() => "not installed · install latest".into(),
@@ -659,7 +668,8 @@ impl App {
         let hosts: Vec<&Host> = self.hosts.iter().filter(|h| names.contains(&h.name)).collect();
         let desktop = all && !self.outdated_desktop().is_empty();
         let row = |choice, label: &str, detail: String| Item::Row { choice, icon: "↑", label: label.into(), detail };
-        let everything = format!("T3, every installed provider{}", if desktop { ", desktop app" } else { "" });
+        let t3 = if hosts.iter().any(|h| no_t3(h)) { "installs T3, updates" } else { "T3," };
+        let everything = format!("{t3} every installed provider{}", if desktop { ", desktop app" } else { "" });
         let mut items =
             vec![Item::Section("Update".into()), row(Choice::Update("all".into()), "Everything", everything)];
         for (name, label) in COMPONENTS {

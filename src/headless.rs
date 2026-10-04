@@ -76,7 +76,8 @@ pub async fn run(opts: Options, desktop: String, logs: PathBuf) -> i32 {
             for tool in &h.auth {
                 if let Some(command) = model::login_command(tool) {
                     println!(
-                        "{name:<width$}  ! {tool} not signed in; run: ssh -t {name} {}",
+                        "{name:<width$}  ! {tool} {}; run: ssh -t {name} {}",
+                        model::sign_in_what(tool),
                         shlex::try_quote(&command).unwrap()
                     );
                 }
@@ -95,6 +96,10 @@ pub async fn run(opts: Options, desktop: String, logs: PathBuf) -> i32 {
     for h in &hosts {
         if h.status == Status::Idle {
             println!("  – {:<16} SKIPPED  (canary failed)", h.name);
+            continue;
+        }
+        if h.status == Status::Ok && model::no_t3(h) {
+            println!("  ○ {:<16} NO T3    install it: t3up --only t3 --host {}", h.name, h.name);
             continue;
         }
         let ok = h.status == Status::Ok;

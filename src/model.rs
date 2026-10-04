@@ -38,8 +38,23 @@ pub fn remote_script() -> String {
 }
 
 /// Interactive sign-in per tool: each prints a link or code to finish in your browser.
-pub const LOGIN: &[(&str, &str)] =
-    &[("Codex", "codex login --device-auth"), ("Claude", "claude auth login"), ("Grok", "grok login")];
+/// T3 itself pairs a new server with your app: `t3 pair` prints a code and exits, so it waits for Enter.
+pub const LOGIN: &[(&str, &str)] = &[
+    ("Codex", "codex login --device-auth"),
+    ("Claude", "claude auth login"),
+    ("Grok", "grok login"),
+    ("T3", "t3 pair && printf '\\nPress Enter to go back to t3up. ' && read -r _"),
+];
+
+/// What a reported `auth` asks of you: T3 pairs a new server, a tool signs in.
+pub fn sign_in_what(name: &str) -> &'static str {
+    if name == "T3" { "needs pairing with your T3 Code app" } else { "not signed in" }
+}
+
+/// Whether `h`'s last run found no T3 on it.
+pub fn no_t3(h: &Host) -> bool {
+    matches!(h.steps.get("T3"), Some((StepState::Skip, _)))
+}
 
 /// The remote command that signs in to a tool, for `ssh -t HOST <command>`.
 pub fn login_command(name: &str) -> Option<String> {
@@ -240,7 +255,7 @@ impl Host {
             Event::Skip(detail) => self.finish(StepState::Skip, &detail),
             Event::Fail(detail) => self.finish(StepState::Fail, &detail),
             Event::Auth(name) => {
-                let line = format!("! {name}  not signed in");
+                let line = format!("! {name}  {}", sign_in_what(&name));
                 self.auth.push(name);
                 line
             }

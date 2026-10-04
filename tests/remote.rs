@@ -180,6 +180,7 @@ update) echo "$*" >> "$HOME/update-calls"; sleep 1
     [ ! -f "$HOME/rollback-broken" ] || { echo 'cannot reinstall old T3' >&2; exit 3; }
     echo 0.0.1 > "$HOME/t3"
   else echo 0.0.2 > "$HOME/t3"; fi;;
+service) echo "$*" >> "$HOME/service-calls";;
 esac"#,
     );
     tool(
@@ -189,13 +190,27 @@ esac"#,
             r#"case "$*" in *localhost*|*127.0.0.1*)
   [ ! -f "$HOME/always-bad-health" ] || exit 1
   [ ! -f "$HOME/bad-health" ] || [ "$(cat "$HOME/t3")" = 0.0.1 ]; exit $?;; esac
+case "$*" in *t3.codes/install.sh*)
+  while [ "$1" != -o ]; do shift; done
+  printf '%s\n' 'echo "${{T3CODE_CHANNEL:-}}${{T3CODE_VERSION:-}}" > "$HOME/t3-installed"' \
+    'cp "$HOME/t3-shelved" "$HOME/.local/bin/t3"; echo 0.0.3 > "$HOME/t3"' > "$2"
+  exit 0;; esac
 while [ $# -gt 0 ]; do
   [ "$1" != -o ] || printf '%s\n' 'ln -sf "$HOME/{CLAUDE}" "$HOME/.local/bin/claude"' 'echo 2.0.0 > "$HOME/claude"' > "$2"
   shift
 done"#
         ),
     );
-    tool(&home, ".local/bin/systemctl", r#"[ -f "$HOME/system-service" ]"#);
+    tool(
+        &home,
+        ".local/bin/systemctl",
+        r#"case "$*" in *t3code.service*) [ -f "$HOME/user-service" ];; *) [ -f "$HOME/system-service" ];; esac"#,
+    );
+    tool(
+        &home,
+        ".local/bin/loginctl",
+        r#"case $1 in show-user) echo "Linger=$(cat "$HOME/linger" 2>/dev/null || echo no)";; enable-linger) echo yes > "$HOME/linger";; esac"#,
+    );
     tool(&home, ".local/bin/sudo", r#"shift; exec "$@""#);
     tool(&home, ".local/bin/ps", r#"cat "$HOME/ps-output" 2>/dev/null"#);
     tool(
@@ -258,6 +273,46 @@ exec /bin/sleep "$@""#,
     ok(&h);
     assert_eq!(h.steps["Codex"].0, StepState::Skip);
     assert_eq!(h.steps["Claude"].0, StepState::Skip);
+
+    // No T3 at all: a check says so instead of failing, and runs no health check.
+    reset(&home);
+    fs::rename(home.join(".local/bin/t3"), home.join("t3-shelved")).unwrap();
+    let (h, _) = remote(&home, Mode::Check, "all").await;
+    ok(&h);
+    assert_eq!(h.steps["T3"], (StepState::Skip, "not installed".into()));
+    assert!(!h.steps.contains_key("Health"), "no T3, nothing to answer on 3773");
+    // Updating it installs T3 the official way, on the nightly train, as a service with lingering,
+    // then asks to pair the new server.
+    let (h, _) = remote(&home, Mode::Update, "t3").await;
+    ok(&h);
+    assert_eq!(value(&h, "T3"), "new → 0.0.3");
+    assert_eq!(fs::read_to_string(home.join("t3-installed")).unwrap(), "nightly\n");
+    assert_eq!(fs::read_to_string(home.join("service-calls")).unwrap(), "service install\n");
+    assert_eq!(fs::read_to_string(home.join("linger")).unwrap(), "yes\n");
+    assert_eq!(h.auth, ["T3"]);
+    assert_eq!(h.steps["Health"].0, StepState::Done);
+    for name in ["t3-installed", "service-calls", "linger"] {
+        remove(&home.join(name));
+    }
+    // A service-managed T3 is found from its state file without node (the installer brings none).
+    reset(&home);
+    tool(&home, ".t3/runtime/versions/0.0.9/t3", r#"echo "t3 v0.0.9""#);
+    fs::write(
+        home.join(".t3/runtime/service-state.json"),
+        "{\n  \"protocol\": 3,\n  \"activeVersion\": \"0.0.9\"\n}\n",
+    )
+    .unwrap();
+    fs::write(home.join("user-service"), "").unwrap();
+    let (h, _) = remote(&home, Mode::Check, "all").await;
+    ok(&h);
+    assert_eq!(value(&h, "T3"), "0.0.9");
+    fs::remove_dir_all(home.join(".t3")).unwrap();
+    remove(&home.join("user-service"));
+    // Back to where the missing-tools checks below left off.
+    reset(&home);
+    for name in ["codex", "claude"] {
+        remove(&home.join(format!(".local/bin/{name}")));
+    }
     let started = Instant::now();
     let (h, _) = remote(&home, Mode::Update, "codex,claude,pi").await;
     ok(&h);

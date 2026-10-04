@@ -3,7 +3,6 @@ picked() { case ",$only," in *",$1,"*) true ;; *) false ;; esac; }
 # Update a component only in update mode and when it was picked or ONLY is `all`.
 want() { [ "$mode" = update ] && { picked all || picked "$1"; }; }
 event() { printf '\n@@t3up\t%s\t%s\n' "$1" "$2"; }
-command -v t3 >/dev/null
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 # One npm install at a time: parallel `npm install -g` into one prefix can corrupt it.
@@ -82,7 +81,9 @@ pi_step() {  # API keys per model provider; no sign-in to check
 t3_binary() {
   state="$HOME/.t3/runtime/service-state.json"
   if [ -f "$state" ] && systemctl --user cat t3code.service >/dev/null 2>&1; then
-    active=$(node -e 'const s=require(process.argv[1]); if (!/^[0-9][a-zA-Z0-9.+-]*$/.test(s.activeVersion)) process.exit(1); process.stdout.write(s.activeVersion)' "$state")
+    # Not node: the official installer brings none.
+    active=$(sed -n 's/.*"activeVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$state")
+    case $active in ''|[!0-9]*|*[!a-zA-Z0-9.+-]*) echo 'Unreadable T3 service state' >&2; return 1 ;; esac
     binary="$HOME/.t3/runtime/versions/$active/t3"
     [ -x "$binary" ] || { echo 'Active T3 executable is missing' >&2; return 1; }
     printf '%s\n' "$binary"
@@ -135,9 +136,35 @@ t3_install() {
     ln -sfn "$binary" "$HOME/.local/bin/t3"
   fi
 }
+# A server without T3 gets it the official way: the installer on the nightly train (or the pinned
+# version), then the per-user background service, which needs lingering to outlive logins.
+t3_fresh() {
+  curl -fsSL https://t3.codes/install.sh -o "$tmp/t3-install.sh"
+  if [ -n "$1" ]; then T3CODE_VERSION=$1 sh "$tmp/t3-install.sh"
+  else T3CODE_CHANNEL=nightly sh "$tmp/t3-install.sh"; fi
+  if command -v loginctl >/dev/null && ! loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q '=yes'; then
+    sudo -n loginctl enable-linger "$(id -un)" 2>/dev/null ||
+      echo 'Could not enable lingering without a password; T3 may stop when you log out' >&2
+  fi
+  "$HOME/.local/bin/t3" service install
+}
 # Cursor and Antigravity run inside T3 (an SDK and a T3-managed download): updating T3 updates them.
 t3_step() {
   event busy "$(busy)"
+  if ! command -v t3 >/dev/null && [ ! -f "$HOME/.t3/runtime/service-state.json" ]; then
+    want t3 || { event skip 'T3: not installed'; exit 0; }
+    t3_fresh "$version"
+    binary=$(t3_binary)
+    server=$("$binary" --version)
+    server=$(printf '%s\n' "$server" | sed 's/^t3 v//')
+    : > "$tmp/t3-before"
+    : > "$tmp/t3-fresh"  # a first install has nothing to roll back to
+    printf '%s\n' "$server" > "$tmp/t3-after"
+    event version "$server"
+    event done "T3: none -> $server"
+    event auth T3  # a new server pairs with your T3 Code app
+    return
+  fi
   binary=$(t3_binary)
   before=$("$binary" --version) || { echo 'T3 --version failed; update stopped' >&2; return 1; }
   before=$(printf '%s\n' "$before" | sed 's/^t3 v//') server=$before
@@ -187,12 +214,13 @@ failed=0
 for name in $names; do
   if [ "$(cat "$tmp/$name" 2>/dev/null)" != 0 ]; then event fail "$name"; failed=1; fi
 done
-if [ "$(cat "$tmp/T3" 2>/dev/null)" = 0 ]; then
+# Health, when T3 is there to answer (a server without it skipped its step).
+if [ "$(cat "$tmp/T3" 2>/dev/null)" = 0 ] && [ -f "$tmp/t3-after" ]; then
   event begin 'Health'
   if health; then event done 'Health: OK'
   else
     before=$(cat "$tmp/t3-before") after=$(cat "$tmp/t3-after")
-    if [ "$mode" = update ] && [ "$before" != "$after" ]; then
+    if [ "$mode" = update ] && [ ! -f "$tmp/t3-fresh" ] && [ "$before" != "$after" ]; then
       event begin Rollback
       ( set -e; rollback_step ) &
       if ! wait "$!"; then

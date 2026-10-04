@@ -199,6 +199,7 @@ pub fn status(h: &Host, queued: bool, t: Duration) -> (String, ratatui::style::C
             (spinner(t).to_string(), AMBER, if h.mode == crate::model::Mode::Update { "updating" } else { "checking" })
         }
         _ if queued => ("◌".into(), DIM, "queued"),
+        Status::Ok if crate::model::no_t3(h) => ("○".into(), AMBER, "no T3"),
         Status::Idle => ("·".into(), DIM, "not checked"),
         Status::Failed => ("✗".into(), RED, "failed"),
         Status::Ok => ("✓".into(), GREEN, if h.mode == crate::model::Mode::Update { "updated" } else { "healthy" }),
@@ -355,7 +356,8 @@ pub fn header_text(app: &App, width: usize) -> (Line<'static>, Line<'static>) {
     let counts = [
         (count(&Host::running), AMBER, "busy", "…"),
         (app.queued.len(), DIM, "queued", "◌"),
-        (count(&|h| h.status == Status::Ok), GREEN, "ok", "✓"),
+        (count(&|h| h.status == Status::Ok && !crate::model::no_t3(h)), GREEN, "ok", "✓"),
+        (count(&|h| h.status == Status::Ok && crate::model::no_t3(h)), AMBER, "no T3", "○"),
         (
             count(&|h| h.status == Status::Ok && !updates(h, &app.latest, &app.target).is_empty()),
             ACCENT,
@@ -604,12 +606,20 @@ fn draw_card(app: &App, g: &Geo, logos: &Logos, i: usize, buf: &mut Buffer, dim_
     let (x0, inner_w) = (2u16, g.card_w.saturating_sub(4));
     let top = 1 + TOP_PAD;
     let tiles_h = g.tile_rows as u16 * TILE_ROWS + (g.tile_rows as u16 - 1);
-    if h.status == Status::Failed && h.steps.is_empty() {
-        // Never got as far as a step: just say why, as tall as the tiles.
-        let lines = [
-            clip(vec![Span::styled(format!("✗ {}", h.error), fg(RED))], inner_w as usize),
-            Line::styled("enter → retry or open a terminal", fg(DIM)),
-        ];
+    let missing = h.status == Status::Ok && crate::model::no_t3(h);
+    if missing || h.status == Status::Failed && h.steps.is_empty() {
+        // Never got as far as a step, or there's no T3 here: say so, as tall as the tiles.
+        let lines = if missing {
+            [
+                Line::styled("T3 isn't installed on this server", fg(AMBER)),
+                Line::styled("enter → install T3 (latest nightly)", fg(DIM)),
+            ]
+        } else {
+            [
+                clip(vec![Span::styled(format!("✗ {}", h.error), fg(RED))], inner_w as usize),
+                Line::styled("enter → retry or open a terminal", fg(DIM)),
+            ]
+        };
         for (k, line) in lines.iter().enumerate() {
             put(buf, x0, top + 1 + k as u16, inner_w, line);
         }
@@ -1293,6 +1303,20 @@ mod tests {
         assert_eq!(buf[(card(0).x, card(0).y)].fg, ACCENT);
         assert_eq!(buf[(card(1).x, card(1).y)].fg, LINE);
         assert_eq!(cell_fg(&buf, "✗ failed").unwrap(), RED);
+    }
+
+    #[test]
+    fn a_server_without_t3_offers_the_install() {
+        let mut app = demo();
+        let h = &mut app.hosts[1];
+        h.reset(crate::model::Mode::Check, "all");
+        h.apply(Event::Skip("T3: not installed".into()));
+        h.apply(Event::Complete);
+        h.apply(Event::Exit { code: Some(0), error: None });
+        let buf = frame(&mut app, 150, 40);
+        for needle in ["○ no T3", "T3 isn't installed on this server", "enter → install T3"] {
+            assert!(has(&buf, needle), "{needle:?} missing from\n{}", text(&buf).join("\n"));
+        }
     }
 
     #[test]
