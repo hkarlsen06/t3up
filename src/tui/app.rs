@@ -104,6 +104,8 @@ pub enum Hit {
     Suggest(usize),
     /// A button in a sign-in or pairing window.
     Act(Act),
+    /// The Installer's install button.
+    Install,
 }
 
 /// What a sign-in or pairing window's buttons do.
@@ -125,6 +127,7 @@ pub enum Choice {
     Terminal,
     Pair,
     SignIn(String),
+    Installer,
     Changes,
     Desktop,
     DesktopGo,
@@ -185,6 +188,7 @@ pub enum Cmd {
     Ssh(String),
     Pair(String),
     SignIn(String, String),
+    Installer(Vec<String>),
     Changes(String),
     Output,
 }
@@ -254,6 +258,40 @@ pub enum Modal {
     Help { scroll: usize },
     Palette(Palette),
     Flow(Flow),
+    Installer(Installer),
+}
+
+/// Pick what to install on one or more servers: each component, what the last check found there.
+#[derive(Debug, Clone)]
+pub struct Installer {
+    pub names: Vec<String>,
+    pub rows: Vec<InstallRow>,
+    pub cursor: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct InstallRow {
+    pub name: &'static str,
+    pub label: &'static str,
+    /// Servers it's missing on (or that haven't said yet), of `total`.
+    pub missing: usize,
+    pub total: usize,
+    /// The version installed, when every server has it.
+    pub version: Option<String>,
+    pub checked: bool,
+}
+
+impl InstallRow {
+    /// Whether there's anything to install: missing somewhere.
+    pub fn open(&self) -> bool {
+        self.missing > 0
+    }
+}
+
+impl Installer {
+    pub fn picked(&self) -> Vec<&'static str> {
+        self.rows.iter().filter(|r| r.checked && r.open()).map(|r| r.name).collect()
+    }
 }
 
 /// An update of several servers starts with the first alone; the rest wait for it.
@@ -679,6 +717,40 @@ impl App {
         }
     }
 
+    // ── the installer ──────────────────────────────────────────────────────
+
+    /// What each server has, from its last check, with the boxes to tick. T3 starts ticked where it's
+    /// missing (nothing works without it); the rest is your pick.
+    pub fn open_installer(&mut self, names: Vec<String>) {
+        let hosts: Vec<&Host> = self.hosts.iter().filter(|h| names.contains(&h.name)).collect();
+        if hosts.is_empty() {
+            return;
+        }
+        let rows = COMPONENTS
+            .iter()
+            .map(|&(name, label)| {
+                let missing = hosts.iter().filter(|h| !h.installed.contains(name)).count();
+                let version =
+                    (missing == 0).then(|| hosts.iter().find_map(|h| h.current.get(name)).map(|v| short(v))).flatten();
+                InstallRow { name, label, missing, total: hosts.len(), version, checked: name == "T3" && missing > 0 }
+            })
+            .collect::<Vec<_>>();
+        let cursor = rows.iter().position(InstallRow::open).unwrap_or(0);
+        self.open_modal(Modal::Installer(Installer { names, rows, cursor }));
+    }
+
+    /// Install what's ticked: an update of just those, by name, which installs what's missing.
+    fn install(&mut self, inst: Installer) -> Option<Modal> {
+        let picked = inst.picked();
+        if picked.is_empty() {
+            self.toast(Sev::Warning, "Nothing ticked", "Pick what to install with space, or a for all");
+            return Some(Modal::Installer(inst));
+        }
+        let only: Vec<String> = picked.iter().map(|n| n.to_lowercase()).collect();
+        self.begin_update(inst.names, &only.join(","), false);
+        None
+    }
+
     // ── sign-ins and pairing ───────────────────────────────────────────────
 
     /// Sign in to `tool` (or pair, for 'T3') on `host` in a window of its own; queued behind an open one.
@@ -817,15 +889,20 @@ impl App {
         let everything = format!("{t3} every installed provider{}", if desktop { ", desktop app" } else { "" });
         let mut items =
             vec![Item::Section("Update".into()), row(Choice::Update("all".into()), "Everything", everything)];
-        // Something missing: one row sets the whole machine up (each picked by name, so it's installed).
-        let missing = hosts.iter().any(|h| h.steps.values().any(|(state, _)| *state == StepState::Skip));
-        if missing {
-            let every: Vec<String> = COMPONENTS.iter().map(|(n, _)| n.to_lowercase()).collect();
-            let detail = "T3 and every provider, with their own installers".to_string();
-            items.push(row(Choice::Update(every.join(",")), "Install everything", detail));
-        }
+        // Rows for what's installed; the rest is the Installer's.
         for (name, label) in COMPONENTS {
+            if !hosts.iter().any(|h| h.installed.contains(*name)) {
+                continue;
+            }
             items.push(row(Choice::Update(name.to_lowercase()), label, self.detail(name, &hosts)));
+        }
+        if hosts.iter().any(|h| COMPONENTS.iter().any(|(n, _)| !h.installed.contains(*n))) {
+            items.push(Item::Row {
+                choice: Choice::Installer,
+                icon: "+",
+                label: "Installer…".into(),
+                detail: "pick what to install".into(),
+            });
         }
         if desktop {
             let detail = format!("this machine · → {}", compact(&self.outdated_desktop(), &self.desktop));
@@ -1003,6 +1080,12 @@ impl App {
             }
             items.push((format!("What's new on {}", h.name), Cmd::Changes(h.name.clone())));
         }
+        if self.hosts.len() > 1 {
+            items.push(("Installer on all servers".into(), Cmd::Installer(self.names())));
+        }
+        for h in &self.hosts {
+            items.push((format!("Installer on {}", h.name), Cmd::Installer(vec![h.name.clone()])));
+        }
         items.push(("Toggle output".into(), Cmd::Output));
         self.open_modal(Modal::Palette(Palette { input: Input::default(), items, cursor: 0 }));
     }
@@ -1022,6 +1105,7 @@ impl App {
             Cmd::SignIn(host, tool) => self.start_flow(&host, &tool),
             Cmd::Changes(host) => self.open_changes(&host),
             Cmd::Output => self.toggle_output(),
+            Cmd::Installer(names) => self.open_installer(names),
         }
     }
 
@@ -1056,6 +1140,7 @@ impl App {
                     self.open_pair(name);
                 }
             }
+            Choice::Installer => self.open_installer(hosts),
             Choice::SignIn(tool) => {
                 if let Some(name) = hosts.first() {
                     self.start_flow(name, &tool);
@@ -1222,6 +1307,11 @@ impl App {
             }
             KeyCode::Char('l') => self.toggle_output(),
             KeyCode::Char('d') => self.open_desktop(),
+            KeyCode::Char('i') => {
+                if let Some(h) = self.host() {
+                    self.open_installer(vec![h.name.clone()]);
+                }
+            }
             KeyCode::Char('?') => self.open_modal(Modal::Help { scroll: 0 }),
             KeyCode::Char('q') => self.quit(),
             _ => {}
@@ -1309,6 +1399,28 @@ impl App {
                 }
             },
             Modal::Servers(s) => self.servers_key(s, key),
+            Modal::Installer(mut inst) => {
+                let n = inst.rows.len();
+                match key.code {
+                    KeyCode::Esc => return None,
+                    KeyCode::Up | KeyCode::Char('k') => inst.cursor = (inst.cursor + n - 1) % n,
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => inst.cursor = (inst.cursor + 1) % n,
+                    KeyCode::Char(' ') => {
+                        if let Some(r) = inst.rows.get_mut(inst.cursor).filter(|r| r.open()) {
+                            r.checked = !r.checked;
+                        }
+                    }
+                    KeyCode::Char('a') => {
+                        let all = inst.rows.iter().filter(|r| r.open()).all(|r| r.checked);
+                        for r in inst.rows.iter_mut().filter(|r| r.open()) {
+                            r.checked = !all;
+                        }
+                    }
+                    KeyCode::Enter => return self.install(inst),
+                    _ => {}
+                }
+                Some(Modal::Installer(inst))
+            }
             Modal::Confirm(mut c) => match key.code {
                 KeyCode::Esc | KeyCode::Char('n') => None,
                 KeyCode::Char('y') => {
@@ -1507,6 +1619,17 @@ impl App {
                 }
                 _ => Some(Modal::Menu(m)),
             },
+            Modal::Installer(mut inst) => match hit {
+                Some(Hit::Row(i)) => {
+                    inst.cursor = i;
+                    if let Some(r) = inst.rows.get_mut(i).filter(|r| r.open()) {
+                        r.checked = !r.checked;
+                    }
+                    Some(Modal::Installer(inst))
+                }
+                Some(Hit::Install) => self.install(inst),
+                _ => Some(Modal::Installer(inst)),
+            },
             Modal::Confirm(c) => match hit {
                 Some(Hit::Row(i)) => {
                     if i == 0 {
@@ -1540,9 +1663,13 @@ mod tests {
     use super::*;
     use crate::tui::snap::{frame, has};
 
+    /// Servers that have every tool, the usual case for menus.
     fn app(names: &[&str]) -> App {
         let mut a =
             App::new(names.iter().map(|n| n.to_string()).collect(), "/tmp/t3up-test/logs".into(), BTreeMap::new());
+        for h in &mut a.hosts {
+            h.installed.extend(COMPONENTS.iter().map(|(n, _)| n.to_string()));
+        }
         a.take_effects();
         a
     }
@@ -1705,14 +1832,21 @@ mod tests {
     }
 
     #[test]
-    fn install_everything_sets_up_a_new_machine() {
+    fn menus_list_what_is_installed_and_the_installer_the_rest() {
         let mut a = app(&["box"]);
         settle(&mut a);
-        // Nothing missing: no such row.
+        let labels = |a: &App| -> Vec<String> {
+            menu(a)
+                .items
+                .iter()
+                .filter_map(|i| if let Item::Row { label, .. } = i { Some(label.clone()) } else { None })
+                .collect()
+        };
+        // Everything there: every tool's row, no Installer.
         a.open_actions();
-        assert!(!menu(&a).items.iter().any(|i| matches!(i, Item::Row { label, .. } if label == "Install everything")));
+        assert!(labels(&a).contains(&"Pi".to_string()) && !labels(&a).contains(&"Installer…".to_string()));
         a.modal = None;
-        // A server missing tools offers it; it picks every component by name, so each is installed.
+        // A new machine: no T3, no Codex. Their rows go; the Installer has them.
         a.refresh();
         a.take_effects();
         a.on_job("box", Event::Skip("T3: not installed".into()));
@@ -1720,17 +1854,25 @@ mod tests {
         done(&mut a, "box", true);
         a.take_effects();
         a.open_actions();
-        let at =
-            menu(&a).items.iter().position(|i| matches!(i, Item::Row { label, .. } if label == "Install everything"));
-        let Some(at) = at else { panic!("no Install everything") };
-        if let Some(Modal::Menu(m)) = &mut a.modal {
-            m.cursor = at;
-        }
+        let rows = labels(&a);
+        assert!(!rows.contains(&"T3 server".to_string()) && !rows.contains(&"Codex CLI".to_string()), "{rows:?}");
+        assert!(rows.contains(&"Claude Code".to_string()) && rows.contains(&"Installer…".to_string()));
+        a.modal = None;
+        // The Installer: T3 starts ticked, the rest is a choice; installed ones can't be ticked.
+        press(&mut a, "i");
+        let Some(Modal::Installer(inst)) = &a.modal else { panic!("no installer") };
+        assert_eq!(inst.picked(), ["T3"]);
+        assert!(inst.rows.iter().find(|r| r.name == "Claude").is_some_and(|r| !r.open()));
+        // Tick Codex (the next open row), untick nothing else, install: just those two, by name.
+        code(&mut a, KeyCode::Down);
+        press(&mut a, " ");
         code(&mut a, KeyCode::Enter);
-        assert_eq!(
-            jobs(a.take_effects()),
-            vec![("box".into(), Mode::Update, "t3,codex,claude,opencode,grok,pi".into())]
-        );
+        assert_eq!(jobs(a.take_effects()), vec![("box".into(), Mode::Update, "t3,codex".into())]);
+        // Nothing ticked: it says so, and stays open.
+        a.open_installer(vec!["box".into()]);
+        press(&mut a, " ");
+        code(&mut a, KeyCode::Enter);
+        assert!(matches!(a.modal, Some(Modal::Installer(_))) && a.toasts.iter().any(|t| t.title == "Nothing ticked"));
     }
 
     #[test]
@@ -2067,7 +2209,8 @@ mod tests {
 
     #[test]
     fn a_finished_job_saves_the_tools_it_found() {
-        let mut a = app(&["second"]);
+        let mut a = App::new(vec!["second".into()], "/tmp/t3up-test/logs".into(), BTreeMap::new());
+        a.take_effects();
         a.on_job("second", Event::Done("Codex: codex-cli 1.0.0".into()));
         a.on_job("second", Event::Skip("Pi: not installed".into()));
         done(&mut a, "second", true);

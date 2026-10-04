@@ -91,6 +91,7 @@ Run `t3up` with no arguments to open the dashboard.
 | <kbd>e</kbd> | Add or remove servers |
 | <kbd>s</kbd> | Open an SSH session on the selected server |
 | <kbd>l</kbd> | Show or hide the live output |
+| <kbd>i</kbd> | Installer: pick what to install on the selected server |
 | <kbd>d</kbd> | Update the T3 Code desktop app on this machine (macOS) |
 | <kbd>Ctrl</kbd>+<kbd>P</kbd> | Command palette |
 | <kbd>?</kbd> | All keys |
@@ -99,10 +100,10 @@ Run `t3up` with no arguments to open the dashboard.
 Each card shows a server's tools, their versions and any newer release (`→ 0.161.0`), tools that need you to
 sign in, the server's load, disk and uptime, and how many agents are running on it.
 
-"Everything" updates T3 and every provider that's already installed. A missing provider is installed
-(per user, without sudo) only if you pick it by name, or with **Install everything**, which sets up a new machine:
-T3 and all five providers, each with its own official installer (Codex, Claude Code, OpenCode, Grok and Pi all
-have one), so a server needs nothing but SSH and curl. Pi needs Node.js, so t3up adds the official build for it
+A server's menu lists what's installed on it. **Everything** updates T3 and all of those. To add something, open
+the **Installer** (in the menu, with <kbd>i</kbd>, or by typing "install" in the palette) and tick what you want:
+T3 and any of the five providers, each set up with its own official installer (Codex, Claude Code, OpenCode, Grok
+and Pi all have one), so a new machine needs nothing but SSH and curl. Pi needs Node.js, so t3up adds the official build for it
 (checked against its SHA-256); T3 needs `libatomic`, which t3up adds with `apt`/`dnf` when sudo needs no password.
 
 ### Headless

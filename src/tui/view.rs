@@ -13,7 +13,7 @@ use ratatui::widgets::{
 use regex::Regex;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::app::{Act, App, Changes, Confirm, Hit, Item, Menu, Modal, Palette, Servers, Sev, Toast};
+use super::app::{Act, App, Changes, Confirm, Hit, Installer, Item, Menu, Modal, Palette, Servers, Sev, Toast};
 use super::flow::{Flow, Kind, State};
 use super::logos::{self, Logos};
 use super::motion;
@@ -817,7 +817,62 @@ fn modal(app: &mut App, buf: &mut Buffer) {
         Modal::Help { scroll } => help(app, buf, scroll),
         Modal::Palette(p) => palette(app, buf, &p),
         Modal::Flow(f) => flow_window(app, buf, &f),
+        Modal::Installer(i) => installer(app, buf, &i),
     }
+}
+
+/// The Installer: each component with a box to tick, what's there already greyed out.
+fn installer(app: &mut App, buf: &mut Buffer, inst: &Installer) {
+    let h = 4 + 2 + inst.rows.len() as u16 + 2 + 1 + 2;
+    let (_, inner) = panel(app, buf, 64, h);
+    let target = if inst.names.len() == 1 { inst.names[0].clone() } else { format!("{} servers", inst.names.len()) };
+    let title =
+        Line::from(vec![Span::styled("Installer", bold(TEXT)), Span::styled(format!("   {target}"), fg(MUTED))]);
+    put(buf, inner.x, inner.y, inner.width, &title);
+    let label_w = inst.rows.iter().map(|r| r.label.width()).max().unwrap_or(0) + 3;
+    for (i, r) in inst.rows.iter().enumerate() {
+        let y = inner.y + 2 + i as u16;
+        let area = Rect::new(inner.x.saturating_sub(1), y, inner.width + 2, 1);
+        if i == inst.cursor {
+            buf.set_style(area, Style::new().bg(cursor_bg()));
+        }
+        let pad = " ".repeat(label_w - r.label.width());
+        let line = if r.open() {
+            let mark = if r.checked { Span::styled("● ", bold(ACCENT)) } else { Span::styled("○ ", fg(MUTED)) };
+            let status = if r.missing == r.total {
+                "not installed".to_string()
+            } else {
+                format!("missing on {} of {}", r.missing, r.total)
+            };
+            Line::from(vec![
+                mark,
+                Span::styled(format!("{}{pad}", r.label), bold(TEXT)),
+                Span::styled(status, fg(AMBER)),
+            ])
+        } else {
+            let version = r.version.as_deref().map_or(String::new(), |v| format!(" · {v}"));
+            Line::from(vec![
+                Span::styled("✓ ", fg(blend(GREEN, SURFACE, 0.6))),
+                Span::styled(format!("{}{pad}", r.label), fg(DIM)),
+                Span::styled(format!("installed{version}"), fg(DIM)),
+            ])
+        };
+        put(buf, inner.x, y, inner.width, &line);
+        app.hits.push((area, Hit::Row(i)));
+    }
+    // The button says what it will do.
+    let n = inst.picked().len();
+    let y = inner.y + 2 + inst.rows.len() as u16 + 1;
+    let label = if n == 0 { "Install".to_string() } else { format!("Install {n}") };
+    let bw = label.width() as u16 + 4;
+    let area = Rect::new(inner.x, y, bw, 1);
+    let hovered = app.hover.as_ref().is_some_and(|h| h.hit == Some(Hit::Install));
+    let bg =
+        if n == 0 { blend(FAINT, SURFACE, 0.4) } else { blend(ACCENT, SURFACE, if hovered { 0.42 } else { 0.24 }) };
+    buf.set_style(area, Style::new().bg(bg));
+    put(buf, inner.x + 2, y, bw, &Line::styled(label, bold(if n == 0 { DIM } else { ACCENT })));
+    app.hits.push((area, Hit::Install));
+    hint(buf, inner, "space tick · a all · enter install · esc close");
 }
 
 // ── sign-in and pairing ────────────────────────────────────────────────────
@@ -1301,7 +1356,7 @@ fn confirm(app: &mut App, buf: &mut Buffer, c: &Confirm) {
     app.hits.push((b, Hit::Row(1)));
 }
 
-const HELP: [(&str, &str); 19] = [
+const HELP: [(&str, &str); 20] = [
     ("enter / click", "Actions for the selected server"),
     ("← ↑ ↓ → j k", "Move between servers"),
     ("u", "Update menu for the selected server"),
@@ -1314,6 +1369,7 @@ const HELP: [(&str, &str); 19] = [
     ("l", "Show or hide the output panel"),
     ("pgup / pgdn", "Scroll the output panel or the grid"),
     ("d", "Update the T3 Code desktop app (macOS)"),
+    ("i", "Installer: pick what to install on the selected server"),
     ("ctrl+p", "Command palette"),
     ("?", "This help"),
     ("q", "Quit (press twice while servers are running)"),
