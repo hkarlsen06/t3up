@@ -821,7 +821,15 @@ fn modal(app: &mut App, buf: &mut Buffer) {
 fn menu(app: &mut App, buf: &mut Buffer, m: &Menu) {
     let sections = m.items.iter().skip(1).filter(|i| matches!(i, Item::Section(_))).count();
     let h = 4 + 1 + 1 + m.items.len() as u16 + sections as u16 + 1 + 1;
-    let (_, inner) = panel(app, buf, 72, h);
+    // Columns sized to what's in them: the widest label plus three cells, then the details.
+    let rows = || {
+        m.items
+            .iter()
+            .filter_map(|i| if let Item::Row { label, detail, .. } = i { Some((label, detail)) } else { None })
+    };
+    let label_w = rows().map(|(l, _)| l.width()).max().unwrap_or(0) + 3;
+    let detail_w = rows().map(|(_, d)| d.width()).max().unwrap_or(0);
+    let (_, inner) = panel(app, buf, (2 + label_w + detail_w + 6).max(56) as u16, h);
     put(buf, inner.x, inner.y, inner.width, &m.heading);
     // The body as lines, then the window of them around the cursor that fits.
     let mut lines: Vec<(Line<'static>, Option<usize>)> = vec![];
@@ -837,7 +845,7 @@ fn menu(app: &mut App, buf: &mut Buffer, m: &Menu) {
                 let detail_color = if i == m.cursor { TEXT } else { MUTED };
                 let line = Line::from(vec![
                     Span::styled(format!("{icon} "), fg(ACCENT)),
-                    Span::styled(format!("{label:<16}"), bold(TEXT)),
+                    Span::styled(format!("{label}{}", " ".repeat(label_w - label.width())), bold(TEXT)),
                     Span::styled(detail.clone(), fg(detail_color)),
                 ]);
                 lines.push((line, Some(i)));
@@ -1381,6 +1389,7 @@ mod tests {
             "Check again",
             "What's new",
             "Show output",
+            "Create pairing link",
             "Terminal",
             "↑↓ move · enter choose · esc close",
             "mdr: out of disk",
@@ -1389,7 +1398,7 @@ mod tests {
         }
         // The backdrop is dimmed.
         assert_ne!(buf[(2, 10)].fg, TEXT);
-        assert_eq!(app.hits.iter().filter(|(_, h)| matches!(h, Hit::Row(_))).count(), 11);
+        assert_eq!(app.hits.iter().filter(|(_, h)| matches!(h, Hit::Row(_))).count(), 12);
     }
 
     #[test]

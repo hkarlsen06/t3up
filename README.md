@@ -58,8 +58,10 @@ cargo install --git https://github.com/hkarlsen06/t3up
 
 Each server needs key-based SSH access (t3up runs `ssh` in batch mode, so it never asks for a password).
 A server without T3 Code shows up as **no T3**: pick **T3 server** (or **Everything**) in its menu and t3up installs it
-the official way (`t3.codes/install.sh` on the nightly train, then `t3 service install`), and then opens `t3 pair`
-so you can pair it with your T3 Code app.
+the official way (`t3.codes/install.sh` on the nightly train, then `t3 service install`), and then opens a pairing link
+so you can pair it with your T3 Code app. **Create pairing link** in a server's menu makes a new one any time:
+over Tailscale when the server runs it (t3up makes your user the tailnet operator once, with sudo, so T3 can
+use Tailscale Serve), otherwise for the local network.
 
 Press <kbd>e</kbd> in the dashboard to add servers. It suggests hosts from your `~/.ssh/config`.
 Or edit `~/.config/t3up/servers` yourself, with one SSH alias or `user@host` per line:

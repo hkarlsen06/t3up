@@ -91,6 +91,7 @@ pub enum Choice {
     Check,
     Logs,
     Terminal,
+    Pair,
     Changes,
     Desktop,
     DesktopGo,
@@ -149,6 +150,7 @@ pub enum Cmd {
     Servers,
     Desktop,
     Ssh(String),
+    Pair(String),
     Changes(String),
     Output,
 }
@@ -705,6 +707,7 @@ impl App {
             row(Choice::Check, "↻", "Check again", "versions and health, changes nothing"),
             row(Choice::Changes, "✦", "What's new", "release notes for what's waiting"),
             row(Choice::Logs, "≡", if self.show_output { "Hide output" } else { "Show output" }, "live log below"),
+            row(Choice::Pair, "⌁", "Create pairing link", "connect a device, via Tailscale"),
             row(Choice::Terminal, "›", "Terminal", "ssh in · type exit to return"),
         ];
         self.update_menu(vec![h.name.clone()], heading, inspect, false);
@@ -798,6 +801,18 @@ impl App {
         }
     }
 
+    /// A pairing link for a device, made on the server in a real terminal (see `model::PAIR`).
+    pub fn open_pair(&mut self, name: &str) {
+        let Some(i) = self.hosts.iter().position(|h| h.name == name) else { return };
+        self.select(i);
+        let command = login_command("T3").unwrap_or_default();
+        let banner = format!("Pairing link for {name}: scan the code, or paste the link into Add environment.");
+        self.fx.push(Effect::Terminal {
+            command: vec![job::ssh_program(), "-t".into(), name.to_string(), command],
+            banner,
+        });
+    }
+
     /// What's new: the release notes of everything waiting on this server.
     pub fn open_changes(&mut self, name: &str) {
         let Some(h) = self.hosts.iter().find(|h| h.name == name) else { return };
@@ -832,6 +847,7 @@ impl App {
         items.push(("Update T3 Code desktop".into(), Cmd::Desktop));
         for h in &self.hosts {
             items.push((format!("SSH into {}", h.name), Cmd::Ssh(h.name.clone())));
+            items.push((format!("Create pairing link for {}", h.name), Cmd::Pair(h.name.clone())));
             items.push((format!("What's new on {}", h.name), Cmd::Changes(h.name.clone())));
         }
         items.push(("Toggle output".into(), Cmd::Output));
@@ -849,6 +865,7 @@ impl App {
             Cmd::Servers => self.open_servers(),
             Cmd::Desktop => self.open_desktop(),
             Cmd::Ssh(host) => self.open_ssh(&host),
+            Cmd::Pair(host) => self.open_pair(&host),
             Cmd::Changes(host) => self.open_changes(&host),
             Cmd::Output => self.toggle_output(),
         }
@@ -878,6 +895,11 @@ impl App {
             Choice::Terminal => {
                 if let Some(name) = hosts.first() {
                     self.open_ssh(name);
+                }
+            }
+            Choice::Pair => {
+                if let Some(name) = hosts.first() {
+                    self.open_pair(name);
                 }
             }
             Choice::Changes => {

@@ -38,13 +38,24 @@ pub fn remote_script() -> String {
 }
 
 /// Interactive sign-in per tool: each prints a link or code to finish in your browser.
-/// T3 itself pairs a new server with your app: `t3 pair` prints a code and exits, so it waits for Enter.
-pub const LOGIN: &[(&str, &str)] = &[
-    ("Codex", "codex login --device-auth"),
-    ("Claude", "claude auth login"),
-    ("Grok", "grok login"),
-    ("T3", "t3 pair && printf '\\nPress Enter to go back to t3up. ' && read -r _"),
-];
+/// T3 itself pairs a new server with your app (`PAIR`).
+pub const LOGIN: &[(&str, &str)] =
+    &[("Codex", "codex login --device-auth"), ("Claude", "claude auth login"), ("Grok", "grok login"), ("T3", PAIR)];
+
+/// A pairing link for a device: over Tailscale when it runs on the server, else for the local network.
+/// Tailscale Serve needs the server's user to be the tailnet operator, set once with sudo (it may ask for
+/// a password: this runs in a real terminal). `t3 pair` prints and exits, so it waits for Enter.
+pub const PAIR: &str = r#"how=local
+if command -v tailscale >/dev/null && tailscale status >/dev/null 2>&1; then
+  if tailscale debug prefs 2>/dev/null | grep -q "\"OperatorUser\": \"$(id -un)\""; then how=tailscale
+  else
+    echo "Letting $(id -un) publish T3 over Tailscale Serve: sudo tailscale set --operator=$(id -un)"
+    if sudo tailscale set --operator="$(id -un)"; then how=tailscale; fi
+  fi
+fi
+if [ "$how" = tailscale ]; then t3 pair --tailscale
+else echo "Tailscale isn't available here: this link only works on the local network."; t3 pair; fi
+printf '\nPress Enter to go back to t3up. '; read -r _"#;
 
 /// What a reported `auth` asks of you: T3 pairs a new server, a tool signs in.
 pub fn sign_in_what(name: &str) -> &'static str {
