@@ -30,7 +30,7 @@ pub fn component_index(name: &str) -> usize {
 
 /// Non-interactive SSH skips shell rc files: add the usual per-user and Homebrew bin dirs.
 /// One line, so sign-in commands can start with it too. ponytail: nvm picks highest by name, not semver.
-pub const PATH_SETUP: &str = r#"for dir in "$HOME"/.nvm/versions/node/*/bin; do if [ -d "$dir" ]; then PATH="$dir:$PATH"; fi; done; PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:$HOME/.opencode/bin:$HOME/.volta/bin:$HOME/.local/share/pnpm:/usr/local/bin:/opt/homebrew/bin:$PATH"; export PATH"#;
+pub const PATH_SETUP: &str = r#"for dir in "$HOME"/.nvm/versions/node/*/bin; do if [ -d "$dir" ]; then PATH="$dir:$PATH"; fi; done; PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:$HOME/.opencode/bin:$HOME/.volta/bin:$HOME/.local/share/pnpm:$HOME/.grok/bin:$HOME/.local/share/pi-node/current/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"; export PATH"#;
 
 /// The POSIX sh script each server runs, piped to `ssh HOST sh -s -- MODE VERSION ONLY`.
 pub fn remote_script() -> String {

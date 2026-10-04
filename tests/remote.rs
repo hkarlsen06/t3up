@@ -48,6 +48,9 @@ fn link(home: &Path, name: &str, path: &str) {
 const CODEX: &str = ".local/lib/node_modules/@openai/codex/bin/codex.js";
 const PI: &str = ".local/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js";
 const CLAUDE: &str = ".local/share/claude/versions/1/claude";
+// Where the official installers put Codex and Pi: their updaters own these.
+const CODEX_STANDALONE: &str = ".codex/packages/standalone/current/codex";
+const PI_MANAGED: &str = ".pi/agent/install/bin/pi";
 
 fn reset(home: &Path) {
     for (name, version) in
@@ -68,6 +71,9 @@ fn reset(home: &Path) {
         "rollback-broken",
         "system-service",
         "always-bad-health",
+        "codex-noninteractive",
+        "curl-calls",
+        ".local/bin/node",
     ] {
         remove(&home.join(name));
     }
@@ -183,24 +189,38 @@ update) echo "$*" >> "$HOME/update-calls"; sleep 1
 service) echo "$*" >> "$HOME/service-calls";;
 esac"#,
     );
+    // curl serves each official installer (as a fake that installs where the real one does), and
+    // nodejs.org's checksums and archive from $HOME/node-dist.
     tool(
         &home,
         ".local/bin/curl",
         &format!(
-            r#"case "$*" in *localhost*|*127.0.0.1*)
+            r#"url= out=
+while [ $# -gt 0 ]; do case $1 in -o) out=$2; shift 2 ;; --max-time) shift 2 ;; -*) shift ;; *) url=$1; shift ;; esac; done
+case $url in *localhost*|*127.0.0.1*)
   [ ! -f "$HOME/always-bad-health" ] || exit 1
-  [ ! -f "$HOME/bad-health" ] || [ "$(cat "$HOME/t3")" = 0.0.1 ]; exit $?;; esac
-case "$*" in *t3.codes/install.sh*)
-  while [ "$1" != -o ]; do shift; done
-  printf '%s\n' 'echo "${{T3CODE_CHANNEL:-}}${{T3CODE_VERSION:-}}" > "$HOME/t3-installed"' \
-    'cp "$HOME/t3-shelved" "$HOME/.local/bin/t3"; echo 0.0.3 > "$HOME/t3"' > "$2"
-  exit 0;; esac
-while [ $# -gt 0 ]; do
-  [ "$1" != -o ] || printf '%s\n' 'ln -sf "$HOME/{CLAUDE}" "$HOME/.local/bin/claude"' 'echo 2.0.0 > "$HOME/claude"' > "$2"
-  shift
-done"#
+  [ ! -f "$HOME/bad-health" ] || [ "$(cat "$HOME/t3")" = 0.0.1 ]; exit $? ;;
+esac
+echo "$url" >> "$HOME/curl-calls"
+case $url in
+*t3.codes/install.sh) printf '%s\n' 'echo "${{T3CODE_CHANNEL:-}}${{T3CODE_VERSION:-}}" > "$HOME/t3-installed"' \
+    'cp "$HOME/t3-shelved" "$HOME/.local/bin/t3"; echo 0.0.3 > "$HOME/t3"' > "$out" ;;
+*chatgpt.com/codex/install.sh) printf '%s\n' 'echo "$NON_INTERACTIVE" > "$HOME/codex-noninteractive"' \
+    'ln -sf "$HOME/{CODEX_STANDALONE}" "$HOME/.local/bin/codex"; echo 0.2.0 > "$HOME/codex"' > "$out" ;;
+*pi.dev/install.sh) printf '%s\n' 'command -v npm >/dev/null && node -e 1 || {{ echo "Node.js 22.19.0 or newer is required" >&2; exit 1; }}' \
+    'ln -sf "$HOME/{PI_MANAGED}" "$HOME/.local/bin/pi"; echo 0.6.0 > "$HOME/pi"' > "$out" ;;
+*/SHASUMS256.txt) cp "$HOME/node-dist/SHASUMS256.txt" "$out" ;;
+*.tar.gz) cp "$HOME/node-dist/${{url##*/}}" "$out" ;;
+*) printf '%s\n' 'ln -sf "$HOME/{CLAUDE}" "$HOME/.local/bin/claude"' 'echo 2.0.0 > "$HOME/claude"' > "$out" ;;
+esac"#
         ),
     );
+    tool(
+        &home,
+        CODEX_STANDALONE,
+        r#"case $1 in --version) echo "codex-cli $(cat "$HOME/codex")";; login) [ -f "$HOME/codex-auth" ];; esac"#,
+    );
+    tool(&home, PI_MANAGED, r#"cat "$HOME/pi""#);
     tool(
         &home,
         ".local/bin/systemctl",
@@ -313,15 +333,73 @@ exec /bin/sleep "$@""#,
     for name in ["codex", "claude"] {
         remove(&home.join(format!(".local/bin/{name}")));
     }
-    let started = Instant::now();
+    // A new machine: every missing tool comes from its own official installer, never npm.
+    tool(&home, ".local/bin/node", "exit 0"); // a Node new enough for Pi's installer
     let (h, _) = remote(&home, Mode::Update, "codex,claude,pi").await;
     ok(&h);
-    assert!(started.elapsed().as_secs_f64() > 2.0, "npm installs must serialize");
     assert_eq!(
         [value(&h, "Codex"), value(&h, "Claude"), value(&h, "Pi")],
         ["new → 0.2.0", "new → 2.0.0", "new → 0.6.0"]
     );
     assert!(h.auth.is_empty());
+    assert!(!home.join("npm-calls").exists(), "installers, not npm");
+    assert_eq!(fs::read_to_string(home.join("codex-noninteractive")).unwrap(), "1\n");
+    // Updating them later goes through their own updaters: Codex's standalone, `pi update`.
+    let (h, _) = remote(&home, Mode::Update, "codex,pi").await;
+    ok(&h);
+    assert!(!home.join("npm-calls").exists());
+    remove(&home.join(".local/bin/node"));
+
+    // No Node at all: Pi's installer gets the official build first, checked against its SHA-256.
+    let plat = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "darwin-arm64",
+        ("macos", _) => "darwin-x64",
+        (_, "aarch64") => "linux-arm64",
+        _ => "linux-x64",
+    };
+    let name = format!("node-v24.9.0-{plat}");
+    let dist = home.join("node-dist");
+    tool(&dist, &format!("{name}/bin/node"), "exit 0");
+    tool(&dist, &format!("{name}/bin/npm"), "exit 0");
+    let archive = format!("{name}.tar.gz");
+    assert!(
+        std::process::Command::new("tar")
+            .args(["-czf", &archive, &name])
+            .current_dir(&dist)
+            .status()
+            .unwrap()
+            .success()
+    );
+    use sha2::Digest;
+    let sum: String =
+        sha2::Sha256::digest(fs::read(dist.join(&archive)).unwrap()).iter().map(|b| format!("{b:02x}")).collect();
+    let sums = format!("{} node-v24.9.0-other.tar.gz\n{sum}  {archive}\n", "0".repeat(64));
+    fs::write(dist.join("SHASUMS256.txt"), &sums).unwrap();
+    unsafe {
+        std::env::set_var("T3UP_NODE_DIST", "https://dist.example/latest-v24.x");
+    }
+    remove(&home.join(".local/bin/pi"));
+    let (h, _) = remote(&home, Mode::Update, "pi").await;
+    ok(&h);
+    assert_eq!(value(&h, "Pi"), "new → 0.6.0");
+    assert!(home.join(".local/share/pi-node/current/bin/node").exists());
+    // A download that doesn't match is refused, and Pi isn't installed.
+    fs::remove_dir_all(home.join(".local/share/pi-node")).unwrap();
+    remove(&home.join(".local/bin/pi"));
+    fs::write(dist.join("SHASUMS256.txt"), sums.replace(&sum, &"f".repeat(64))).unwrap();
+    let (h, _) = remote(&home, Mode::Update, "pi").await;
+    assert_eq!(h.steps["Pi"].0, StepState::Fail);
+    assert!(h.error.contains("checksum"), "{}", h.error);
+    assert!(!home.join(".local/share/pi-node").join("current").exists());
+
+    // Tools npm installed still update with npm, one install at a time.
+    reset(&home);
+    link(&home, "pi", PI);
+    let started = Instant::now();
+    let (h, _) = remote(&home, Mode::Update, "codex,pi").await;
+    ok(&h);
+    assert!(started.elapsed().as_secs_f64() > 2.0, "npm installs must serialize");
+    assert_eq!(fs::read_to_string(home.join("npm-calls")).unwrap().lines().count(), 2);
     remove(&home.join("npm-calls"));
     let (h, _) = remote(&home, Mode::Update, "pi").await;
     ok(&h);

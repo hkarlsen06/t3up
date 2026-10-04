@@ -40,14 +40,43 @@ upgrade() {  # Name bin npm-package native-real-path-glob native-update-args
        return 1 ;;
   esac
 }
-# Report a provider's version, updating it when wanted. A missing tool is installed per
-# user (no sudo) only when picked by name; otherwise its step ends here, as skipped.
+# A Node.js for tools that need one (Pi): the official LTS build for this machine, checked against
+# its published SHA-256, per user, no sudo. It goes where Pi's own installer puts a standalone Node.
+ensure_node() {
+  if command -v npm >/dev/null && node -e 'const [a, b] = process.versions.node.split(".").map(Number); process.exit(a > 22 || (a === 22 && b >= 19) ? 0 : 1)' 2>/dev/null; then
+    return 0
+  fi
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64) plat=linux-x64 ;;
+    Linux-aarch64|Linux-arm64) plat=linux-arm64 ;;
+    Darwin-arm64) plat=darwin-arm64 ;;
+    Darwin-x86_64) plat=darwin-x64 ;;
+    *) echo "No Node.js build for $(uname -sm); install Node.js 22.19 or newer" >&2; return 1 ;;
+  esac
+  base=${T3UP_NODE_DIST:-https://nodejs.org/dist/latest-v24.x}
+  echo "Installing Node.js for $plat from $base"
+  curl -fsSL "$base/SHASUMS256.txt" -o "$tmp/node-sums"
+  file=$(awk -v want="-$plat.tar.gz" 'substr($2, length($2) - length(want) + 1) == want { print $2; exit }' "$tmp/node-sums")
+  [ -n "$file" ] || { echo "No Node.js $plat build is listed" >&2; return 1; }
+  curl -fsSL "$base/$file" -o "$tmp/$file"
+  want=$(awk -v f="$file" '$2 == f { print $1 }' "$tmp/node-sums")
+  got=$( { sha256sum "$tmp/$file" 2>/dev/null || shasum -a 256 "$tmp/$file"; } | awk '{ print $1 }')
+  [ -n "$want" ] && [ "$want" = "$got" ] || { echo 'The Node.js download does not match its checksum' >&2; return 1; }
+  dir=${XDG_DATA_HOME:-$HOME/.local/share}/pi-node
+  mkdir -p "$dir"
+  tar -xzf "$tmp/$file" -C "$dir"
+  ln -sfn "$dir/${file%.tar.gz}" "$dir/current"
+  PATH="$dir/current/bin:$PATH"; export PATH
+}
+# Report a provider's version, updating it when wanted. A missing tool is installed per user
+# (no sudo) with its official installer, only when picked by name; otherwise its step ends here,
+# as skipped. The installers never prompt here: no terminal, and NON_INTERACTIVE for Codex's.
 tool() {  # Name bin npm-package native-real-path-glob native-update-args [install-script-url]
   if ! command -v "$2" >/dev/null; then
     if [ "$mode" = update ] && picked "$2"; then
       if [ -n "${6:-}" ]; then
         curl -fsSL "$6" -o "$tmp/$2-install.sh"
-        bash "$tmp/$2-install.sh"
+        NON_INTERACTIVE=1 bash "$tmp/$2-install.sh" </dev/null
       else mkdir -p "$HOME/.local"; npm_into "$HOME/.local" "$3@latest"; fi
       event done "$1: none -> $("$2" --version </dev/null)"
       return
@@ -61,7 +90,7 @@ tool() {  # Name bin npm-package native-real-path-glob native-update-args [insta
 }
 # Each provider step then reports whether the tool is signed in; t3up runs the login itself.
 codex_step() {
-  tool Codex codex @openai/codex '*/packages/standalone/*' update
+  tool Codex codex @openai/codex '*/packages/standalone/*' update https://chatgpt.com/codex/install.sh
   codex login status </dev/null >/dev/null 2>&1 || event auth Codex
 }
 claude_step() {
@@ -72,11 +101,12 @@ opencode_step() {  # signs in per model provider, so there is no single status t
   tool OpenCode opencode opencode-ai '*/.opencode/bin/opencode' upgrade https://opencode.ai/install
 }
 grok_step() {  # Grok updates itself however it was installed
-  tool Grok grok @xai-official/grok '*' update
+  tool Grok grok @xai-official/grok '*' update https://x.ai/cli/install.sh
   grok models </dev/null 2>&1 | grep -qi 'you are logged in' || event auth Grok
 }
-pi_step() {  # API keys per model provider; no sign-in to check
-  tool Pi pi @earendil-works/pi-coding-agent '' ''
+pi_step() {  # API keys per model provider; no sign-in to check. Its installer needs Node to be there.
+  if ! command -v pi >/dev/null && [ "$mode" = update ] && picked pi; then ensure_node; fi
+  tool Pi pi @earendil-works/pi-coding-agent '*/.pi/agent/*' update https://pi.dev/install.sh
 }
 t3_binary() {
   state="$HOME/.t3/runtime/service-state.json"
@@ -139,6 +169,19 @@ t3_install() {
 # A server without T3 gets it the official way: the installer on the nightly train (or the pinned
 # version), then the per-user background service, which needs lingering to outlive logins.
 t3_fresh() {
+  # T3's Linux build links libatomic, which minimal installs lack: add it when sudo needs no password.
+  if [ "$(uname -s)" = Linux ] && ! { ldconfig -p 2>/dev/null || /sbin/ldconfig -p 2>/dev/null; } | grep -q 'libatomic\.so\.1'; then
+    if command -v apt-get >/dev/null && sudo -n true 2>/dev/null; then
+      echo 'Installing libatomic1, which T3 needs'
+      sudo -n sh -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libatomic1' >/dev/null
+    elif command -v dnf >/dev/null && sudo -n true 2>/dev/null; then
+      echo 'Installing libatomic, which T3 needs'
+      sudo -n dnf install -y -q libatomic >/dev/null
+    else
+      echo 'T3 needs libatomic (on Ubuntu: sudo apt install libatomic1); install it and try again' >&2
+      return 1
+    fi
+  fi
   curl -fsSL https://t3.codes/install.sh -o "$tmp/t3-install.sh"
   if [ -n "$1" ]; then T3CODE_VERSION=$1 sh "$tmp/t3-install.sh"
   else T3CODE_CHANNEL=nightly sh "$tmp/t3-install.sh"; fi
@@ -146,7 +189,10 @@ t3_fresh() {
     sudo -n loginctl enable-linger "$(id -un)" 2>/dev/null ||
       echo 'Could not enable lingering without a password; T3 may stop when you log out' >&2
   fi
-  "$HOME/.local/bin/t3" service install
+  "$HOME/.local/bin/t3" service install || {
+    echo "T3 is installed, but its background service didn't start: see t3 service status on $(hostname)" >&2
+    return 1
+  }
 }
 # Cursor and Antigravity run inside T3 (an SDK and a T3-managed download): updating T3 updates them.
 t3_step() {

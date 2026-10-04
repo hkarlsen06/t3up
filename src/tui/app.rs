@@ -817,6 +817,13 @@ impl App {
         let everything = format!("{t3} every installed provider{}", if desktop { ", desktop app" } else { "" });
         let mut items =
             vec![Item::Section("Update".into()), row(Choice::Update("all".into()), "Everything", everything)];
+        // Something missing: one row sets the whole machine up (each picked by name, so it's installed).
+        let missing = hosts.iter().any(|h| h.steps.values().any(|(state, _)| *state == StepState::Skip));
+        if missing {
+            let every: Vec<String> = COMPONENTS.iter().map(|(n, _)| n.to_lowercase()).collect();
+            let detail = "T3 and every provider, with their own installers".to_string();
+            items.push(row(Choice::Update(every.join(",")), "Install everything", detail));
+        }
         for (name, label) in COMPONENTS {
             items.push(row(Choice::Update(name.to_lowercase()), label, self.detail(name, &hosts)));
         }
@@ -1695,6 +1702,35 @@ mod tests {
         a.on_result(Res::FlowExit { id, code: Some(0) });
         assert_eq!(jobs(a.take_effects()), vec![("box".into(), Mode::Check, "all".into())]);
         assert!(a.toasts.iter().any(|t| t.title == "Signed in"));
+    }
+
+    #[test]
+    fn install_everything_sets_up_a_new_machine() {
+        let mut a = app(&["box"]);
+        settle(&mut a);
+        // Nothing missing: no such row.
+        a.open_actions();
+        assert!(!menu(&a).items.iter().any(|i| matches!(i, Item::Row { label, .. } if label == "Install everything")));
+        a.modal = None;
+        // A server missing tools offers it; it picks every component by name, so each is installed.
+        a.refresh();
+        a.take_effects();
+        a.on_job("box", Event::Skip("T3: not installed".into()));
+        a.on_job("box", Event::Skip("Codex: not installed".into()));
+        done(&mut a, "box", true);
+        a.take_effects();
+        a.open_actions();
+        let at =
+            menu(&a).items.iter().position(|i| matches!(i, Item::Row { label, .. } if label == "Install everything"));
+        let Some(at) = at else { panic!("no Install everything") };
+        if let Some(Modal::Menu(m)) = &mut a.modal {
+            m.cursor = at;
+        }
+        code(&mut a, KeyCode::Enter);
+        assert_eq!(
+            jobs(a.take_effects()),
+            vec![("box".into(), Mode::Update, "t3,codex,claude,opencode,grok,pi".into())]
+        );
     }
 
     #[test]

@@ -100,7 +100,10 @@ Each card shows a server's tools, their versions and any newer release (`→ 0.1
 sign in, the server's load, disk and uptime, and how many agents are running on it.
 
 "Everything" updates T3 and every provider that's already installed. A missing provider is installed
-(per user, without sudo) only if you pick it by name.
+(per user, without sudo) only if you pick it by name, or with **Install everything**, which sets up a new machine:
+T3 and all five providers, each with its own official installer (Codex, Claude Code, OpenCode, Grok and Pi all
+have one), so a server needs nothing but SSH and curl. Pi needs Node.js, so t3up adds the official build for it
+(checked against its SHA-256); T3 needs `libatomic`, which t3up adds with `apt`/`dnf` when sudo needs no password.
 
 ### Headless
 
