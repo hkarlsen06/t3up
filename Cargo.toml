@@ -1,0 +1,43 @@
+[package]
+name = "t3up"
+version = "0.2.0"
+edition = "2024"
+description = "Full-screen terminal dashboard for checking and updating T3 Code servers over SSH"
+license = "MIT"
+repository = "https://github.com/hkarlsen06/t3up"
+readme = "README.md"
+
+[[bin]]
+name = "t3up"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive"] }
+crossterm = "0.29.0"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+plist = "1.10.1"
+ratatui = "0.30.2"
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+shlex = "2.0.1"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs"] }
+ureq = "3.4.2"
+unicode-width = "0.2.2"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.190"
+tokio = { version = "1.53.2", features = ["signal"] }
+
+[dev-dependencies]
+portable-pty = "0.9"
