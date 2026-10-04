@@ -1,10 +1,8 @@
-//! The pairing command (`model::PAIR`) under bash and dash, with fake tailscale, sudo and t3.
+//! The pairing command (`model::pair_command`) under bash and dash, with fake tailscale, sudo and t3.
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-
-use std::io::Write;
 
 fn tool(dir: &Path, name: &str, body: &str) {
     let path = dir.join(name);
@@ -32,7 +30,8 @@ fn pair(shell: &str, tailscale: Option<&str>, operator: bool) -> (String, String
             ),
         );
     }
-    let command = t3up::model::PAIR;
+    let command = t3up::model::pair_command(true); // without PATH_SETUP: only the fakes on PATH
+    let command = command.as_str();
     let mut child = Command::new(shell)
         .args(["-c", command])
         .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
@@ -41,7 +40,7 @@ fn pair(shell: &str, tailscale: Option<&str>, operator: bool) -> (String, String
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(b"\n").unwrap(); // the Enter that ends it
+    drop(child.stdin.take());
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "{shell}: {out:?}");
     let calls = fs::read_to_string(&log).unwrap_or_default();
@@ -54,6 +53,8 @@ fn pairs_over_tailscale_when_it_runs() {
     for shell in ["/bin/bash", "/bin/dash"].into_iter().filter(|s| Path::new(s).exists()) {
         let (calls, _) = pair(shell, Some("running"), true);
         assert_eq!(calls, "t3 pair --tailscale\n", "{shell}: already the operator, no sudo");
+        let (_, out) = pair(shell, Some("running"), true);
+        assert!(out.contains("@@pair tailscale"));
 
         let (calls, out) = pair(shell, Some("running"), false);
         assert!(calls.starts_with("sudo tailscale set --operator="), "{shell}: {calls}");
@@ -62,7 +63,7 @@ fn pairs_over_tailscale_when_it_runs() {
 
         let (calls, out) = pair(shell, Some("stopped"), true);
         assert_eq!(calls, "t3 pair\n", "{shell}: tailscale down, local link");
-        assert!(out.contains("local network"));
+        assert!(out.contains("@@pair local"), "{shell}: tells the dashboard it's a local link");
 
         let (calls, _) = pair(shell, None, true);
         assert_eq!(calls, "t3 pair\n", "{shell}: no tailscale, local link");

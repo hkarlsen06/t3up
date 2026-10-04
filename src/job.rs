@@ -14,7 +14,7 @@ use crate::model::{self, Event, Mode};
 /// Events from every running job, tagged with the host they came from.
 pub type Sender = UnboundedSender<(String, Event)>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Job {
     pub host: String,
     pub mode: Mode,

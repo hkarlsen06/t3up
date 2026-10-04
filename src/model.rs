@@ -38,24 +38,34 @@ pub fn remote_script() -> String {
 }
 
 /// Interactive sign-in per tool: each prints a link or code to finish in your browser.
-/// T3 itself pairs a new server with your app (`PAIR`).
-pub const LOGIN: &[(&str, &str)] =
-    &[("Codex", "codex login --device-auth"), ("Claude", "claude auth login"), ("Grok", "grok login"), ("T3", PAIR)];
+/// T3 itself pairs a new server with your app: `pair_command`.
+pub const LOGIN: &[(&str, &str)] = &[
+    ("Codex", "codex login --device-auth"),
+    ("Claude", "claude auth login"),
+    ("Grok", "grok login"),
+    ("T3", "t3 pair"),
+];
 
-/// A pairing link for a device: over Tailscale when it runs on the server, else for the local network.
-/// Tailscale Serve needs the server's user to be the tailnet operator, set once with sudo (it may ask for
-/// a password: this runs in a real terminal). `t3 pair` prints and exits, so it waits for Enter.
-pub const PAIR: &str = r#"how=local
+/// Make a pairing link: over Tailscale when it runs on the server, else for the local network.
+/// Tailscale Serve needs the server's user to be the tailnet operator; `interactive` may ask sudo for a
+/// password (in a real terminal), the dashboard only tries without one. Prints `@@pair tailscale|local`.
+pub fn pair_command(interactive: bool) -> String {
+    let sudo = if interactive { "sudo" } else { "sudo -n" };
+    format!(
+        r#"how=local
 if command -v tailscale >/dev/null && tailscale status >/dev/null 2>&1; then
   if tailscale debug prefs 2>/dev/null | grep -q "\"OperatorUser\": \"$(id -un)\""; then how=tailscale
   else
-    echo "Letting $(id -un) publish T3 over Tailscale Serve: sudo tailscale set --operator=$(id -un)"
-    if sudo tailscale set --operator="$(id -un)"; then how=tailscale; fi
+    echo "Letting $(id -un) publish T3 over Tailscale Serve: {sudo} tailscale set --operator=$(id -un)"
+    if {sudo} tailscale set --operator="$(id -un)"; then how=tailscale
+    else echo "Couldn't (it needs sudo); this link only works on the local network."; fi
   fi
 fi
+echo "@@pair $how"
 if [ "$how" = tailscale ]; then t3 pair --tailscale
-else echo "Tailscale isn't available here: this link only works on the local network."; t3 pair; fi
-printf '\nPress Enter to go back to t3up. '; read -r _"#;
+else t3 pair; fi"#
+    )
+}
 
 /// What a reported `auth` asks of you: T3 pairs a new server, a tool signs in.
 pub fn sign_in_what(name: &str) -> &'static str {
@@ -68,7 +78,14 @@ pub fn no_t3(h: &Host) -> bool {
 }
 
 /// The remote command that signs in to a tool, for `ssh -t HOST <command>`.
+/// T3's pairing prints and exits, so in a terminal it waits for Enter.
 pub fn login_command(name: &str) -> Option<String> {
+    if name == "T3" {
+        return Some(format!(
+            "{PATH_SETUP}; {}\nprintf '\\nPress Enter to go back to t3up. '; read -r _",
+            pair_command(true)
+        ));
+    }
     LOGIN.iter().find(|(n, _)| *n == name).map(|(_, c)| format!("{PATH_SETUP}; {c}"))
 }
 

@@ -1,5 +1,6 @@
 //! The full-screen dashboard: terminal setup, the event loop, and the things `App` asks for.
 pub mod app;
+pub mod flow;
 pub mod input;
 pub mod logos;
 pub mod motion;
@@ -8,8 +9,10 @@ mod snap;
 pub mod theme;
 pub mod view;
 
+use std::collections::HashMap;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use crossterm::event::{
@@ -22,6 +25,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui_image::picker::Picker;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
@@ -147,9 +151,119 @@ fn blocking<T: Send + 'static>(
     });
 }
 
+/// Running sign-ins and pairings: their task, and where what you type goes.
+type Flows = HashMap<u64, (JoinHandle<()>, UnboundedSender<String>)>;
+
+/// The longest whole-UTF-8 prefix of `buf`, taken out of it (a character can straddle two reads).
+fn take_utf8(buf: &mut Vec<u8>) -> String {
+    let valid = match std::str::from_utf8(buf) {
+        Ok(s) => s.len(),
+        Err(e) if e.error_len().is_some() => buf.len(), // really invalid: lossy, all of it
+        Err(e) => e.valid_up_to(),
+    };
+    let text = String::from_utf8_lossy(&buf[..valid]).into_owned();
+    buf.drain(..valid);
+    text
+}
+
+/// Run `command` on `host` under a remote terminal (the tools expect one), streaming its output back.
+fn start_flow(
+    id: u64,
+    host: String,
+    command: String,
+    res: &UnboundedSender<Res>,
+) -> (JoinHandle<()>, UnboundedSender<String>) {
+    let (input, mut typed) = unbounded_channel::<String>();
+    let res = res.clone();
+    let task = tokio::spawn(async move {
+        let say = |text: String| drop(res.send(Res::FlowOut { id, text }));
+        let spawned = tokio::process::Command::new(job::ssh_program())
+            .args(["-tt", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", &host, &command])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(e) => {
+                say(format!("Could not start ssh: {e}\n"));
+                let _ = res.send(Res::FlowExit { id, code: None });
+                return;
+            }
+        };
+        let (Some(mut out), Some(mut err), Some(mut stdin)) =
+            (child.stdout.take(), child.stderr.take(), child.stdin.take())
+        else {
+            return;
+        };
+        let (mut a, mut b) = ([0u8; 4096], [0u8; 4096]);
+        let (mut out_open, mut err_open, mut carry) = (true, true, Vec::new());
+        while out_open || err_open {
+            tokio::select! {
+                n = out.read(&mut a), if out_open => match n {
+                    Ok(n) if n > 0 => {
+                        carry.extend_from_slice(&a[..n]);
+                        say(take_utf8(&mut carry));
+                    }
+                    _ => out_open = false,
+                },
+                n = err.read(&mut b), if err_open => match n {
+                    Ok(n) if n > 0 => say(String::from_utf8_lossy(&b[..n]).into_owned()),
+                    _ => err_open = false,
+                },
+                Some(text) = typed.recv() => {
+                    let _ = stdin.write_all(text.as_bytes()).await;
+                    let _ = stdin.flush().await;
+                }
+            }
+        }
+        let code = child.wait().await.ok().and_then(|s| s.code());
+        let _ = res.send(Res::FlowExit { id, code });
+    });
+    (task, input)
+}
+
+/// Put text on the clipboard: the system's tool if there is one, else ask the terminal (OSC 52).
+fn copy(text: &str) {
+    let tools: [(&str, &[&str]); 3] = [("pbcopy", &[]), ("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])];
+    for (program, args) in tools {
+        let Ok(mut child) = std::process::Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        let wrote = child.stdin.take().is_some_and(|mut s| s.write_all(text.as_bytes()).is_ok());
+        if wrote && child.wait().is_ok_and(|s| s.success()) {
+            return;
+        }
+    }
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut out = io::stdout();
+    let _ = write!(out, "\x1b]52;c;{encoded}\x07");
+    let _ = out.flush();
+}
+
+/// Open a link in the browser on this machine.
+fn open(url: &str) {
+    let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let _ = std::process::Command::new(program)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
 fn run_effect(
     effect: Effect,
     jobs: &mut Vec<JoinHandle<()>>,
+    flows: &mut Flows,
     job_tx: &UnboundedSender<(String, Event)>,
     res_tx: &UnboundedSender<Res>,
     logs: &Path,
@@ -178,6 +292,22 @@ fn run_effect(
             );
         }
         Effect::SaveTools(tools) => config::save_known_tools(logs.parent().unwrap_or(logs), &tools),
+        Effect::StartFlow { id, host, command } => {
+            flows.retain(|_, (task, _)| !task.is_finished());
+            flows.insert(id, start_flow(id, host, command, res_tx));
+        }
+        Effect::FlowInput { id, text } => {
+            if let Some((_, input)) = flows.get(&id) {
+                let _ = input.send(text);
+            }
+        }
+        Effect::StopFlow(id) => {
+            if let Some((task, _)) = flows.remove(&id) {
+                task.abort(); // and with it ssh, killed on drop
+            }
+        }
+        Effect::Copy(text) => copy(&text),
+        Effect::Open(url) => open(&url),
         Effect::Terminal { .. } | Effect::Quit => {}
     }
 }
@@ -202,6 +332,7 @@ pub async fn run(hosts: Vec<String>, logs: PathBuf) -> anyhow::Result<()> {
     let (job_tx, mut job_rx) = unbounded_channel::<(String, Event)>();
     let (res_tx, mut res_rx) = unbounded_channel::<Res>();
     let mut jobs: Vec<JoinHandle<()>> = vec![];
+    let mut flows = Flows::new();
     let mut app = App::new(hosts, logs.clone(), known);
     app.motion = motion::Motion::new(std::env::var_os("T3UP_NO_MOTION").is_none());
     app.desktop = tokio::task::spawn_blocking(desktop::desktop_version).await.unwrap_or_default();
@@ -256,14 +387,14 @@ pub async fn run(hosts: Vec<String>, logs: PathBuf) -> anyhow::Result<()> {
                         break 'main;
                     }
                 }
-                other => run_effect(other, &mut jobs, &job_tx, &res_tx, &logs),
+                other => run_effect(other, &mut jobs, &mut flows, &job_tx, &res_tx, &logs),
             }
         }
         if app.dirty {
             present(&mut term, &mut app, &logos, false)?;
         }
     }
-    for job in &jobs {
+    for job in jobs.iter().chain(flows.values().map(|(task, _)| task)) {
         job.abort();
     }
     Ok(())

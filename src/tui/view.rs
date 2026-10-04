@@ -13,7 +13,8 @@ use ratatui::widgets::{
 use regex::Regex;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::app::{App, Changes, Confirm, Hit, Item, Menu, Modal, Palette, Servers, Sev, Toast};
+use super::app::{Act, App, Changes, Confirm, Hit, Item, Menu, Modal, Palette, Servers, Sev, Toast};
+use super::flow::{Flow, Kind, State};
 use super::logos::{self, Logos};
 use super::motion;
 use super::theme::*;
@@ -815,6 +816,286 @@ fn modal(app: &mut App, buf: &mut Buffer) {
         Modal::Changes(c) => changes(app, buf, c),
         Modal::Help { scroll } => help(app, buf, scroll),
         Modal::Palette(p) => palette(app, buf, &p),
+        Modal::Flow(f) => flow_window(app, buf, &f),
+    }
+}
+
+// ── sign-in and pairing ────────────────────────────────────────────────────
+
+/// One-row buttons, left to right from (x, y) within `w`, wrapping to the next row two down when
+/// they don't fit: the key in accent, then what it does.
+fn pills(app: &mut App, buf: &mut Buffer, x: u16, y: u16, w: u16, items: &[(&str, &str, Act)]) {
+    let (mut at, mut y) = (x, y);
+    for &(key, label, act) in items {
+        let width = (key.width() + label.width() + 5) as u16;
+        if at > x && at + width > x + w {
+            (at, y) = (x, y + 2);
+        }
+        if width > w {
+            break;
+        }
+        let area = Rect::new(at, y, width, 1);
+        let hovered = app.hover.as_ref().is_some_and(|h| h.hit == Some(Hit::Act(act)));
+        buf.set_style(area, Style::new().bg(blend(ACCENT, SURFACE, if hovered { 0.34 } else { 0.14 })));
+        let line = Line::from(vec![
+            Span::styled(format!("  {key}"), bold(ACCENT)),
+            Span::styled(format!(" {label}  "), fg(if hovered { TEXT } else { MUTED })),
+        ]);
+        put(buf, at, y, width, &line);
+        app.hits.push((area, Hit::Act(act)));
+        at += width + 2;
+    }
+}
+
+/// A step's number and what to do, e.g. '1  Open this link and sign in'.
+fn step_line(n: u8, text: &str, note: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{n}  "), bold(ACCENT)),
+        Span::styled(text.to_string(), bold(TEXT)),
+        Span::styled(if note.is_empty() { String::new() } else { format!("   {note}") }, fg(DIM)),
+    ])
+}
+
+/// A link, cut to fit with an ellipsis (copy and open use all of it).
+fn link_line(url: &str, w: usize) -> Line<'static> {
+    Line::styled(truncate(url, w), Style::new().fg(ACCENT).add_modifier(Modifier::UNDERLINED))
+}
+
+/// 'AB12-CD345' as 'A B 1 2 - C D 3 4 5': easier to read off and type.
+fn spaced(code: &str) -> String {
+    code.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ")
+}
+
+/// A token in groups of four, 'K7PQ 2ZM4 XW9R', so it reads off a screen.
+fn grouped(token: &str) -> String {
+    let chars: Vec<char> = token.chars().collect();
+    chars.chunks(4).map(|c| c.iter().collect::<String>()).collect::<Vec<_>>().join(" ")
+}
+
+/// Time left before an ISO expiry: 'in 4:32', or None once it's past.
+fn expires_in(iso: &str) -> Option<String> {
+    let at = chrono::DateTime::parse_from_rfc3339(iso).ok()?;
+    let left = (at.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds();
+    (left > 0).then(|| format!("in {}:{:02}", left / 60, left % 60))
+}
+
+/// A QR code drawn with half blocks: two modules per cell, top and bottom, dark on light.
+fn draw_qr(buf: &mut Buffer, x: u16, y: u16, rows: &[Vec<bool>]) {
+    let (dark, light) = (hex(0x16161a), hex(0xf4f4f6));
+    for (k, pair) in rows.chunks(2).enumerate() {
+        for (i, &top) in pair[0].iter().enumerate() {
+            let bottom = pair.get(1).is_some_and(|r| r[i]);
+            if let Some(cell) = buf.cell_mut((x + i as u16, y + k as u16)) {
+                cell.set_symbol("▀").set_fg(if top { dark } else { light }).set_bg(if bottom { dark } else { light });
+            }
+        }
+    }
+}
+
+fn flow_window(app: &mut App, buf: &mut Buffer, f: &Flow) {
+    let t = app.clock();
+    let qr = match (f.kind, &f.url) {
+        (Kind::Pair, Some(url)) => super::flow::qr(url, 1),
+        _ => None,
+    };
+    // A QR code beside the details when the screen has room for it, both ways.
+    let qr_size = qr.as_ref().map_or(0, |q| q.len() as u16);
+    let (sw, sh) = (buf.area.width, buf.area.height);
+    // QR, a gap, a details column of 40; padding of three each side. Tall enough for the code and the title.
+    let side = qr_size > 0 && sw >= qr_size + 51 && sh >= qr_size.div_ceil(2) + 9;
+    let roomy = sh >= qr_size.div_ceil(2) + 10; // a line of hints under it, too
+    let (w, h) = match f.kind {
+        Kind::Pair if side => (qr_size + 49, qr_size.div_ceil(2) + if roomy { 8 } else { 7 }),
+        Kind::Pair => (64, 17),
+        Kind::Other => (72, 18),
+        Kind::Claude => (72, 18), // room for "that code didn't work" under the input
+        Kind::Codex => (72, 18),
+    };
+    let (_, inner) = panel(app, buf, w, h);
+    let iw = inner.width as usize;
+
+    // Title, and how it's going on the right.
+    let (chip, color) = match (&f.state, f.kind) {
+        (State::Failed(_), _) => ("✗ failed".to_string(), RED),
+        (State::Done, Kind::Pair) => ("● ready".into(), GREEN),
+        (State::Done, _) => ("✓ signed in".into(), GREEN),
+        (State::Running, _) if f.url.is_none() => (format!("{} connecting", spinner(t)), AMBER),
+        (State::Running, _) if f.prompt => ("● needs your code".into(), ACCENT),
+        (State::Running, _) if f.sent > 0 => (format!("{} checking", spinner(t)), AMBER),
+        (State::Running, _) => (format!("{} waiting for you", spinner(t)), AMBER),
+    };
+    put(buf, inner.x, inner.y, inner.width, &Line::styled(f.title(), bold(TEXT)));
+    let cw = chip.width() as u16;
+    put(buf, inner.right().saturating_sub(cw), inner.y, cw, &Line::styled(chip, fg(color)));
+    let mut y = inner.y + 2;
+
+    if let State::Failed(why) = &f.state {
+        for line in wrap(&format!("✗ {why}"), iw).into_iter().take(3) {
+            put(buf, inner.x, y, inner.width, &Line::styled(line, fg(RED)));
+            y += 1;
+        }
+        y += 1;
+        pills(
+            app,
+            buf,
+            inner.x,
+            y,
+            inner.width,
+            &[("r", "Try again", Act::Retry), ("t", "Open in terminal", Act::Terminal)],
+        );
+        hint(buf, inner, "esc close");
+        return;
+    }
+    if f.url.is_none() {
+        let line = Line::styled(format!("Connecting to {}…", f.host), fg(MUTED));
+        put(buf, inner.x, y, inner.width, &line);
+        for (k, l) in f.tail(3).into_iter().enumerate() {
+            put(buf, inner.x, y + 2 + k as u16, inner.width, &Line::styled(truncate(&l, iw), fg(DIM)));
+        }
+        hint(buf, inner, "t open in terminal instead · esc cancel");
+        return;
+    }
+    let url = f.url.clone().unwrap_or_default();
+    let ctrl = if f.prompt { "ctrl+" } else { "" };
+    match f.kind {
+        Kind::Pair => {
+            let x = if side {
+                if let Some(q) = &qr {
+                    draw_qr(buf, inner.x, y, q);
+                }
+                inner.x + qr_size + 3
+            } else {
+                inner.x
+            };
+            let dw = inner.right().saturating_sub(x);
+            let lines = [
+                Line::styled("Scan it with the T3 Code app,", fg(TEXT)),
+                Line::styled("or paste the link into Add environment.", fg(MUTED)),
+            ];
+            let mut yy = y;
+            for line in lines {
+                put(buf, x, yy, dw, &line);
+                yy += 1;
+            }
+            yy += 1;
+            let label = |s: &str| Line::styled(s.to_uppercase(), bold(DIM));
+            put(buf, x, yy, dw, &label("Link"));
+            put(buf, x, yy + 1, dw, &link_line(&url, dw as usize));
+            yy += 3;
+            if let Some(code) = &f.code {
+                put(buf, x, yy, dw, &label("Token"));
+                put(buf, x, yy + 1, dw, &Line::styled(grouped(code), bold(TEXT)));
+                yy += 3;
+            }
+            let (left, left_color) = match f.expires.as_deref().map(expires_in) {
+                Some(Some(left)) => (format!("Expires {left}"), MUTED),
+                Some(None) => ("Expired: press r for a new link".to_string(), RED),
+                None => (String::new(), MUTED),
+            };
+            let reach = if f.tailscale {
+                Line::from(vec![
+                    Span::styled("● ", fg(GREEN)),
+                    Span::styled("Over Tailscale · ", fg(MUTED)),
+                    Span::styled(left, fg(left_color)),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled("● ", fg(AMBER)),
+                    Span::styled("Local network only · ", fg(MUTED)),
+                    Span::styled(left, fg(left_color)),
+                ])
+            };
+            put(buf, x, yy, dw, &reach);
+            let py = yy + 2;
+            let mut acts = vec![("l", "Copy link", Act::CopyLink)];
+            if f.code.is_some() {
+                acts.push(("c", "Copy token", Act::CopyCode));
+            }
+            acts.push(("r", "New link", Act::Retry));
+            pills(app, buf, x, py, dw, &acts);
+            if !side && qr.is_some() {
+                put(buf, x, py + 2, dw, &Line::styled("Make the window larger to see the QR code", fg(DIM)));
+            }
+            if roomy || !side {
+                hint(buf, inner, "o open the link here · esc close");
+            }
+        }
+        Kind::Codex | Kind::Claude => {
+            put(buf, inner.x, y, inner.width, &step_line(1, "Open this link and sign in", ""));
+            put(buf, inner.x + 3, y + 1, inner.width - 3, &link_line(&url, iw - 3));
+            let open_key = format!("{ctrl}o");
+            let link_key = format!("{ctrl}l");
+            pills(
+                app,
+                buf,
+                inner.x + 3,
+                y + 3,
+                inner.width - 3,
+                &[(&open_key, "Open in browser", Act::Open), (&link_key, "Copy link", Act::CopyLink)],
+            );
+            y += 5;
+            if f.kind == Kind::Codex {
+                put(
+                    buf,
+                    inner.x,
+                    y,
+                    inner.width,
+                    &step_line(2, "Enter this code on that page", "expires in 15 minutes"),
+                );
+                let code = f.code.as_deref().map_or("…".to_string(), spaced);
+                let cw = code.width() as u16;
+                put(buf, inner.x + 3, y + 2, cw, &Line::styled(code, bold(TEXT)));
+                pills(
+                    app,
+                    buf,
+                    inner.x + 3 + cw + 3,
+                    y + 2,
+                    inner.width.saturating_sub(cw + 6),
+                    &[("c", "Copy code", Act::CopyCode)],
+                );
+                let wait = format!("{} Waiting for you to finish in the browser…", spinner(t));
+                put(buf, inner.x + 3, y + 4, inner.width - 3, &Line::styled(wait, fg(MUTED)));
+                hint(buf, inner, "t open in terminal instead · esc cancel");
+            } else {
+                put(buf, inner.x, y, inner.width, &step_line(2, "Paste the code the page shows you", ""));
+                input_box(
+                    buf,
+                    Rect::new(inner.x + 3, y + 1, inner.width - 3, 3),
+                    &f.input,
+                    "the code from the browser",
+                    f.prompt,
+                );
+                let note = if f.retry() {
+                    Line::styled("That code didn't work. Paste it again.", fg(AMBER))
+                } else if f.sent > 0 && f.state == State::Running {
+                    Line::styled(format!("{} Checking the code…", spinner(t)), fg(MUTED))
+                } else {
+                    Line::default()
+                };
+                put(buf, inner.x + 3, y + 4, inner.width - 3, &note);
+                hint(buf, inner, "enter send · ctrl+t open in terminal instead · esc cancel");
+            }
+        }
+        Kind::Other => {
+            for (k, l) in f.tail(6).into_iter().enumerate() {
+                put(buf, inner.x, y + k as u16, inner.width, &Line::styled(truncate(&l, iw), fg(MUTED)));
+            }
+            y += 7;
+            let open_key = format!("{ctrl}o");
+            let link_key = format!("{ctrl}l");
+            pills(
+                app,
+                buf,
+                inner.x,
+                y,
+                inner.width,
+                &[(&open_key, "Open link", Act::Open), (&link_key, "Copy link", Act::CopyLink)],
+            );
+            if f.prompt {
+                input_box(buf, Rect::new(inner.x, y + 2, inner.width, 3), &f.input, "type here, enter sends it", true);
+            }
+            hint(buf, inner, "enter send · ctrl+t open in terminal instead · esc cancel");
+        }
     }
 }
 
@@ -1314,6 +1595,51 @@ mod tests {
     }
 
     #[test]
+    fn sign_in_and_pairing_windows_show_everything_at_91x27() {
+        use crate::tui::app::Res;
+        let cases: [(&str, &str, &[&str]); 3] = [
+            (
+                "Codex",
+                "1. Open\r\n   https://auth.openai.com/codex/device\r\n2. Enter this one-time code\r\n   AB12-CD345\r\n",
+                &[
+                    "https://auth.openai.com/codex/device",
+                    "A B 1 2 - C D 3 4 5",
+                    "Copy code",
+                    "Waiting for you",
+                    "Open in browser",
+                ],
+            ),
+            (
+                "Claude",
+                "visit: https://claude.com/cai/oauth/authorize?code=true\r\nPaste code here if prompted > ",
+                &["Paste the code the page shows you", "the code from the browser", "needs your code", "Copy link"],
+            ),
+            (
+                "T3",
+                "@@pair tailscale\r\nPairing URL: https://one-s.tail79489d.ts.net/pair#token=K7PQ2ZM4XW9R\r\nToken: K7PQ2ZM4XW9R\r\nExpires: 2099-01-01T00:00:00.000Z\r\n",
+                &["K7PQ 2ZM4 XW9R", "Over Tailscale", "Copy token", "New link", "▀"],
+            ),
+        ];
+        for (tool, output, needles) in cases {
+            let mut app = demo();
+            app.modal = None;
+            app.start_flow("one-s", tool);
+            let id = match &app.modal {
+                Some(Modal::Flow(f)) => f.id,
+                _ => panic!("no window for {tool}"),
+            };
+            app.on_result(Res::FlowOut { id, text: output.into() });
+            if tool == "T3" {
+                app.on_result(Res::FlowExit { id, code: Some(0) });
+            }
+            let buf = frame(&mut app, 91, 27);
+            for needle in needles {
+                assert!(has(&buf, needle), "{tool}: {needle:?} missing from\n{}", text(&buf).join("\n"));
+            }
+        }
+    }
+
+    #[test]
     fn a_server_without_t3_offers_the_install() {
         let mut app = demo();
         let h = &mut app.hosts[1];
@@ -1392,13 +1718,17 @@ mod tests {
             "Create pairing link",
             "Terminal",
             "↑↓ move · enter choose · esc close",
-            "mdr: out of disk",
         ] {
             assert!(has(&buf, needle), "{needle:?} missing from\n{}", text(&buf).join("\n"));
         }
         // The backdrop is dimmed.
         assert_ne!(buf[(2, 10)].fg, TEXT);
-        assert_eq!(app.hits.iter().filter(|(_, h)| matches!(h, Hit::Row(_))).count(), 12);
+        let rows = app.hits.iter().filter(|(_, h)| matches!(h, Hit::Row(_))).count();
+        assert!(rows >= 12, "{rows}");
+        // Toasts wait under an open window, and show once it closes.
+        app.modal = None;
+        let buf = frame(&mut app, 100, 30);
+        assert!(has(&buf, "mdr: out of disk"), "{}", text(&buf).join("\n"));
     }
 
     #[test]

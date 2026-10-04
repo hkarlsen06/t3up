@@ -27,7 +27,10 @@ You can update one server or all of them without leaving the terminal.
 - **What's new.** Press <kbd>c</kbd> to read the release notes of every update waiting on a server.
 - **Updates tools the way they were installed.** A provider is updated with its own updater if it installed itself,
   otherwise with whichever of npm, pnpm, bun or Homebrew owns it. If t3up can't tell, it fails and says so instead of guessing.
-- **Sign-in built in.** When an update leaves a tool signed out, t3up opens its login on that server for you.
+- **Sign-in and pairing, in the dashboard.** When a tool on a server is signed out, t3up runs its login there
+  and shows just what you need: the link (open it, or copy it), Codex's one-time code, or a box to paste
+  Claude's code into. **Create pairing link** draws a scannable QR code with the link and token to copy, and
+  how long it's valid. Anything unexpected still has **t: open in terminal**.
 - **No agent on the server.** It runs a POSIX `sh` script over plain SSH. Nothing to install remotely.
 - **Scriptable.** `--check` and `--update` give plain output and an exit code, for cron or CI.
 - **Desktop app (macOS).** When your T3 Code desktop app is older than your servers, t3up can update it as well.

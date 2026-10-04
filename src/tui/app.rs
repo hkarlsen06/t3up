@@ -1,6 +1,6 @@
 //! The dashboard's state machine: no terminal, no I/O. Keys, mouse, job events and background
 //! results go in; state changes and `Effect`s (things for `tui::run` to do) come out.
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,6 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButto
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
+use super::flow::{self, Flow, Kind};
 use super::input::Input;
 use super::motion::Motion;
 use super::theme::*;
@@ -22,7 +23,7 @@ use crate::model::{
 };
 
 /// Something for `tui::run` to do.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Effect {
     StartJob(Job),
     /// Hand the real terminal to a command, then come back.
@@ -39,6 +40,22 @@ pub enum Effect {
     },
     UpdateDesktop,
     SaveTools(BTreeMap<String, Vec<String>>),
+    /// Run a sign-in or pairing on a server (`ssh -tt`), its output coming back as `Res::FlowOut`.
+    StartFlow {
+        id: u64,
+        host: String,
+        command: String,
+    },
+    /// Type into a running flow.
+    FlowInput {
+        id: u64,
+        text: String,
+    },
+    StopFlow(u64),
+    /// Put text on this machine's clipboard.
+    Copy(String),
+    /// Open a link in this machine's browser.
+    Open(String),
     /// Stop every job and leave.
     Quit,
 }
@@ -51,6 +68,8 @@ pub enum Res {
     DesktopSay(String),
     DesktopDone(Result<String, String>),
     Changelog { key: ChangeKey, result: Result<Vec<Release>, String> },
+    FlowOut { id: u64, text: String },
+    FlowExit { id: u64, code: Option<i32> },
 }
 
 /// (component, from, to): what a changelog was fetched for.
@@ -83,6 +102,19 @@ pub enum Hit {
     Remove(usize),
     Add,
     Suggest(usize),
+    /// A button in a sign-in or pairing window.
+    Act(Act),
+}
+
+/// What a sign-in or pairing window's buttons do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Act {
+    Open,
+    CopyLink,
+    CopyCode,
+    Submit,
+    Retry,
+    Terminal,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -92,6 +124,7 @@ pub enum Choice {
     Logs,
     Terminal,
     Pair,
+    SignIn(String),
     Changes,
     Desktop,
     DesktopGo,
@@ -151,6 +184,7 @@ pub enum Cmd {
     Desktop,
     Ssh(String),
     Pair(String),
+    SignIn(String, String),
     Changes(String),
     Output,
 }
@@ -219,6 +253,7 @@ pub enum Modal {
     Changes(Changes),
     Help { scroll: usize },
     Palette(Palette),
+    Flow(Flow),
 }
 
 /// An update of several servers starts with the first alone; the rest wait for it.
@@ -276,6 +311,9 @@ pub struct App {
     pub modal_rect: Rect,
     pub hover: Option<Hover>,
     pub motion: Motion,
+    /// Sign-ins waiting for the window: (host, tool).
+    flow_queue: VecDeque<(String, String)>,
+    next_flow: u64,
 }
 
 impl App {
@@ -311,6 +349,8 @@ impl App {
             modal_rect: Rect::default(),
             hover: None,
             motion: Motion::new(false),
+            flow_queue: VecDeque::new(),
+            next_flow: 0,
         };
         app.set_hosts(names);
         if app.hosts.is_empty() {
@@ -344,6 +384,7 @@ impl App {
     /// Whether something on screen moves by itself (spinners, elapsed time) and needs redraws.
     pub fn animating(&self) -> bool {
         self.motion.on
+            || matches!(self.modal, Some(Modal::Flow(_)))
             || self.hosts.iter().any(Host::running)
             || self.desktop_updating
             || matches!(&self.modal, Some(Modal::Changes(c)) if c.items.iter().any(|k| !self.changelogs.contains_key(k)))
@@ -368,6 +409,18 @@ impl App {
         self.toasts.retain(|t| t.until > now);
         self.motion.prune();
         self.dirty |= self.toasts.len() != before;
+        if let Some(Modal::Flow(f)) = &self.modal
+            && f.kind != Kind::Pair
+            && f.state == flow::State::Done
+            && f.finished.is_some_and(|t| t.elapsed() > Duration::from_millis(1400))
+        {
+            self.close_modal();
+        }
+        if self.modal.is_none()
+            && let Some((host, tool)) = self.flow_queue.pop_front()
+        {
+            self.start_flow(&host, &tool);
+        }
         if let Some(h) = self.hover.as_mut().filter(|h| !h.shown && h.since.elapsed() > Duration::from_millis(600)) {
             h.shown = matches!(h.hit, Some(Hit::Card(_))) || (h.header && h.hit.is_none());
             self.dirty |= h.shown;
@@ -569,23 +622,10 @@ impl App {
         if !h.rollback.is_empty() {
             self.toast(Sev::Warning, "Rolled back", format!("{}: T3 {}", h.name, h.rollback));
         }
-        // An update that left a tool it was meant to touch signed out: sign in, then check again.
+        // An update that left a tool it was meant to touch signed out: sign in (each checks again when done).
         if h.mode == Mode::Update {
-            let logins: Vec<&String> = h.auth.iter().filter(|n| h.picked(n)).collect();
-            for name in &logins {
-                if let Some(login) = login_command(name) {
-                    self.fx.push(Effect::Terminal {
-                        command: vec![job::ssh_program(), "-t".into(), h.name.clone(), login],
-                        banner: if *name == "T3" {
-                            format!("Pair {} with your T3 Code app: scan the code, or open the link.", h.name)
-                        } else {
-                            format!("Sign in to {name} on {}. You come back here when it finishes.", h.name)
-                        },
-                    });
-                }
-            }
-            if !logins.is_empty() {
-                self.start(vec![h.name.clone()], Mode::Check, "all");
+            for name in h.auth.iter().filter(|n| h.picked(n) && login_command(n).is_some()) {
+                self.start_flow(&h.name, name);
             }
         }
     }
@@ -617,7 +657,110 @@ impl App {
             Res::Changelog { key, result } => {
                 self.changelogs.insert(key, result);
             }
+            Res::FlowOut { id, text } => {
+                if let Some(Modal::Flow(f)) = self.modal.as_mut()
+                    && f.id == id
+                {
+                    f.feed(&text);
+                }
+            }
+            Res::FlowExit { id, code } => {
+                let Some(Modal::Flow(f)) = self.modal.as_mut() else { return };
+                if f.id != id {
+                    return;
+                }
+                f.exit(code);
+                let (host, kind, tool, state) = (f.host.clone(), f.kind, f.tool.clone(), f.state.clone());
+                if state == flow::State::Done && kind != Kind::Pair {
+                    self.toast(Sev::Info, "Signed in", format!("{tool} on {host}"));
+                    self.start(vec![host], Mode::Check, "all");
+                }
+            }
         }
+    }
+
+    // ── sign-ins and pairing ───────────────────────────────────────────────
+
+    /// Sign in to `tool` (or pair, for 'T3') on `host` in a window of its own; queued behind an open one.
+    pub fn start_flow(&mut self, host: &str, tool: &str) {
+        if self.modal.is_some() {
+            if !self.flow_queue.iter().any(|(h, t)| h == host && t == tool) {
+                self.flow_queue.push_back((host.into(), tool.into()));
+            }
+            return;
+        }
+        self.next_flow += 1;
+        let f = Flow::new(self.next_flow, host, tool);
+        self.fx.push(Effect::StartFlow { id: f.id, host: host.into(), command: f.command() });
+        self.open_modal(Modal::Flow(f));
+    }
+
+    /// Close the open window; a sign-in still running stops.
+    fn close_modal(&mut self) {
+        if let Some(Modal::Flow(f)) = self.modal.take()
+            && f.state == flow::State::Running
+        {
+            self.fx.push(Effect::StopFlow(f.id));
+        }
+        self.invalidate_hits();
+        self.dirty = true;
+    }
+
+    /// A button (or its key) in a sign-in or pairing window. Returns the window, or None to close it.
+    fn act(&mut self, mut f: Flow, act: Act) -> Option<Modal> {
+        match act {
+            Act::Open => {
+                if let Some(url) = &f.url {
+                    self.fx.push(Effect::Open(url.clone()));
+                }
+            }
+            Act::CopyLink => {
+                if let Some(url) = &f.url {
+                    self.fx.push(Effect::Copy(url.clone()));
+                    self.toast(Sev::Info, "Copied", "The link is on your clipboard");
+                }
+            }
+            Act::CopyCode => {
+                if let Some(code) = &f.code {
+                    self.fx.push(Effect::Copy(code.clone()));
+                    let what = if f.kind == Kind::Pair { "token" } else { "code" };
+                    self.toast(Sev::Info, "Copied", format!("The {what} is on your clipboard"));
+                }
+            }
+            Act::Submit => {
+                let text = f.input.value.trim().to_string();
+                if f.prompt && !text.is_empty() {
+                    self.fx.push(Effect::FlowInput { id: f.id, text: format!("{text}\r") });
+                    f.sent += 1;
+                    f.prompt = false;
+                    f.input = Input::default();
+                } else if f.state == flow::State::Done {
+                    return None;
+                }
+            }
+            Act::Retry => {
+                if f.state == flow::State::Running {
+                    self.fx.push(Effect::StopFlow(f.id));
+                }
+                let (host, tool) = (f.host.clone(), f.tool.clone());
+                self.start_flow(&host, &tool);
+                return self.modal.take();
+            }
+            Act::Terminal => {
+                if f.state == flow::State::Running {
+                    self.fx.push(Effect::StopFlow(f.id));
+                }
+                if let Some(login) = login_command(&f.tool) {
+                    let banner = format!("{}. You come back here when it finishes.", f.title());
+                    self.fx.push(Effect::Terminal {
+                        command: vec![job::ssh_program(), "-t".into(), f.host.clone(), login],
+                        banner,
+                    });
+                }
+                return None;
+            }
+        }
+        Some(Modal::Flow(f))
     }
 
     // ── actions ────────────────────────────────────────────────────────────
@@ -703,13 +846,18 @@ impl App {
             label: label.into(),
             detail: detail.into(),
         };
-        let inspect = vec![
+        let mut inspect = vec![
             row(Choice::Check, "↻", "Check again", "versions and health, changes nothing"),
             row(Choice::Changes, "✦", "What's new", "release notes for what's waiting"),
             row(Choice::Logs, "≡", if self.show_output { "Hide output" } else { "Show output" }, "live log below"),
-            row(Choice::Pair, "⌁", "Create pairing link", "connect a device, via Tailscale"),
-            row(Choice::Terminal, "›", "Terminal", "ssh in · type exit to return"),
         ];
+        // Tools its last run found signed out, right where you'd look.
+        for tool in h.auth.iter().filter(|t| *t != "T3" && login_command(t).is_some()) {
+            let label = format!("Sign in to {tool}");
+            inspect.push(row(Choice::SignIn(tool.clone()), "→", &label, "not signed in"));
+        }
+        inspect.push(row(Choice::Pair, "⌁", "Create pairing link", "connect a device, via Tailscale"));
+        inspect.push(row(Choice::Terminal, "›", "Terminal", "ssh in · type exit to return"));
         self.update_menu(vec![h.name.clone()], heading, inspect, false);
     }
 
@@ -801,16 +949,11 @@ impl App {
         }
     }
 
-    /// A pairing link for a device, made on the server in a real terminal (see `model::PAIR`).
+    /// A pairing link for a device, made on the server in a real terminal (see `model::pair_command`).
     pub fn open_pair(&mut self, name: &str) {
         let Some(i) = self.hosts.iter().position(|h| h.name == name) else { return };
         self.select(i);
-        let command = login_command("T3").unwrap_or_default();
-        let banner = format!("Pairing link for {name}: scan the code, or paste the link into Add environment.");
-        self.fx.push(Effect::Terminal {
-            command: vec![job::ssh_program(), "-t".into(), name.to_string(), command],
-            banner,
-        });
+        self.start_flow(name, "T3");
     }
 
     /// What's new: the release notes of everything waiting on this server.
@@ -848,6 +991,9 @@ impl App {
         for h in &self.hosts {
             items.push((format!("SSH into {}", h.name), Cmd::Ssh(h.name.clone())));
             items.push((format!("Create pairing link for {}", h.name), Cmd::Pair(h.name.clone())));
+            for tool in h.auth.iter().filter(|t| *t != "T3" && login_command(t).is_some()) {
+                items.push((format!("Sign in to {tool} on {}", h.name), Cmd::SignIn(h.name.clone(), tool.clone())));
+            }
             items.push((format!("What's new on {}", h.name), Cmd::Changes(h.name.clone())));
         }
         items.push(("Toggle output".into(), Cmd::Output));
@@ -866,6 +1012,7 @@ impl App {
             Cmd::Desktop => self.open_desktop(),
             Cmd::Ssh(host) => self.open_ssh(&host),
             Cmd::Pair(host) => self.open_pair(&host),
+            Cmd::SignIn(host, tool) => self.start_flow(&host, &tool),
             Cmd::Changes(host) => self.open_changes(&host),
             Cmd::Output => self.toggle_output(),
         }
@@ -900,6 +1047,11 @@ impl App {
             Choice::Pair => {
                 if let Some(name) = hosts.first() {
                     self.open_pair(name);
+                }
+            }
+            Choice::SignIn(tool) => {
+                if let Some(name) = hosts.first() {
+                    self.start_flow(name, &tool);
                 }
             }
             Choice::Changes => {
@@ -1001,6 +1153,7 @@ impl App {
                 p.input.insert(text);
                 p.cursor = 0;
             }
+            Some(Modal::Flow(f)) if f.prompt => f.input.insert(text.trim()),
             _ => {}
         }
     }
@@ -1086,6 +1239,35 @@ impl App {
     fn modal_key(&mut self, modal: Modal, key: KeyEvent) -> Option<Modal> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match modal {
+            Modal::Flow(mut f) => {
+                // With an input box open, letters type; the shortcuts need ctrl.
+                let key_ok = |want: bool| want && (ctrl || !f.prompt);
+                let act = match key.code {
+                    KeyCode::Esc => {
+                        self.modal = Some(Modal::Flow(f));
+                        self.close_modal();
+                        return None;
+                    }
+                    KeyCode::Enter => Some(Act::Submit),
+                    KeyCode::Char('o') if key_ok(f.url.is_some()) => Some(Act::Open),
+                    KeyCode::Char('l') if key_ok(f.url.is_some()) => Some(Act::CopyLink),
+                    KeyCode::Char('c') if !ctrl && !f.prompt && f.code.is_some() => Some(Act::CopyCode),
+                    KeyCode::Char('r') if key_ok(f.kind == Kind::Pair || matches!(f.state, flow::State::Failed(_))) => {
+                        Some(Act::Retry)
+                    }
+                    KeyCode::Char('t') if key_ok(true) => Some(Act::Terminal),
+                    _ => {
+                        if f.prompt {
+                            f.input.key(key);
+                        }
+                        None
+                    }
+                };
+                match act {
+                    Some(act) => self.act(f, act),
+                    None => Some(Modal::Flow(f)),
+                }
+            }
             Modal::Menu(mut m) => {
                 match key.code {
                     KeyCode::Esc => return None,
@@ -1298,6 +1480,15 @@ impl App {
                     Some(Modal::Servers(s))
                 }
             }
+            Modal::Flow(f) if outside => {
+                self.modal = Some(Modal::Flow(f));
+                self.close_modal();
+                None
+            }
+            Modal::Flow(f) => match hit {
+                Some(Hit::Act(act)) => self.act(f, act),
+                _ => Some(Modal::Flow(f)),
+            },
             _ if outside => None,
             Modal::Menu(mut m) => match hit {
                 Some(Hit::Row(i)) if matches!(m.items.get(i), Some(Item::Row { .. })) => {
@@ -1477,21 +1668,60 @@ mod tests {
         a.on_job("box", Event::Auth("Codex".into()));
         done(&mut a, "box", true);
         assert!(a.take_effects().iter().all(|e| !matches!(e, Effect::Terminal { .. })));
-        // An update of Codex does, then checks the server again.
+        // An update of Codex does, in a window of its own, then checks the server again.
         a.start(vec!["box".into()], Mode::Update, "codex");
         a.take_effects();
         a.on_job("box", Event::Auth("Codex".into()));
         done(&mut a, "box", true);
         let fx = a.take_effects();
-        let terminal = fx.iter().find_map(|e| match e {
-            Effect::Terminal { command, banner } => Some((command.clone(), banner.clone())),
-            _ => None,
+        assert!(fx.iter().all(|e| !matches!(e, Effect::Terminal { .. })), "no raw terminal");
+        let id = fx
+            .iter()
+            .find_map(|e| match e {
+                Effect::StartFlow { id, host, command } if host == "box" => {
+                    assert!(command.ends_with("codex login --device-auth"), "{command}");
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .expect("a sign-in");
+        assert!(matches!(&a.modal, Some(Modal::Flow(f)) if f.tool == "Codex"));
+        a.on_result(Res::FlowOut {
+            id,
+            text: "1. Open https://auth.openai.com/codex/device\r\n2. one-time code\r\n AB12-CD345\r\n".into(),
         });
-        let (command, banner) = terminal.expect("a sign-in");
-        assert_eq!(command[1..3], ["-t", "box"]);
-        assert!(command[3].ends_with("codex login --device-auth"), "{command:?}");
-        assert_eq!(banner, "Sign in to Codex on box. You come back here when it finishes.");
-        assert_eq!(jobs(fx), vec![("box".into(), Mode::Check, "all".into())]);
+        press(&mut a, "c");
+        assert!(a.take_effects().contains(&Effect::Copy("AB12-CD345".into())));
+        a.on_result(Res::FlowExit { id, code: Some(0) });
+        assert_eq!(jobs(a.take_effects()), vec![("box".into(), Mode::Check, "all".into())]);
+        assert!(a.toasts.iter().any(|t| t.title == "Signed in"));
+    }
+
+    #[test]
+    fn claude_takes_the_code_in_the_window() {
+        let mut a = app(&["box"]);
+        settle(&mut a);
+        a.start_flow("box", "Claude");
+        let id = match a.take_effects().as_slice() {
+            [Effect::StartFlow { id, .. }] => *id,
+            fx => panic!("{fx:?}"),
+        };
+        a.on_result(Res::FlowOut {
+            id,
+            text: "visit: https://claude.com/x?state=1\r\nPaste code here if prompted > ".into(),
+        });
+        // Letters type into the box, not shortcuts; enter sends it to the tool with a return.
+        press(&mut a, "olc");
+        code(&mut a, KeyCode::Enter);
+        assert_eq!(a.take_effects(), vec![Effect::FlowInput { id, text: "olc\r".into() }]);
+        // A second sign-in waits for this window.
+        a.start_flow("box", "Codex");
+        assert!(a.take_effects().is_empty());
+        // Esc closes it and stops the tool; then the queued one opens.
+        code(&mut a, KeyCode::Esc);
+        assert_eq!(a.take_effects(), vec![Effect::StopFlow(id)]);
+        a.tick();
+        assert!(matches!(&a.modal, Some(Modal::Flow(f)) if f.tool == "Codex"));
     }
 
     #[test]
