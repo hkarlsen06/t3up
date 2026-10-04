@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use regex::Regex;
 
+use super::app::Act;
 use super::input::Input;
 use crate::model::{PATH_SETUP, pair_command};
 
@@ -53,6 +54,8 @@ pub struct Flow {
     pub state: State,
     pub started: Instant,
     pub finished: Option<Instant>,
+    /// The last copy button pressed, and when: it says "Copied" for a moment.
+    pub copied: Option<(Act, Instant)>,
 }
 
 static ANSI: LazyLock<Regex> = LazyLock::new(|| {
@@ -93,6 +96,7 @@ impl Flow {
             state: State::Running,
             started: Instant::now(),
             finished: None,
+            copied: None,
         }
     }
 
@@ -170,6 +174,11 @@ impl Flow {
         let lines: Vec<&str> =
             self.output.lines().map(str::trim_end).filter(|l| !l.is_empty() && !l.starts_with("@@")).collect();
         lines[lines.len().saturating_sub(n)..].iter().map(|l| l.to_string()).collect()
+    }
+
+    /// The copy button that should say "Copied" right now.
+    pub fn copied_now(&self) -> Option<Act> {
+        self.copied.filter(|(_, at)| at.elapsed().as_millis() < 1600).map(|(act, _)| act)
     }
 
     /// A wrong code: the tool asked again after one was sent.

@@ -252,8 +252,9 @@ pub fn render(app: &mut App, logos: &Logos, buf: &mut Buffer) {
     }
     footer(app, buf);
     if app.modal.is_some() {
-        toasts(app, buf);
         let since = *app.motion.modal_since.get_or_insert_with(std::time::Instant::now);
+        // Toasts that were up before the window opened stay behind it.
+        toasts(app, buf, Some(since), false);
         let k = if app.motion.on { motion::ease_out(since.elapsed().as_secs_f32() / motion::FADE) } else { 1.0 };
         dim(buf, 0.65 * k);
         modal(app, buf, logos);
@@ -261,8 +262,9 @@ pub fn render(app: &mut App, logos: &Logos, buf: &mut Buffer) {
     } else {
         app.motion.modal_since = None;
         tooltip(app, buf);
-        toasts(app, buf);
     }
+    // New ones on top of everything, beside an open window when there's room for that.
+    toasts(app, buf, app.modal.is_some().then_some(app.motion.modal_since).flatten(), true);
     if let Some(t) = app.motion.intro_at() {
         let hosts: Vec<_> = app.hosts.iter().map(|h| (h.name.clone(), h.status)).collect();
         motion::intro(buf, t, &hosts);
@@ -897,7 +899,14 @@ fn installer(app: &mut App, buf: &mut Buffer, inst: &Installer) {
 
 /// One-row buttons, left to right from (x, y) within `w`, wrapping to the next row two down when
 /// they don't fit: the key in accent, then what it does.
-fn pills(app: &mut App, buf: &mut Buffer, x: u16, y: u16, w: u16, items: &[(&str, &str, Act)]) {
+/// `copied` is the copy button that just worked: it says so for a moment, in place.
+fn pills(
+    app: &mut App,
+    buf: &mut Buffer,
+    (x, y, w): (u16, u16, u16),
+    items: &[(&str, &str, Act)],
+    copied: Option<Act>,
+) {
     let (mut at, mut y) = (x, y);
     for &(key, label, act) in items {
         let width = (key.width() + label.width() + 5) as u16;
@@ -909,11 +918,20 @@ fn pills(app: &mut App, buf: &mut Buffer, x: u16, y: u16, w: u16, items: &[(&str
         }
         let area = Rect::new(at, y, width, 1);
         let hovered = app.hover.as_ref().is_some_and(|h| h.hit == Some(Hit::Act(act)));
-        buf.set_style(area, Style::new().bg(blend(ACCENT, SURFACE, if hovered { 0.34 } else { 0.14 })));
-        let line = Line::from(vec![
-            Span::styled(format!("  {key}"), bold(ACCENT)),
-            Span::styled(format!(" {label}  "), fg(if hovered { TEXT } else { MUTED })),
-        ]);
+        let done = copied == Some(act);
+        let tint =
+            if done { blend(GREEN, SURFACE, 0.18) } else { blend(ACCENT, SURFACE, if hovered { 0.34 } else { 0.14 }) };
+        buf.set_style(area, Style::new().bg(tint));
+        let line = if done {
+            // Same width as the label it stands in for, so nothing moves.
+            let text = format!("{:^w$}", "✓ Copied", w = width as usize);
+            Line::styled(text, bold(GREEN))
+        } else {
+            Line::from(vec![
+                Span::styled(format!("  {key}"), bold(ACCENT)),
+                Span::styled(format!(" {label}  "), fg(if hovered { TEXT } else { MUTED })),
+            ])
+        };
         put(buf, at, y, width, &line);
         app.hits.push((area, Hit::Act(act)));
         at += width + 2;
@@ -1024,10 +1042,9 @@ fn flow_window(app: &mut App, buf: &mut Buffer, f: &Flow, logos: &Logos) {
         pills(
             app,
             buf,
-            inner.x,
-            y,
-            inner.width,
+            (inner.x, y, inner.width),
             &[("r", "Try again", Act::Retry), ("t", "Open in terminal", Act::Terminal)],
+            f.copied_now(),
         );
         hint(buf, inner, "esc close");
         return;
@@ -1098,7 +1115,7 @@ fn flow_window(app: &mut App, buf: &mut Buffer, f: &Flow, logos: &Logos) {
                 acts.push(("c", "Copy token", Act::CopyCode));
             }
             acts.push(("r", "New link", Act::Retry));
-            pills(app, buf, x, py, dw, &acts);
+            pills(app, buf, (x, py, dw), &acts, f.copied_now());
             if !side && qr.is_some() {
                 put(buf, x, py + 2, dw, &Line::styled("Make the window larger to see the QR code", fg(DIM)));
             }
@@ -1114,10 +1131,9 @@ fn flow_window(app: &mut App, buf: &mut Buffer, f: &Flow, logos: &Logos) {
             pills(
                 app,
                 buf,
-                inner.x + 3,
-                y + 3,
-                inner.width - 3,
+                (inner.x + 3, y + 3, inner.width - 3),
                 &[(&open_key, "Open in browser", Act::Open), (&link_key, "Copy link", Act::CopyLink)],
+                f.copied_now(),
             );
             y += 5;
             if f.kind == Kind::Codex {
@@ -1134,10 +1150,9 @@ fn flow_window(app: &mut App, buf: &mut Buffer, f: &Flow, logos: &Logos) {
                 pills(
                     app,
                     buf,
-                    inner.x + 3 + cw + 3,
-                    y + 2,
-                    inner.width.saturating_sub(cw + 6),
+                    (inner.x + 3 + cw + 3, y + 2, inner.width.saturating_sub(cw + 6)),
                     &[("c", "Copy code", Act::CopyCode)],
+                    f.copied_now(),
                 );
                 let wait = format!("{} Waiting for you to finish in the browser…", spinner(t));
                 put(buf, inner.x + 3, y + 4, inner.width - 3, &Line::styled(wait, fg(MUTED)));
@@ -1172,10 +1187,9 @@ fn flow_window(app: &mut App, buf: &mut Buffer, f: &Flow, logos: &Logos) {
             pills(
                 app,
                 buf,
-                inner.x,
-                y,
-                inner.width,
+                (inner.x, y, inner.width),
                 &[(&open_key, "Open link", Act::Open), (&link_key, "Copy link", Act::CopyLink)],
+                f.copied_now(),
             );
             if f.prompt {
                 input_box(buf, Rect::new(inner.x, y + 2, inner.width, 3), &f.input, "type here, enter sends it", true);
@@ -1607,7 +1621,9 @@ fn changes(app: &mut App, buf: &mut Buffer, mut c: Changes) {
 
 // ── toasts ─────────────────────────────────────────────────────────────────
 
-fn toasts(app: &App, buf: &mut Buffer) {
+/// The toast stack, bottom-right. With a window open (`since` it opened), `over` draws the toasts
+/// that came after it (on top), else the ones from before (under it); every toast keeps its place.
+fn toasts(app: &App, buf: &mut Buffer, since: Option<std::time::Instant>, over: bool) {
     let w = 46u16.min(buf.area.width.saturating_sub(4));
     if w < 12 {
         return;
@@ -1642,7 +1658,19 @@ fn toasts(app: &App, buf: &mut Buffer) {
         for (k, row) in rows.iter().enumerate() {
             put(&mut card, 2, 2 + k as u16, w - 4, &Line::styled(row.clone(), fg(TEXT)));
         }
-        blit(&card, buf, buf.area.width - w - MARGIN + out, y as i32, buf.area);
+        if since.is_some_and(|since| (*born >= since) != over) {
+            bottom = y;
+            continue;
+        }
+        let mut x = buf.area.width - w - MARGIN;
+        let modal = app.modal_rect;
+        if !modal.is_empty()
+            && Rect::new(x, y, w, h).intersects(modal)
+            && modal.right() + 2 + w + MARGIN <= buf.area.width
+        {
+            x = modal.right() + 2;
+        }
+        blit(&card, buf, x + out, y as i32, buf.area);
         bottom = y;
     }
 }
@@ -1749,6 +1777,30 @@ mod tests {
                 assert!(has(&buf, needle), "{tool}: {needle:?} missing from\n{}", text(&buf).join("\n"));
             }
         }
+    }
+
+    #[test]
+    fn copying_says_so_on_the_button_not_in_a_toast() {
+        use crate::tui::app::Res;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = demo();
+        app.modal = None;
+        app.toasts.clear();
+        app.start_flow("one-s", "Codex");
+        let Some(Modal::Flow(f)) = &app.modal else { panic!() };
+        let id = f.id;
+        app.on_result(Res::FlowOut {
+            id,
+            text: "https://auth.openai.com/codex/device\r\none-time code\r\n AB12-CD345\r\n".into(),
+        });
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        let buf = frame(&mut app, 91, 27);
+        assert!(has(&buf, "✓ Copied") && !has(&buf, "Copy code"), "{}", text(&buf).join("\n"));
+        assert!(app.toasts.is_empty());
+        // News while the window is open shows on top of it.
+        app.toast(Sev::Info, "Signed in", "Claude on one-m");
+        let buf = frame(&mut app, 91, 27);
+        assert!(has(&buf, "Claude on one-m"), "{}", text(&buf).join("\n"));
     }
 
     #[test]

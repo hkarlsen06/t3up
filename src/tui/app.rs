@@ -849,17 +849,17 @@ impl App {
                     self.fx.push(Effect::Open(url.clone()));
                 }
             }
+            // The button itself says "Copied", right where you pressed it.
             Act::CopyLink => {
                 if let Some(url) = &f.url {
                     self.fx.push(Effect::Copy(url.clone()));
-                    self.toast(Sev::Info, "Copied", "The link is on your clipboard");
+                    f.copied = Some((act, Instant::now()));
                 }
             }
             Act::CopyCode => {
                 if let Some(code) = &f.code {
                     self.fx.push(Effect::Copy(code.clone()));
-                    let what = if f.kind == Kind::Pair { "token" } else { "code" };
-                    self.toast(Sev::Info, "Copied", format!("The {what} is on your clipboard"));
+                    f.copied = Some((act, Instant::now()));
                 }
             }
             Act::Submit => {
