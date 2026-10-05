@@ -199,6 +199,8 @@ system_info() {
   if [ -r /proc/loadavg ]; then read -r load rest < /proc/loadavg
   else load=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}') || load=""; fi
   [ -z "$load" ] || info="load $load"
+  cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || cpus=""
+  [ -z "$cpus" ] || info="${info}${info:+ · }cpus $cpus"
   disk=$(df -P "$HOME" 2>/dev/null | awk 'NR==2 {print $5}') || disk=""
   [ -z "$disk" ] || info="${info}${info:+ · }disk $disk"
   if [ -r /proc/uptime ]; then

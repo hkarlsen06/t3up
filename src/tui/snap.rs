@@ -193,7 +193,7 @@ pub fn demo() -> App {
             done("OpenCode: 1.18.34"),
             Event::Auth("Claude".into()),
             done("Health: OK"),
-            Event::Sys("load 0.24 · disk 21% · up 1d 5h".into()),
+            Event::Sys("load 0.24 · cpus 4 · disk 21% · up 1d 5h".into()),
             Event::Busy(2),
             Event::Complete,
             Event::Exit { code: Some(0), error: None },

@@ -627,11 +627,18 @@ fn draw_card(
     }
     let name_w = h.name.width() + 4;
     let alert = clip(alert, (g.card_w as usize).saturating_sub(name_w + 4));
+    // Uptime sits opposite the status, when both fit.
+    let status_w = Line::from(sub.clone()).width();
+    let up = sys_parts(&h.sys)
+        .find(|(k, _)| *k == "up")
+        .map(|(_, v)| Line::styled(format!(" up {v} "), fg(DIM)))
+        .filter(|l| l.width() + status_w + 4 <= g.card_w as usize);
     Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(fg(border))
         .title(Line::styled(format!(" {} ", h.name), bold(if selected { ACCENT } else { TEXT })))
         .title(alert.right_aligned())
+        .title_bottom(up.clone().unwrap_or_default().left_aligned())
         .title_bottom(Line::from(sub).right_aligned())
         .render(buf.area, buf);
     if app.motion.on && h.running() {
@@ -703,7 +710,7 @@ fn draw_card(
         }
     }
     // The machine, then any error.
-    put(buf, x0, top + tiles_h, inner_w, &clip(vec![Span::styled(h.sys.clone(), fg(DIM))], inner_w as usize));
+    put(buf, x0, top + tiles_h, inner_w, &clip(machine(&h.sys, inner_w as usize, up.is_none()), inner_w as usize));
     if !h.error.is_empty() && !h.steps.is_empty() {
         put(
             buf,
@@ -714,6 +721,59 @@ fn draw_card(
         );
     }
     tiles
+}
+
+/// The `sys` report as (key, value) pairs, e.g. ("load", "0.24").
+fn sys_parts(sys: &str) -> impl Iterator<Item = (&str, &str)> {
+    sys.split(" · ").filter_map(|p| p.split_once(' '))
+}
+
+/// The machine row: load (per CPU) and disk as meters sharing the width `w`, then the uptime if `with_up`.
+fn machine(sys: &str, w: usize, with_up: bool) -> Vec<Span<'static>> {
+    let up = sys_parts(sys).find(|(k, _)| *k == "up" && with_up).map(|(_, v)| format!("  up {v}"));
+    let w = w.saturating_sub(up.as_ref().map_or(0, |u| u.width()));
+    let cpus = sys_parts(sys).find(|(k, _)| *k == "cpus").and_then(|(_, c)| c.parse::<f64>().ok());
+    let meters: Vec<(&str, &str, Option<f64>)> = sys_parts(sys)
+        .filter_map(|(key, value)| {
+            let frac = match key {
+                "load" => value.parse::<f64>().ok().zip(cpus.filter(|&c| c > 0.0)).map(|(l, c)| l / c),
+                "disk" => value.trim_end_matches('%').parse::<f64>().ok().map(|d| d / 100.0),
+                _ => return None,
+            };
+            Some((key, value, frac))
+        })
+        .collect();
+    let each = w.saturating_sub(2 * meters.len().saturating_sub(1)) / meters.len().max(1);
+    let mut out = vec![];
+    for (key, value, frac) in meters {
+        if !out.is_empty() {
+            out.push(Span::raw("  "));
+        }
+        out.push(Span::styled(format!("{key} "), fg(DIM)));
+        let cells = each.saturating_sub(key.len() + 1).max(4);
+        out.extend(frac.map_or_else(|| vec![Span::styled(value.to_string(), fg(DIM))], |f| bar(f, cells)));
+    }
+    out.extend(up.map(|u| Span::styled(u, fg(DIM))));
+    out
+}
+
+/// A bar of `cells` in half cells, green, then amber past 70%, red past 90%.
+fn bar(frac: f64, cells: usize) -> Vec<Span<'static>> {
+    let frac = frac.clamp(0.0, 1.0);
+    let color = if frac > 0.9 {
+        RED
+    } else if frac > 0.7 {
+        AMBER
+    } else {
+        GREEN
+    };
+    let halves = (frac * (cells * 2) as f64).round() as usize;
+    let mut on = "━".repeat(halves / 2);
+    if halves % 2 == 1 {
+        on.push('╸');
+    }
+    let rest = "━".repeat(cells - halves.div_ceil(2));
+    vec![Span::styled(on, fg(color)), Span::styled(rest, fg(LINE))]
 }
 
 /// What hovering a card shows: every tool's full version, and the one an update would install.
@@ -1764,7 +1824,8 @@ mod tests {
             "→ #2648",
             "→ 0.161.0",
             "sign in",
-            "load 0.24 · disk 21%",
+            "load ╸━━━━━━━  disk ━╸━━━━━━  up 1d 5h", // too narrow for uptime on the border
+            "╰ up 12d 2h ─",
             "● 2 agents live",
             "updating",
             "↑ 2.1.289",

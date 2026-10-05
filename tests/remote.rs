@@ -253,7 +253,7 @@ exec /bin/sleep "$@""#,
     assert_eq!(h.steps["OpenCode"], (StepState::Skip, "not installed".into()));
     assert_eq!(h.steps["Pi"], h.steps["OpenCode"]);
     assert_eq!(h.busy, Some(0));
-    assert!(events.iter().any(|e| matches!(e, Event::Sys(s) if s.contains("disk "))));
+    assert!(events.iter().any(|e| matches!(e, Event::Sys(s) if s.contains("disk ") && s.contains("cpus "))));
 
     reset(&home);
     let started = Instant::now();
