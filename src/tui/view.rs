@@ -32,21 +32,52 @@ const TOP_PAD: u16 = 1;
 
 // ── geometry ───────────────────────────────────────────────────────────────
 
-/// Where the card grid and the output panel go, from the screen size and what is in them.
+/// Where the cards and the output panel go, from the screen size and what is in them.
 pub struct Geo {
-    pub cols: usize,
-    pub card_w: u16,
+    /// Each card's place: x on screen, y down the (scrolled) content. All are `card_h` tall.
+    pub cards: Vec<Rect>,
     pub card_h: u16,
-    /// Cards too wide for the screen: one full-width card, tiles wrapped.
+    /// A card too wide for the screen: every card full width, one per row, tiles wrapped.
     pub wrapped: bool,
     pub per_row: usize,
     pub tile_rows: usize,
-    pub gutter: u16,
-    pub left: u16,
-    pub rows: usize,
     pub content_h: u16,
     pub view: Rect,
     pub out: Rect,
+}
+
+#[cfg(test)]
+impl Geo {
+    /// Cards in the first row.
+    pub fn cols(&self) -> usize {
+        self.cards.iter().filter(|c| c.y == self.cards[0].y).count()
+    }
+}
+
+/// Columns between cards side by side.
+const GUTTER: u16 = 3;
+
+/// The tools a card shows a tile for, in order.
+fn present(h: &Host) -> Vec<&'static str> {
+    COMPONENTS
+        .iter()
+        .map(|(n, _)| *n)
+        .filter(|n| h.installed.contains(*n) && !matches!(h.steps.get(*n), Some((StepState::Skip, _))))
+        .collect()
+}
+
+/// A card with a message where its tiles would be: no T3 there, or it never got as far as a step.
+fn message_card(h: &Host) -> bool {
+    h.status == Status::Ok && crate::model::no_t3(h) || h.status == Status::Failed && h.steps.is_empty()
+}
+
+/// As wide as its own tiles, and wide enough for its name and meters (or its message).
+fn card_width(h: &Host) -> u16 {
+    if message_card(h) {
+        return 38;
+    }
+    let n = present(h).len().max(1) as u16;
+    32.max(n * (TILE + GAP) - GAP + 4)
 }
 
 pub fn geometry(app: &App) -> Geo {
@@ -55,33 +86,38 @@ pub fn geometry(app: &App) -> Geo {
     let out_h = if app.show_output { (body * 45 / 100).max(5).min(body) } else { 0 };
     let view = Rect::new(0, HEADER, w, body - out_h);
     let out = Rect::new(0, HEADER + body - out_h, w, out_h);
-    let n = app.tools.len().max(1) as u16;
-    let want = 36.max(n * (TILE + GAP) - GAP + 4);
     let avail = w.saturating_sub(4);
-    let wrapped = avail < want;
-    let card_w = if wrapped { avail.max(12) } else { want };
-    let cols = if wrapped { 1 } else { app.hosts.len().min(((avail + 2) / (card_w + 2)) as usize).max(1) };
-    let per_row = if wrapped { ((card_w.saturating_sub(4) + GAP) / (TILE + GAP)).max(1) as usize } else { n as usize };
-    let tile_rows = (n as usize).div_ceil(per_row);
+    let mut widths: Vec<u16> = app.hosts.iter().map(card_width).collect();
+    let wrapped = widths.iter().any(|&cw| cw > avail);
+    if wrapped {
+        widths.fill(avail.max(12));
+    }
+    let per_row = if wrapped { ((avail.max(12) - 4 + GAP) / (TILE + GAP)).max(1) as usize } else { COMPONENTS.len() };
+    let most = app.hosts.iter().map(|h| present(h).len()).max().unwrap_or(1).max(1);
+    let tile_rows = most.div_ceil(per_row);
     let error_row = app.hosts.iter().any(|h| !h.error.is_empty() && !h.steps.is_empty()) as u16;
     let card_h = 2 + TOP_PAD + tile_rows as u16 * TILE_ROWS + (tile_rows as u16 - 1) + 1 + error_row;
-    let rows = app.hosts.len().div_ceil(cols).max(1);
-    let gutter = if cols > 1 { (w.saturating_sub(cols as u16 * card_w) / (cols as u16 + 1)).clamp(2, 6) } else { 0 };
-    let block = cols as u16 * card_w + (cols as u16 - 1) * gutter;
-    Geo {
-        cols,
-        card_w,
-        card_h,
-        wrapped,
-        per_row,
-        tile_rows,
-        gutter,
-        left: w.saturating_sub(block) / 2,
-        rows,
-        content_h: 2 + rows as u16 * card_h + (rows as u16 - 1),
-        view,
-        out,
+    // Left to right, a new row when the next card won't fit; the rows start together, centered.
+    let mut rows: Vec<Vec<(usize, u16)>> = vec![];
+    let mut x = 0;
+    for (i, &cw) in widths.iter().enumerate() {
+        if rows.is_empty() || x + cw > avail {
+            rows.push(vec![]);
+            x = 0;
+        }
+        rows.last_mut().unwrap().push((i, x));
+        x += cw + GUTTER;
     }
+    let block = rows.iter().filter_map(|r| r.last().map(|&(i, x)| x + widths[i])).max().unwrap_or(0);
+    let left = w.saturating_sub(block) / 2;
+    let mut cards = vec![Rect::default(); widths.len()];
+    for (r, row) in rows.iter().enumerate() {
+        for &(i, x) in row {
+            cards[i] = Rect::new(left + x, 1 + r as u16 * (card_h + 1), widths[i], card_h);
+        }
+    }
+    let rows = rows.len().max(1) as u16;
+    Geo { cards, card_h, wrapped, per_row, tile_rows, content_h: 2 + rows * card_h + (rows - 1), view, out }
 }
 
 pub fn max_scroll(app: &App) -> u16 {
@@ -92,7 +128,7 @@ pub fn max_scroll(app: &App) -> u16 {
 /// The scroll offset that shows card `i`, moving as little as possible.
 pub fn scroll_to(app: &App, i: usize) -> u16 {
     let g = geometry(app);
-    let top = 1 + (i / g.cols) as u16 * (g.card_h + 1);
+    let top = g.cards.get(i).map_or(1, |c| c.y);
     let bottom = top + g.card_h + 1;
     let mut scroll = app.scroll;
     if top.saturating_sub(1) < scroll {
@@ -306,6 +342,12 @@ fn header(app: &mut App, buf: &mut Buffer) {
         let color = if enabled { if hovered { TEXT } else { ACCENT } } else { DIM };
         buf.set_style(button, Style::new().bg(bg));
         put(buf, button.x + 2, 1, bw - 2, &Line::styled(label, bold(color)));
+        // Rounded ends: Powerline's half circles, which Ghostty, kitty and WezTerm draw themselves.
+        for (x, cap) in [(button.x, "\u{e0b6}"), (button.right() - 1, "\u{e0b4}")] {
+            if let Some(cell) = buf.cell_mut((x, 1)) {
+                cell.set_symbol(cap).set_style(Style::new().fg(bg).bg(SURFACE));
+            }
+        }
         if enabled {
             // The whole height of the bar is clickable, not just the text row.
             app.hits.push((Rect::new(button.x, 0, bw, HEADER), Hit::UpdateAll));
@@ -322,49 +364,18 @@ fn header(app: &mut App, buf: &mut Buffer) {
     }
 }
 
-/// The widest layout that fits: narrow terminals lose where t3up runs, then the long counts,
-/// then the long desktop line (an outdated desktop is never dropped, only shortened).
+/// The widest layout that fits: narrow terminals lose the long counts, then the pinned version.
 pub fn header_text(app: &App, width: usize) -> (Line<'static>, Line<'static>) {
     let badge = Span::styled(" t3up ", Style::new().fg(BG).bg(ACCENT).add_modifier(Modifier::BOLD));
-    let on = if app.local.is_empty() {
-        vec![]
-    } else {
-        vec![Span::styled("   On ", fg(DIM)), Span::styled(app.local.clone(), fg(TEXT))]
-    };
     let pinned = if app.target.is_empty() {
         vec![]
     } else {
         vec![Span::styled("   Installs ", fg(DIM)), Span::styled(app.target.clone(), fg(AMBER))]
     };
-    let behind = app.outdated_desktop();
-    let (full, terse): (Vec<Span>, Vec<Span>) = if app.desktop_updating {
-        let s = vec![Span::styled("   updating desktop…", fg(AMBER))];
-        (s.clone(), s)
-    } else if !behind.is_empty() {
-        let bump = compact(&behind, &app.desktop);
-        (
-            vec![
-                Span::styled("   Desktop ", fg(DIM)),
-                Span::styled(short(&app.desktop), fg(AMBER)),
-                Span::styled(format!(" → {bump} · d to update"), fg(AMBER)),
-            ],
-            vec![Span::styled(format!("   update desktop → {bump}"), fg(AMBER))],
-        )
-    } else {
-        let v = short(&app.desktop);
-        (
-            vec![
-                Span::styled("   Desktop ", fg(DIM)),
-                Span::styled(if v.is_empty() { "not detected".to_string() } else { v }, fg(TEXT)),
-            ],
-            vec![],
-        )
-    };
     let count = |f: &dyn Fn(&Host) -> bool| app.hosts.iter().filter(|h| f(h)).count();
     let counts = [
         (count(&Host::running), AMBER, "busy", "…"),
         (app.queued.len(), DIM, "queued", "◌"),
-        (count(&|h| h.status == Status::Ok && !crate::model::no_t3(h)), GREEN, "ok", "✓"),
         (count(&|h| h.status == Status::Ok && crate::model::no_t3(h)), AMBER, "no T3", "○"),
         (
             count(&|h| h.status == Status::Ok && !updates(h, &app.latest, &app.target).is_empty()),
@@ -399,11 +410,10 @@ pub fn header_text(app: &App, width: usize) -> (Line<'static>, Line<'static>) {
         (None, _) => (vec![], vec![]),
     };
     let layouts = [
-        (cat(&[&on, &full, &pinned, &mine]), false),
-        (cat(&[&full, &pinned, &mine]), false),
-        (cat(&[&full, &pinned, &mine]), true),
-        (cat(&[&terse, &pinned, &mine_terse]), true),
-        (cat(&[&terse, &mine_terse]), true),
+        (cat(&[&pinned, &mine]), false),
+        (cat(&[&pinned, &mine]), true),
+        (cat(&[&pinned, &mine_terse]), true),
+        (cat(&[&mine_terse]), true),
     ];
     let mut chosen = None;
     for (parts, short) in &layouts {
@@ -413,8 +423,8 @@ pub fn header_text(app: &App, width: usize) -> (Line<'static>, Line<'static>) {
             break;
         }
     }
-    // Nothing fits with the counts: they go, the desktop hint stays.
-    chosen.unwrap_or_else(|| (Line::from(cat(&[&terse])), Line::default()))
+    // Nothing fits with the counts: they go.
+    chosen.unwrap_or_else(|| (Line::from(cat(&[])), Line::default()))
 }
 
 // ── footer ─────────────────────────────────────────────────────────────────
@@ -496,14 +506,13 @@ fn cards(app: &mut App, logos: &Logos, buf: &mut Buffer, dim_logos: bool) {
         put(buf, x, y, g.view.width, &line);
         return;
     }
-    for i in 0..app.hosts.len() {
-        let (row, col) = ((i / g.cols) as i32, (i % g.cols) as u16);
-        let x = g.left + col * (g.card_w + g.gutter);
-        let y = g.view.y as i32 + 1 + row * (g.card_h as i32 + 1) - app.scroll as i32;
+    for (i, place) in g.cards.iter().enumerate() {
+        let x = place.x;
+        let y = g.view.y as i32 + place.y as i32 - app.scroll as i32;
         if y + g.card_h as i32 <= g.view.y as i32 || y >= g.view.bottom() as i32 {
             continue;
         }
-        let mut card = Buffer::empty(Rect::new(0, 0, g.card_w, g.card_h));
+        let mut card = Buffer::empty(Rect::new(0, 0, place.width, g.card_h));
         card.set_style(card.area, Style::new().bg(BG).fg(TEXT));
         let tiles = draw_card(app, &g, logos, i, &mut card, dim_logos);
         let visible = blit(&card, buf, x, y, g.view);
@@ -549,7 +558,8 @@ fn blit(src: &Buffer, dst: &mut Buffer, x: u16, y: i32, clip: Rect) -> Rect {
 /// The tool's version for its tile: '↑ 2.1.289' after an update, a spinner while it runs.
 fn tile_version(app: &App, h: &Host, name: &str) -> Span<'static> {
     let (state, value) = h.steps.get(name).map_or((None, ""), |(s, v)| (Some(*s), v.as_str()));
-    let span = if state == Some(StepState::Begin) && h.running() {
+    let span = if (state == Some(StepState::Begin) && h.running()) || (h.local && name == "T3" && app.desktop_updating)
+    {
         Span::styled(spinner(app.clock()).to_string(), fg(AMBER))
     } else if matches!(state, Some(StepState::Begin | StepState::Fail)) {
         Span::styled("✗ failed", fg(RED))
@@ -558,7 +568,7 @@ fn tile_version(app: &App, h: &Host, name: &str) -> Span<'static> {
             (true, Some(cur)) => format!("#{}", cur.rsplit('.').next().unwrap_or(cur)),
             _ => value.rsplit(" → ").next().unwrap_or(value).to_string(),
         };
-        Span::styled(format!("↑ {done}"), bold(GREEN))
+        Span::styled(format!("↑{done}"), bold(GREEN))
     } else {
         let value = if value.is_empty() { "—" } else { value };
         Span::styled(value.to_string(), fg(if state.is_some() { TEXT } else { FAINT }))
@@ -604,19 +614,21 @@ fn draw_card(
     let border = app.motion.border(&h.name, border);
     let (icon, color, label) = status(h, queued, t);
     let new = updates(h, &app.latest, &app.target);
-    let mut sub = vec![Span::raw(" "), Span::styled(format!("{icon} {label}"), fg(color))];
-    // A queued server (waiting for the canary) has nothing more to say.
-    if !queued {
-        if h.status == Status::Ok && !new.is_empty() {
-            sub.push(Span::styled(format!(" · {} to update", new.len()), fg(ACCENT)));
-        }
-        if matches!(h.status, Status::Ok | Status::Failed | Status::Running) {
-            let secs = h.took().as_secs_f64();
-            let took = if h.running() { format!("{secs:.0}s") } else { format!("{secs:.1}s") };
-            sub.push(Span::styled(format!("  {took}"), fg(DIM)));
-        }
+    // Healthy is the norm and says nothing: the status shows only what isn't.
+    let fine = h.status == Status::Ok && !queued && !crate::model::no_t3(h);
+    let mut sub = vec![];
+    if !fine {
+        sub.push(Span::styled(format!(" {icon} {label}"), fg(color)));
     }
-    sub.push(Span::raw(" "));
+    if fine && !new.is_empty() {
+        sub.push(Span::styled(format!(" ↑ {} to update", new.len()), fg(ACCENT)));
+    }
+    if h.running() && !queued {
+        sub.push(Span::styled(format!("  {:.0}s", h.took().as_secs_f64()), fg(DIM)));
+    }
+    if !sub.is_empty() {
+        sub.push(Span::raw(" "));
+    }
     // What needs attention sits on the top border, opposite the name.
     let mut alert: Vec<Span<'static>> = vec![];
     if let Some(n) = h.busy.filter(|&n| n > 0) {
@@ -625,20 +637,23 @@ fn draw_card(
     if !h.rollback.is_empty() {
         alert.push(Span::styled(format!(" ↩ rolled back {} ", h.rollback), fg(AMBER)));
     }
-    let name_w = h.name.width() + 4;
-    let alert = clip(alert, (g.card_w as usize).saturating_sub(name_w + 4));
-    // Uptime sits opposite the status, when both fit.
-    let status_w = Line::from(sub.clone()).width();
+    if fine && h.mode == crate::model::Mode::Update {
+        alert.push(Span::styled(" ✓ updated ", fg(GREEN)));
+    }
+    // Uptime follows the name, when it fits beside what needs attention.
+    let name = Span::styled(format!(" {} ", h.name), bold(if selected { ACCENT } else { TEXT }));
+    let alert_w = Line::from(alert.clone()).width();
     let up = sys_parts(&h.sys)
         .find(|(k, _)| *k == "up")
-        .map(|(_, v)| Line::styled(format!(" up {v} "), fg(DIM)))
-        .filter(|l| l.width() + status_w + 4 <= g.card_w as usize);
+        .map(|(_, v)| Span::styled(format!("up {v} "), fg(DIM)))
+        .filter(|u| name.width() + u.width() + alert_w + 4 <= buf.area.width as usize);
+    let alert =
+        clip(alert, (buf.area.width as usize).saturating_sub(name.width() + up.as_ref().map_or(0, Span::width) + 4));
     Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(fg(border))
-        .title(Line::styled(format!(" {} ", h.name), bold(if selected { ACCENT } else { TEXT })))
+        .title(Line::from([name].into_iter().chain(up.clone()).collect::<Vec<_>>()))
         .title(alert.right_aligned())
-        .title_bottom(up.clone().unwrap_or_default().left_aligned())
         .title_bottom(Line::from(sub).right_aligned())
         .render(buf.area, buf);
     if app.motion.on && h.running() {
@@ -651,11 +666,11 @@ fn draw_card(
         motion::comet(buf, t.as_secs_f32(), blend(TEXT, ACCENT, 0.6), 1, 9.0, 0.55);
     }
 
-    let (x0, inner_w) = (2u16, g.card_w.saturating_sub(4));
+    let (x0, inner_w) = (2u16, buf.area.width.saturating_sub(4));
     let top = 1 + TOP_PAD;
     let tiles_h = g.tile_rows as u16 * TILE_ROWS + (g.tile_rows as u16 - 1);
     let missing = h.status == Status::Ok && crate::model::no_t3(h);
-    if missing || h.status == Status::Failed && h.steps.is_empty() {
+    if message_card(h) {
         // Never got as far as a step, or there's no T3 here: say so, as tall as the tiles.
         let lines = if missing {
             [
@@ -672,40 +687,28 @@ fn draw_card(
             put(buf, x0, top + 1 + k as u16, inner_w, line);
         }
     } else {
-        let present: Vec<&str> = app
-            .tools
-            .iter()
-            .copied()
-            .filter(|n| h.installed.contains(*n) && !matches!(h.steps.get(*n), Some((StepState::Skip, _))))
-            .collect();
-        let slot = if g.wrapped { TILE + GAP } else { inner_w / app.tools.len().max(1) as u16 };
-        let places: Vec<(u16, u16, &str)> = if g.wrapped {
-            present
-                .iter()
-                .enumerate()
-                .map(|(k, n)| ((k % g.per_row) as u16 * slot, (k / g.per_row) as u16, *n))
-                .collect()
-        } else {
-            app.tools
-                .iter()
-                .enumerate()
-                .filter(|(_, n)| present.contains(n))
-                .map(|(k, n)| (k as u16 * slot, 0, *n))
-                .collect()
-        };
-        for (dx, row, name) in places {
-            let tx = x0 + dx + if g.wrapped { 0 } else { slot.saturating_sub(TILE) / 2 };
+        let present = present(h);
+        // Side by side, centered when the card is wider than its tiles (its name or meters need the room).
+        let per_row = g.per_row.min(present.len()).max(1) as u16;
+        let indent = if g.wrapped { 0 } else { inner_w.saturating_sub(per_row * (TILE + GAP) - GAP) / 2 };
+        for (k, name) in present.into_iter().enumerate() {
+            let (dx, row) = ((k as u16 % per_row) * (TILE + GAP), k as u16 / per_row);
+            let tx = x0 + indent + dx;
             let ty = top + row * (TILE_ROWS + 1);
             tiles.push((Rect::new(tx, ty, TILE, TILE_ROWS), name));
-            let size = logos.size(name);
-            let lx = tx + TILE.saturating_sub(size.width) / 2;
-            logos.draw(name, Rect::new(lx, ty, size.width.min(TILE), size.height), buf, dim_logos);
             let version = tile_version(app, h, name);
+            // The logo centers on the version number under it, to the pixel.
+            let number = truncate(&version.content, TILE as usize);
+            let odd = number.trim_start_matches('↑').width() % 2 == 1;
+            logos.draw_tile(name, odd, Rect::new(tx, ty, TILE, logos::HEIGHT), buf, dim_logos);
             let note = tile_note(app, h, name, new.iter().find(|(n, _)| n == name).map(|(_, v)| v));
             for (k, span) in [version, note].into_iter().enumerate() {
                 let text = truncate(&span.content, TILE as usize);
-                let (cx, line) = centered(Line::styled(text, span.style), TILE);
-                put(buf, tx + cx, ty + logos::HEIGHT + k as u16, TILE, &line);
+                // The number itself sits under the logo; an update's arrow hangs to its left.
+                let (arrow, number) = text.strip_prefix('↑').map_or(("", text.as_str()), |n| ("↑", n));
+                let (cx, _) = centered(Line::raw(number.to_string()), TILE);
+                let cx = cx.max(arrow.width() as u16) - arrow.width() as u16;
+                put(buf, tx + cx, ty + logos::HEIGHT + k as u16, TILE, &Line::styled(text.clone(), span.style));
             }
         }
     }
@@ -749,23 +752,27 @@ fn machine(sys: &str, w: usize, with_up: bool) -> Vec<Span<'static>> {
         if !out.is_empty() {
             out.push(Span::raw("  "));
         }
+        // Load per CPU reads as how busy the CPUs are; a bare load average stays 'load'.
+        let key = if key == "load" && frac.is_some() { "cpu" } else { key };
         out.push(Span::styled(format!("{key} "), fg(DIM)));
         let cells = each.saturating_sub(key.len() + 1).max(4);
-        out.extend(frac.map_or_else(|| vec![Span::styled(value.to_string(), fg(DIM))], |f| bar(f, cells)));
+        // How busy is a measure (blue); free disk is good news (green).
+        let color = if key == "disk" { GREEN } else { ACCENT };
+        out.extend(frac.map_or_else(|| vec![Span::styled(value.to_string(), fg(DIM))], |f| bar(f, cells, color)));
     }
     out.extend(up.map(|u| Span::styled(u, fg(DIM))));
     out
 }
 
-/// A bar of `cells` in half cells, green, then amber past 70%, red past 90%.
-fn bar(frac: f64, cells: usize) -> Vec<Span<'static>> {
+/// A bar of `cells` in half cells, in `color`, then amber past 70%, red past 90%.
+fn bar(frac: f64, cells: usize, color: ratatui::style::Color) -> Vec<Span<'static>> {
     let frac = frac.clamp(0.0, 1.0);
     let color = if frac > 0.9 {
         RED
     } else if frac > 0.7 {
         AMBER
     } else {
-        GREEN
+        color
     };
     let halves = (frac * (cells * 2) as f64).round() as usize;
     let mut on = "━".repeat(halves / 2);
@@ -1735,25 +1742,25 @@ fn changes(app: &mut App, buf: &mut Buffer, mut c: Changes) {
 
 /// The toast stack, bottom-right. With a window open (`since` it opened), `over` draws the toasts
 /// that came after it (on top), else the ones from before (under it); every toast keeps its place.
-fn toasts(app: &App, buf: &mut Buffer, since: Option<std::time::Instant>, over: bool) {
+/// Toasts, newest at the bottom. Several stack: the newest in front, the edges of two older ones
+/// peeking out above it. Hovering the stack spreads them out.
+fn toasts(app: &mut App, buf: &mut Buffer, since: Option<std::time::Instant>, over: bool) {
     let w = 46u16.min(buf.area.width.saturating_sub(4));
     if w < 12 {
         return;
     }
-    let mut bottom = buf.area.height.saturating_sub(2); // one row of air above the footer
+    let shown: Vec<Toast> =
+        app.toasts.iter().rev().filter(|t| since.is_none_or(|s| (t.born >= s) == over)).cloned().collect();
+    let open = shown.len() == 1 || app.hover.as_ref().is_some_and(|h| h.hit == Some(Hit::Toasts));
+    let floor = buf.area.height.saturating_sub(2); // one row of air above the footer
+    let (mut bottom, mut top, mut front) = (floor, floor, None);
     let now = std::time::Instant::now();
-    for Toast { title, text, sev, born, until } in app.toasts.iter().rev() {
+    for (k, Toast { title, text, sev, born, until }) in shown.iter().enumerate() {
         let color = match sev {
             Sev::Info => ACCENT,
             Sev::Warning => AMBER,
             Sev::Error => RED,
         };
-        let rows = wrap(text, w as usize - 4);
-        let h = 3 + rows.len() as u16;
-        if bottom < HEADER + 1 + h {
-            break;
-        }
-        let y = bottom - h;
         // Slides in from the right edge, and back out just before it expires.
         let (age, left) = (now.duration_since(*born).as_secs_f32(), until.saturating_duration_since(now).as_secs_f32());
         let out = if app.motion.on {
@@ -1762,6 +1769,25 @@ fn toasts(app: &App, buf: &mut Buffer, since: Option<std::time::Instant>, over: 
         } else {
             0
         };
+        // Behind the front one: its top edge, narrower and fainter the further back.
+        if let Some((x, y)) = front.filter(|_| !open) {
+            let k = k as u16;
+            if k > 2 || y < HEADER + 1 + k {
+                break;
+            }
+            let lw = w - 4 * k;
+            let edge = format!("╭{}╮", "─".repeat(lw as usize - 2));
+            let style = Style::new().fg(blend(color, SURFACE, 0.7 / k as f32)).bg(SURFACE);
+            put(buf, x + 2 * k + out, y - k, lw, &Line::styled(edge, style));
+            top = y - k;
+            continue;
+        }
+        let rows = wrap(text, w as usize - 4);
+        let h = 3 + rows.len() as u16;
+        if bottom < HEADER + 1 + h {
+            break;
+        }
+        let y = bottom - h;
         let whole = Rect::new(0, 0, w, h);
         let mut card = Buffer::empty(whole);
         fill(&mut card, whole, SURFACE);
@@ -1769,10 +1795,6 @@ fn toasts(app: &App, buf: &mut Buffer, since: Option<std::time::Instant>, over: 
         put(&mut card, 2, 1, w - 4, &Line::styled(title.clone(), bold(color)));
         for (k, row) in rows.iter().enumerate() {
             put(&mut card, 2, 2 + k as u16, w - 4, &Line::styled(row.clone(), fg(TEXT)));
-        }
-        if since.is_some_and(|since| (*born >= since) != over) {
-            bottom = y;
-            continue;
         }
         let mut x = buf.area.width - w - MARGIN;
         let modal = app.modal_rect;
@@ -1783,7 +1805,12 @@ fn toasts(app: &App, buf: &mut Buffer, since: Option<std::time::Instant>, over: 
             x = modal.right() + 2;
         }
         blit(&card, buf, x + out, y as i32, buf.area);
-        bottom = y;
+        front = front.or(Some((x, y)));
+        (bottom, top) = (y, y);
+    }
+    // Hovering anywhere on the stack (spread out or not) keeps it open.
+    if let Some((x, _)) = front {
+        app.hits.push((Rect::new(x, top, w, floor - top), Hit::Toasts));
     }
 }
 
@@ -1809,14 +1836,13 @@ mod tests {
         for needle in [
             " t3up ",
             "Update all",
-            "Desktop",
-            "→ #2648 · d to update",
-            "● 1", // header; tallies are terse at this width
+            "Ganz-Harbour up 3d 4h", // this machine, top left
+            "● 1",                   // header; tallies are terse at this width
             "one-s",
             "one-m",
             "mdr",
             "box",
-            "✓ healthy · 3 to update",
+            "↑ 3 to update",
             "0.0.46",
             "0.160.0",
             "2.1.288",
@@ -1824,11 +1850,12 @@ mod tests {
             "→ #2648",
             "→ 0.161.0",
             "sign in",
-            "load ╸━━━━━━━  disk ━╸━━━━━━  up 1d 5h", // too narrow for uptime on the border
-            "╰ up 12d 2h ─",
+            "cpu ━━━━━━━━━━━━━━  disk ━━╸━━━━━━━━━━",
+            "one-s up 1d 5h",
+            "one-m up 12d 2h",
             "● 2 agents live",
             "updating",
-            "↑ 2.1.289",
+            "↑2.1.289",
             "✗ failed",
             "Codex: EACCES",
             "enter → retry or open a terminal",
@@ -1842,8 +1869,8 @@ mod tests {
         }
         // The selected card has the accent border, others the line color.
         let card = |i| app.hits.iter().find(|(_, h)| *h == Hit::Card(i)).unwrap().0;
-        assert_eq!(buf[(card(0).x, card(0).y)].fg, ACCENT);
-        assert_eq!(buf[(card(1).x, card(1).y)].fg, LINE);
+        assert_eq!(buf[(card(1).x, card(1).y)].fg, ACCENT);
+        assert_eq!(buf[(card(0).x, card(0).y)].fg, LINE);
         assert_eq!(cell_fg(&buf, "✗ failed").unwrap(), RED);
     }
 
@@ -1893,6 +1920,81 @@ mod tests {
     }
 
     #[test]
+    fn cards_are_as_wide_as_their_tools_and_flow_into_rows() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = demo();
+        frame(&mut app, 100, 30);
+        let g = geometry(&app);
+        let at = |name| app.hosts.iter().position(|h| h.name == name).unwrap();
+        let card = |name| g.cards[at(name)];
+        // Four tools, three, two (the least a card is), and a message.
+        assert_eq!(
+            ["one-s", "Ganz-Harbour", "mdr", "box"].map(|n| card(n).width),
+            [4 * (TILE + GAP) - GAP + 4, 3 * (TILE + GAP) - GAP + 4, 32, 38]
+        );
+        // Left to right, wrapping: Ganz-Harbour and one-s, then one-m and mdr, then box. Rows start together.
+        let rows = ["Ganz-Harbour", "one-s", "one-m", "mdr", "box"].map(|n| (card(n).y - 1) / (g.card_h + 1));
+        assert_eq!(rows, [0, 0, 1, 1, 2]);
+        assert!(card("Ganz-Harbour").x == card("one-m").x && card("one-m").x == card("box").x);
+        // Up and down go to the nearest card in the next row.
+        let key = |app: &mut App, code| app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        app.selected = at("one-s");
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.host().unwrap().name, "mdr");
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.host().unwrap().name, "box");
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.host().unwrap().name, "one-m");
+    }
+
+    #[test]
+    fn an_update_arrow_hangs_left_of_a_centered_version() {
+        let mut app = demo();
+        app.on_job("one-m", Event::Done("Codex: codex-cli 0.160.0 -> codex-cli 1.0.47".into()));
+        let buf = frame(&mut app, 100, 30);
+        let one_m = app.hosts.iter().position(|h| h.name == "one-m").unwrap();
+        let row = |tool| {
+            let tile = app.hits.iter().find(|(_, h)| *h == Hit::Tool(one_m, tool)).unwrap().0;
+            (tile.x..tile.right()).map(|x| buf[(x, tile.y + logos::HEIGHT)].symbol()).collect::<String>()
+        };
+        // Each number centered in its tile as if alone, its arrow right before it, no space.
+        assert_eq!(row("Claude"), "↑2.1.289 ");
+        assert_eq!(row("Codex"), "↑1.0.47  ", "where a lone 1.0.47 would be");
+    }
+
+    #[test]
+    fn toasts_stack_and_spread_out_on_hover() {
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        let mut app = demo();
+        for host in ["depressed-louis", "mdr", "one-s"] {
+            app.toast(Sev::Info, "Done", format!("{host} updated in 2s"));
+        }
+        let buf = frame(&mut app, 100, 30);
+        // The newest in front; only the edges of the two before it.
+        assert!(has(&buf, "one-s updated") && !has(&buf, "mdr updated") && !has(&buf, "louis updated"));
+        let rows = text(&buf);
+        let y = rows.iter().position(|r| r.contains("one-s updated")).unwrap() - 2; // the front card's top
+        assert!(rows[y - 1].contains("╭──") && rows[y - 2].contains("╭──"), "{}", rows.join("\n"));
+        let edge = |r: &str| r[r.rfind('╭').unwrap()..].chars().take_while(|&c| c != '╮').count();
+        assert_eq!((edge(&rows[y - 1]), edge(&rows[y - 2])), (41, 37), "narrower further back");
+        // Hovering spreads them out, and they wait while you read.
+        let stack = app.hits.iter().find(|(_, h)| *h == Hit::Toasts).unwrap().0;
+        let at = |x, y| MouseEvent { kind: MouseEventKind::Moved, column: x, row: y, modifiers: KeyModifiers::NONE };
+        app.on_mouse(at(stack.x + 2, stack.y));
+        assert!(app.dirty);
+        let buf = frame(&mut app, 100, 30);
+        assert!(has(&buf, "one-s updated") && has(&buf, "mdr updated") && has(&buf, "louis updated"));
+        let until = app.toasts[0].until;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        app.tick();
+        assert!(app.toasts[0].until > until, "paused under the pointer");
+        // Away again: stacked.
+        app.on_mouse(at(1, 5));
+        let buf = frame(&mut app, 100, 30);
+        assert!(!has(&buf, "mdr updated"));
+    }
+
+    #[test]
     fn copying_says_so_on_the_button_not_in_a_toast() {
         use crate::tui::app::Res;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1919,7 +2021,7 @@ mod tests {
     #[test]
     fn a_server_without_t3_offers_the_install() {
         let mut app = demo();
-        let h = &mut app.hosts[1];
+        let h = &mut app.hosts[2];
         h.reset(crate::model::Mode::Check, "all");
         h.apply(Event::Skip("T3: not installed".into()));
         h.apply(Event::Complete);
@@ -1939,9 +2041,16 @@ mod tests {
             let x = row.find("↑ Update all").map(|b| row[..b].chars().count()).expect("button");
             let end = x + "↑ Update all".chars().count();
             let bg = buf[(x as u16, 1)].bg;
-            // Two cells of the pill on each side of the label, then the screen's margin.
-            for dx in [x - 2, x - 1, end, end + 1] {
+            // A cell of the pill on each side of the label, then its rounded ends, then the screen's margin.
+            for dx in [x - 1, end] {
                 assert_eq!(buf[(dx as u16, 1)].bg, bg, "pill padding at {dx} (width {w})");
+            }
+            for (dx, cap) in [(x - 2, "\u{e0b6}"), (end + 1, "\u{e0b4}")] {
+                assert_eq!(
+                    (buf[(dx as u16, 1)].symbol(), buf[(dx as u16, 1)].fg),
+                    (cap, bg),
+                    "rounded end (width {w})"
+                );
             }
             assert_ne!(buf[(x as u16 - 3, 1)].bg, bg, "pill starts two cells before the label (width {w})");
             assert_eq!(end + 2 + MARGIN as usize, w as usize, "right margin (width {w})");
@@ -1949,13 +2058,27 @@ mod tests {
     }
 
     #[test]
+    fn healthy_says_nothing_updated_sits_top_right_of_the_card() {
+        let mut app = demo();
+        let buf = frame(&mut app, 100, 30);
+        assert!(!has(&buf, "healthy") && !has(&buf, " ok"), "{}", text(&buf).join("\n"));
+        app.hosts[1].reset(crate::model::Mode::Update, "all");
+        app.on_job("one-s", Event::Done("T3: t3 0.0.46-nightly.20261003.2648".into()));
+        app.on_job("one-s", Event::Complete);
+        app.on_job("one-s", Event::Exit { code: Some(0), error: None });
+        let buf = frame(&mut app, 100, 30);
+        let top = text(&buf).into_iter().find(|r| r.contains("one-s")).unwrap_or_default();
+        assert!(top.contains("✓ updated"), "{}", text(&buf).join("\n"));
+    }
+
+    #[test]
     fn dashboard_at_60x24() {
         let mut app = demo();
         let buf = frame(&mut app, 60, 24);
-        for needle in ["Update all", "one-s", "✓ healthy · 3 to update", "update desktop → #2648", "? help"] {
+        for needle in ["Update all", "one-s", "↑ 3 to update", "? help"] {
             assert!(has(&buf, needle), "{needle:?} missing from\n{}", text(&buf).join("\n"));
         }
-        assert_eq!(geometry(&app).cols, 1);
+        assert_eq!(geometry(&app).cols(), 1);
         // Too small for even a header: still draws.
         frame(&mut app, 20, 6);
         frame(&mut app, 1, 1);
@@ -2011,7 +2134,7 @@ mod tests {
     #[test]
     fn output_panel_shows_the_selected_hosts_log() {
         let mut app = demo();
-        app.selected = 2;
+        app.selected = 3;
         app.show_output = true;
         let buf = frame(&mut app, 100, 30);
         assert!(has(&buf, "mdr output · mdr-153012-check.log"), "{}", text(&buf).join("\n"));
@@ -2077,7 +2200,7 @@ mod tests {
                         0 => app.open_actions(),
                         1 => app.open_update_all(),
                         2 => app.open_version(),
-                        3 => app.begin_update(vec!["one-s".into()], "all", false),
+                        3 => app.begin_update(vec!["one-s".into()], "all"),
                         4 => app.open_desktop(),
                         _ => {
                             app.modal = Some(Modal::Palette(crate::tui::app::Palette {

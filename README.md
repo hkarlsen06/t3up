@@ -20,8 +20,8 @@ t3up shows every server you run T3 Code on, with the version of T3 and each prov
 You can update one server or all of them without leaving the terminal.
 
 - **Check is read-only.** The dashboard checks every server on launch, and checking never changes anything.
-- **Safe rollouts.** Updating several servers updates the first one alone first; the rest follow only if it
-  comes back healthy. If T3 fails its health check after an update, t3up puts the previous version back.
+- **Safe rollouts.** Updating several servers updates the least used one (fewest T3 threads) alone first; the
+  rest follow only if it comes back healthy. If T3 fails its health check after an update, t3up puts the previous version back.
 - **Knows when a server is busy.** It counts the agents running under T3 and asks before an update would
   restart T3 over them.
 - **What's new.** Press <kbd>c</kbd> to read the release notes of every update waiting on a server.
@@ -33,7 +33,8 @@ You can update one server or all of them without leaving the terminal.
   how long it's valid. Anything unexpected still has **t: open in terminal**.
 - **No agent on the server.** It runs a POSIX `sh` script over plain SSH. Nothing to install remotely.
 - **Scriptable.** `--check` and `--update` give plain output and an exit code, for cron or CI.
-- **Desktop app (macOS).** When your T3 Code desktop app is older than your servers, t3up can update it as well.
+- **This machine too.** It gets its own card, top left: its providers, CPU and disk, and the T3 Code desktop app
+  (macOS) as its T3, which t3up can update as well.
 - **Alive.** A pixel-art intro rolls in while the first check runs, versions decode in as servers report,
   light runs around the border of a server that's busy, and finished cards glow green or red.
   Set `T3UP_NO_MOTION=1` for a still dashboard.
@@ -103,7 +104,9 @@ Run `t3up` with no arguments to open the dashboard.
 | <kbd>q</kbd> | Quit |
 
 Each card shows a server's tools, their versions and any newer release (`→ 0.161.0`), tools that need you to
-sign in, the server's load, disk and uptime, and how many agents are running on it.
+sign in, the server's CPU, disk and uptime, and how many agents are running on it. It shows only what's out of
+the ordinary: a healthy server says nothing. Cards are as wide as their tools, busiest servers (most T3 threads)
+first.
 
 A server's menu lists what's installed on it. **Everything** updates T3 and all of those. To add something, open
 the **Installer** (in the menu, with <kbd>i</kbd>, or by typing "install" in the palette) and tick what you want:

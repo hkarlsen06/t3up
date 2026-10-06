@@ -104,6 +104,19 @@ pub fn save_known_tools(state: &Path, tools: &BTreeMap<String, Vec<String>>) {
     let _ = std::fs::write(state.join("tools.json"), serde_json::to_string(tools).unwrap_or_default());
 }
 
+/// {host: T3 threads} as last counted, for the card order.
+pub fn threads(state: &Path) -> BTreeMap<String, u64> {
+    std::fs::read_to_string(state.join("threads.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_threads(state: &Path, threads: &BTreeMap<String, u64>) {
+    let _ = std::fs::create_dir_all(state);
+    let _ = std::fs::write(state.join("threads.json"), serde_json::to_string(threads).unwrap_or_default());
+}
+
 /// This machine's short name, e.g. 'Ganz-Harbour'.
 pub fn local_name() -> String {
     #[cfg(unix)]

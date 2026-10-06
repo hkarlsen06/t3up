@@ -40,11 +40,15 @@ pub enum Effect {
     },
     UpdateDesktop,
     SaveTools(BTreeMap<String, Vec<String>>),
+    /// Remember each server's T3 threads, for the card order next time.
+    SaveThreads(BTreeMap<String, u64>),
     /// Run a sign-in or pairing on a server (`ssh -tt`), its output coming back as `Res::FlowOut`.
     StartFlow {
         id: u64,
         host: String,
         command: String,
+        /// This machine: run it here, no ssh.
+        local: bool,
     },
     /// Type into a running flow.
     FlowInput {
@@ -117,6 +121,8 @@ pub enum Hit {
     Install,
     /// A tool's tile on a card: (card, tool).
     Tool(usize, &'static str),
+    /// The stack of toasts: hovering spreads it out.
+    Toasts,
 }
 
 /// What a sign-in or pairing window's buttons do.
@@ -158,17 +164,16 @@ pub struct Menu {
     pub heading: Line<'static>,
     pub items: Vec<Item>,
     pub cursor: usize,
-    /// The servers a choice applies to; `all` if that is every server (updating T3 on all also updates the desktop app).
+    /// The servers a choice applies to.
     pub hosts: Vec<String>,
-    pub all: bool,
     /// A tool's own menu shows its logo beside the heading.
     pub logo: Option<&'static str>,
 }
 
 impl Menu {
-    fn new(heading: Line<'static>, items: Vec<Item>, hosts: Vec<String>, all: bool) -> Self {
+    fn new(heading: Line<'static>, items: Vec<Item>, hosts: Vec<String>) -> Self {
         let cursor = items.iter().position(|i| matches!(i, Item::Row { .. })).unwrap_or(0);
-        Menu { heading, items, cursor, hosts, all, logo: None }
+        Menu { heading, items, cursor, hosts, logo: None }
     }
 
     fn step(&mut self, by: isize) {
@@ -252,7 +257,6 @@ impl Servers {
 pub struct Confirm {
     pub names: Vec<String>,
     pub only: String,
-    pub desktop: bool,
     /// (host, agents live)
     pub busy: Vec<(String, u32)>,
     /// 0 = go ahead, 1 = Cancel.
@@ -342,8 +346,6 @@ pub struct App {
     pub target: String,
     pub desktop: String,
     pub desktop_updating: bool,
-    /// Tools found on any server: each card's slots, in order.
-    pub tools: Vec<&'static str>,
     pub show_output: bool,
     /// Output lines scrolled up from the bottom; 0 follows new lines.
     pub out_scroll: usize,
@@ -358,12 +360,18 @@ pub struct App {
     pub size: (u16, u16),
     pub started: Instant,
     pub local: String,
+    /// Whether this machine has a card of its own (`show_local`).
+    with_local: bool,
     quit_armed: Option<Instant>,
     logs: PathBuf,
     script: Arc<str>,
     known: BTreeMap<String, Vec<String>>,
+    /// T3 threads per host from its last check (threads.json across runs): the card order.
+    pub threads: BTreeMap<String, u64>,
     fx: Vec<Effect>,
     pub dirty: bool,
+    /// The last `tick`.
+    ticked: Instant,
     /// Where the last draw put clickable things, topmost last.
     pub hits: Vec<(Rect, Hit)>,
     pub modal_rect: Rect,
@@ -388,7 +396,6 @@ impl App {
             target: String::new(),
             desktop: String::new(),
             desktop_updating: false,
-            tools: vec!["T3"],
             show_output: false,
             out_scroll: 0,
             scroll: 0,
@@ -400,12 +407,15 @@ impl App {
             size: (100, 30),
             started: Instant::now(),
             local: config::local_name(),
+            with_local: false,
             quit_armed: None,
             logs,
             script: remote_script().into(),
             known,
+            threads: BTreeMap::new(),
             fx: vec![],
             dirty: true,
+            ticked: Instant::now(),
             hits: vec![],
             modal_rect: Rect::default(),
             hover: None,
@@ -470,6 +480,14 @@ impl App {
     pub fn tick(&mut self) {
         let before = self.toasts.len();
         let now = Instant::now();
+        // Toasts wait while you read them.
+        if self.hover.as_ref().is_some_and(|h| h.hit == Some(Hit::Toasts)) {
+            let paused = now.saturating_duration_since(self.ticked);
+            for t in &mut self.toasts {
+                t.until += paused;
+            }
+        }
+        self.ticked = now;
         self.toasts.retain(|t| t.until > now);
         self.motion.prune();
         self.dirty |= self.toasts.len() != before;
@@ -493,8 +511,24 @@ impl App {
 
     // ── servers ────────────────────────────────────────────────────────────
 
+    /// Give this machine a card of its own: its providers, and the desktop app as its T3.
+    pub fn show_local(&mut self) {
+        if self.local.is_empty() {
+            self.local = "this machine".into();
+        }
+        self.with_local = true;
+        let names = self.hosts.iter().filter(|h| !h.local).map(|h| h.name.clone()).collect();
+        self.set_hosts(names);
+        self.select(0);
+    }
+
     /// Show these servers, keeping the state of ones already shown; check the new ones.
-    pub fn set_hosts(&mut self, names: Vec<String>) {
+    /// This machine's card comes first (top left), unless it's a server in the list too.
+    pub fn set_hosts(&mut self, mut names: Vec<String>) {
+        let local = self.with_local && !names.contains(&self.local);
+        if local {
+            names.insert(0, self.local.clone());
+        }
         let keep = self.host().map(|h| h.name.clone());
         let mut old: HashMap<String, Host> = self.hosts.drain(..).map(|h| (h.name.clone(), h)).collect();
         let mut fresh = vec![];
@@ -512,6 +546,11 @@ impl App {
             });
             self.hosts.push(host);
         }
+        if local && let Some(h) = self.hosts.first_mut() {
+            h.local = true;
+        }
+        self.local_t3(None);
+        self.order();
         if self.canary.as_ref().is_some_and(|c| !names.contains(&c.host)) {
             self.canary = None;
             self.queued.clear();
@@ -522,20 +561,29 @@ impl App {
             );
         }
         self.queued.retain(|q| names.contains(q));
-        self.selected = keep.and_then(|k| names.iter().position(|n| *n == k)).unwrap_or(0);
-        self.fit();
+        self.selected = keep.and_then(|k| self.hosts.iter().position(|h| h.name == k)).unwrap_or(0);
         self.ensure_visible();
         self.start(fresh, Mode::Check, "all");
     }
 
-    /// A slot per tool any server has, in order.
-    fn fit(&mut self) {
-        let tools: Vec<&'static str> = COMPONENTS
-            .iter()
-            .map(|(n, _)| *n)
-            .filter(|n| self.hosts.iter().any(|h| h.installed.contains(*n)))
-            .collect();
-        self.tools = if tools.is_empty() { vec!["T3"] } else { tools };
+    /// Cards in order: this machine, then the servers with the most T3 threads (not yet counted last),
+    /// ties by name. Callers keep the selection.
+    fn order(&mut self) {
+        let threads = &self.threads;
+        self.hosts.sort_by_cached_key(|h| (!h.local, std::cmp::Reverse(threads.get(&h.name).copied()), h.name.clone()));
+    }
+
+    /// Order the cards again, the selection staying on its server.
+    pub fn reorder(&mut self) {
+        let keep = self.host().map(|h| h.name.clone());
+        self.order();
+        self.selected = keep.and_then(|k| self.hosts.iter().position(|h| h.name == k)).unwrap_or(0);
+        self.ensure_visible();
+    }
+
+    /// The rollout's canary among `names`: the least used server (fewest T3 threads) goes first.
+    fn canary_of(&self, names: &[String]) -> usize {
+        (0..names.len()).min_by_key(|&k| (self.threads.get(&names[k]).copied().unwrap_or(0), k)).unwrap_or(0)
     }
 
     pub fn ensure_visible(&mut self) {
@@ -571,6 +619,7 @@ impl App {
                 continue;
             }
             h.reset(mode, only);
+            let local = h.local;
             self.fx.push(Effect::StartJob(Job {
                 host: name,
                 mode,
@@ -578,6 +627,7 @@ impl App {
                 only: only.to_string(),
                 logs: self.logs.clone(),
                 script: self.script.clone(),
+                local,
             }));
         }
         self.out_scroll = 0;
@@ -585,7 +635,7 @@ impl App {
     }
 
     /// Update `names` (by name). If it would restart T3 on a server with agents running, ask first.
-    pub fn begin_update(&mut self, names: Vec<String>, only: &str, desktop: bool) {
+    pub fn begin_update(&mut self, names: Vec<String>, only: &str) {
         let touches_t3 = only.split(',').any(|o| o == "all" || o == "t3");
         let busy: Vec<(String, u32)> = self
             .hosts
@@ -595,28 +645,38 @@ impl App {
             .collect();
         if touches_t3 && !busy.is_empty() {
             let only = only.into();
-            self.open_modal(Modal::Confirm(Confirm { names, only, desktop, busy, cursor: 1, remove: false }));
+            self.open_modal(Modal::Confirm(Confirm { names, only, busy, cursor: 1, remove: false }));
             return;
         }
-        self.run_update(names, only, desktop);
+        self.run_update(names, only);
     }
 
-    fn run_update(&mut self, mut names: Vec<String>, only: &str, desktop: bool) {
-        if names.len() > 1 && self.is_running(&names[0]) {
+    fn run_update(&mut self, mut names: Vec<String>, only: &str) {
+        // This machine isn't part of a rollout: it starts now, and its T3 is the desktop app's update.
+        if let Some(i) = names.iter().position(|n| self.hosts.iter().any(|h| h.local && h.name == *n)) {
+            let local = names.remove(i);
+            if only == "t3" || only.split(',').any(|o| o == "all" || o == "t3") && !self.outdated_desktop().is_empty() {
+                self.update_desktop();
+            }
+            if only != "t3" {
+                self.start(vec![local], Mode::Update, only);
+            }
+            if names.is_empty() {
+                return;
+            }
+        }
+        let at = self.canary_of(&names);
+        if names.len() > 1 && self.is_running(&names[at]) {
             self.toast(
                 Sev::Warning,
                 "Warning",
-                format!("Already running: {}. Wait before starting a rollout.", names[0]),
+                format!("Already running: {}. Wait before starting a rollout.", names[at]),
             );
             return;
         }
-        if desktop && !self.desktop_updating && !self.outdated_desktop().is_empty() {
-            self.desktop_updating = true;
-            self.fx.push(Effect::UpdateDesktop);
-        }
         if names.len() > 1 {
-            // Canary: the first server alone; the rest start when it comes back healthy.
-            let first = names.remove(0);
+            // Canary: one server alone; the rest start when it comes back healthy.
+            let first = names.remove(at);
             self.start(vec![first.clone()], Mode::Update, only);
             if let Some(h) = self.hosts.iter().find(|h| h.name == first && h.running() && h.mode == Mode::Update) {
                 self.canary =
@@ -628,8 +688,28 @@ impl App {
         }
     }
 
+    fn is_local(&self, name: &str) -> bool {
+        self.hosts.iter().any(|h| h.local && h.name == name)
+    }
+
     fn is_running(&self, name: &str) -> bool {
         self.hosts.iter().any(|h| h.name == name && h.running())
+    }
+
+    /// This machine's T3 tile shows the desktop app; `from` is the version an update just replaced.
+    fn local_t3(&mut self, from: Option<String>) {
+        let Some(h) = self.hosts.iter_mut().find(|h| h.local) else { return };
+        if self.desktop.is_empty() {
+            h.installed.remove("T3");
+            h.steps.remove("T3");
+            h.current.remove("T3");
+        } else if h.current.get("T3") != Some(&self.desktop) {
+            let old = from.filter(|old| !old.is_empty() && *old != self.desktop);
+            h.apply(Event::Done(match old {
+                Some(old) => format!("T3: {old} -> {}", self.desktop),
+                None => format!("T3: {}", self.desktop),
+            }));
+        }
     }
 
     /// A newer T3 than this machine's desktop app: its version, or ''.
@@ -657,7 +737,6 @@ impl App {
     }
 
     fn finished(&mut self, i: usize) {
-        self.fit();
         let h = self.hosts[i].clone();
         let installed: Vec<String> = h.installed.iter().cloned().collect();
         if self.known.get(&h.name) != Some(&installed) {
@@ -686,7 +765,18 @@ impl App {
             self.toast(Sev::Info, "Removed", format!("{} from {}", what.join(", "), h.name));
         }
         if !failed && h.mode == Mode::Update {
-            self.toast(Sev::Info, "Done", format!("{} updated in {:.0}s", h.name, h.elapsed.as_secs_f64()));
+            // What it was asked to update and is still behind on: its updater had nothing newer for it.
+            let behind: Vec<String> = updates(&h, &self.latest, &self.target)
+                .into_iter()
+                .filter(|(n, _)| h.picked(n) && !(h.local && n == "T3")) // this machine's T3 is the desktop's update
+                .map(|(n, _)| format!("{n} {}", short(&h.current[&n])))
+                .collect();
+            if behind.is_empty() {
+                self.toast(Sev::Info, "Done", format!("{} updated in {:.0}s", h.name, h.elapsed.as_secs_f64()));
+            } else {
+                let text = format!("{}: {} stayed. Its updater has nothing newer yet.", h.name, behind.join(", "));
+                self.toast(Sev::Warning, "Not updated", text);
+            }
         }
         if !h.rollback.is_empty() {
             self.toast(Sev::Warning, "Rolled back", format!("{}: T3 {}", h.name, h.rollback));
@@ -696,6 +786,15 @@ impl App {
             for name in h.auth.iter().filter(|n| h.picked(n) && login_command(n).is_some()) {
                 self.start_flow(&h.name, name);
             }
+        }
+        // A new thread count moves the card, only now that its run is over.
+        let threads = h.sys.split(" · ").find_map(|p| p.strip_prefix("threads ")?.parse().ok());
+        if let Some(n) = threads
+            && self.threads.get(&h.name) != Some(&n)
+        {
+            self.threads.insert(h.name.clone(), n);
+            self.fx.push(Effect::SaveThreads(self.threads.clone()));
+            self.reorder();
         }
     }
 
@@ -708,14 +807,19 @@ impl App {
                     self.latest = latest;
                 }
             }
-            Res::Desktop(version) => self.desktop = version,
+            Res::Desktop(version) => {
+                self.desktop = version;
+                self.local_t3(None);
+            }
             Res::DesktopSay(text) => self.toast(Sev::Info, "Desktop", text),
             Res::DesktopDone(result) => {
                 self.desktop_updating = false;
                 self.fx.push(Effect::RefreshDesktop);
                 match result {
                     Ok(version) => {
-                        self.toast(Sev::Info, "Desktop up to date", format!("T3 Code desktop {}", short(&version)))
+                        self.toast(Sev::Info, "Desktop up to date", format!("T3 Code desktop {}", short(&version)));
+                        let old = std::mem::replace(&mut self.desktop, version);
+                        self.local_t3(Some(old));
                     }
                     Err(e) => {
                         let text = if e.is_empty() { "Unknown error".to_string() } else { e };
@@ -796,6 +900,11 @@ impl App {
             (Some(cur), None) => format!("{} · up to date", short(cur)),
             (None, _) => "→ latest".into(),
         };
+        let (label, detail) = if h.local && name == "T3" {
+            ("T3 Code desktop", format!("{detail} · quits and reopens it"))
+        } else {
+            (label, detail)
+        };
         items.push(row(Choice::Update(name.to_lowercase()), "↑", format!("Update {label}"), detail));
         if new.is_some() && changelog::has_changelog(name) {
             items.push(row(
@@ -805,7 +914,7 @@ impl App {
                 "release notes for the update".into(),
             ));
         }
-        if name == "T3" {
+        if name == "T3" && !h.local {
             let pair = "connect a device, via Tailscale".to_string();
             items.push(row(Choice::Pair, "⌁", "Create pairing link".into(), pair));
         } else if !signed_out && login_command(name).is_some() {
@@ -830,7 +939,7 @@ impl App {
             Span::styled(label.to_string(), bold(TEXT)),
             Span::styled(format!("   {} · {version}", h.name), fg(MUTED)),
         ]);
-        let mut menu = Menu::new(heading, items, vec![h.name.clone()], false);
+        let mut menu = Menu::new(heading, items, vec![h.name.clone()]);
         menu.logo = Some(name);
         self.open_modal(Modal::Menu(menu));
     }
@@ -840,7 +949,7 @@ impl App {
         let Some(h) = self.hosts.iter().find(|h| h.name == host) else { return };
         let busy = h.busy.filter(|&n| n > 0).map(|n| vec![(h.name.clone(), n)]).unwrap_or_default();
         let only = tool.to_lowercase();
-        let confirm = Confirm { names: vec![host.into()], only, desktop: false, busy, cursor: 1, remove: true };
+        let confirm = Confirm { names: vec![host.into()], only, busy, cursor: 1, remove: true };
         self.open_modal(Modal::Confirm(confirm));
     }
 
@@ -849,7 +958,7 @@ impl App {
         if c.remove {
             self.start(c.names, Mode::Remove, &c.only);
         } else {
-            self.run_update(c.names, &c.only, c.desktop);
+            self.run_update(c.names, &c.only);
         }
     }
 
@@ -883,7 +992,7 @@ impl App {
             return Some(Modal::Installer(inst));
         }
         let only: Vec<String> = picked.iter().map(|n| n.to_lowercase()).collect();
-        self.begin_update(inst.names, &only.join(","), false);
+        self.begin_update(inst.names, &only.join(","));
         None
     }
 
@@ -899,7 +1008,8 @@ impl App {
         }
         self.next_flow += 1;
         let f = Flow::new(self.next_flow, host, tool);
-        self.fx.push(Effect::StartFlow { id: f.id, host: host.into(), command: f.command() });
+        let local = self.is_local(host);
+        self.fx.push(Effect::StartFlow { id: f.id, host: host.into(), command: f.command(), local });
         self.open_modal(Modal::Flow(f));
     }
 
@@ -960,10 +1070,12 @@ impl App {
                 }
                 if let Some(login) = login_command(&f.tool) {
                     let banner = format!("{}. You come back here when it finishes.", f.title());
-                    self.fx.push(Effect::Terminal {
-                        command: vec![job::ssh_program(), "-t".into(), f.host.clone(), login],
-                        banner,
-                    });
+                    let command = if self.is_local(&f.host) {
+                        vec!["sh".into(), "-c".into(), login]
+                    } else {
+                        vec![job::ssh_program(), "-t".into(), f.host.clone(), login]
+                    };
+                    self.fx.push(Effect::Terminal { command, banner });
                 }
                 return None;
             }
@@ -986,14 +1098,26 @@ impl App {
         self.dirty = true;
     }
 
-    /// Spatial move: up/down jump a whole row, clamped to the first and last card.
+    /// Spatial move: left and right go through the cards in order; up and down to the nearest card in
+    /// the row above or below, else the first or last card.
     fn go(&mut self, dx: isize, dy: isize) {
         if self.hosts.is_empty() {
             return;
         }
-        let cols = view::geometry(self).cols as isize;
-        let next = (self.selected as isize + dx + dy * cols).clamp(0, self.hosts.len() as isize - 1);
-        self.select(next as usize);
+        let last = self.hosts.len() - 1;
+        let g = view::geometry(self);
+        let next = if dy == 0 {
+            (self.selected as isize + dx).clamp(0, last as isize) as usize
+        } else {
+            let at = g.cards[self.selected];
+            let row = at.y as i32 + dy as i32 * (g.card_h as i32 + 1);
+            let middle = |c: &Rect| c.x as i32 * 2 + c.width as i32;
+            (0..=last)
+                .filter(|&i| g.cards[i].y as i32 == row)
+                .min_by_key(|&i| (middle(&g.cards[i]) - middle(&at)).abs())
+                .unwrap_or(if dy > 0 { last } else { 0 })
+        };
+        self.select(next);
     }
 
     pub fn refresh(&mut self) {
@@ -1017,9 +1141,9 @@ impl App {
         }
     }
 
-    fn update_menu(&mut self, names: Vec<String>, heading: Line<'static>, inspect: Vec<Item>, all: bool) {
+    fn update_menu(&mut self, names: Vec<String>, heading: Line<'static>, inspect: Vec<Item>) {
         let hosts: Vec<&Host> = self.hosts.iter().filter(|h| names.contains(&h.name)).collect();
-        let desktop = all && !self.outdated_desktop().is_empty();
+        let desktop = hosts.iter().any(|h| h.local) && !self.outdated_desktop().is_empty();
         let row = |choice, label: &str, detail: String| Item::Row { choice, icon: "↑", label: label.into(), detail };
         let t3 = if hosts.iter().any(|h| no_t3(h)) { "installs T3, updates" } else { "T3," };
         let everything = format!("{t3} every installed provider{}", if desktop { ", desktop app" } else { "" });
@@ -1040,15 +1164,11 @@ impl App {
                 detail: "pick what to install".into(),
             });
         }
-        if desktop {
-            let detail = format!("this machine · → {}", compact(&self.outdated_desktop(), &self.desktop));
-            items.push(Item::Row { choice: Choice::Desktop, icon: "↑", label: "Desktop app".into(), detail });
-        }
         if !inspect.is_empty() {
             items.push(Item::Section("Inspect".into()));
             items.extend(inspect);
         }
-        self.open_modal(Modal::Menu(Menu::new(heading, items, names, all)));
+        self.open_modal(Modal::Menu(Menu::new(heading, items, names)));
     }
 
     /// Enter: everything you can do with the selected server.
@@ -1076,25 +1196,30 @@ impl App {
             let label = format!("Sign in to {tool}");
             inspect.push(row(Choice::SignIn(tool.clone()), "→", &label, "not signed in"));
         }
-        inspect.push(row(Choice::Pair, "⌁", "Create pairing link", "connect a device, via Tailscale"));
-        inspect.push(row(Choice::Terminal, "›", "Terminal", "ssh in · type exit to return"));
-        self.update_menu(vec![h.name.clone()], heading, inspect, false);
+        if h.local {
+            inspect.push(row(Choice::Terminal, "›", "Terminal", "a shell here · type exit to return"));
+        } else {
+            inspect.push(row(Choice::Pair, "⌁", "Create pairing link", "connect a device, via Tailscale"));
+            inspect.push(row(Choice::Terminal, "›", "Terminal", "ssh in · type exit to return"));
+        }
+        self.update_menu(vec![h.name.clone()], heading, inspect);
     }
 
     pub fn open_update(&mut self) {
         let Some(h) = self.host() else { return };
         let heading = Line::styled(h.name.clone(), bold(TEXT));
-        self.update_menu(vec![h.name.clone()], heading, vec![], false);
+        self.update_menu(vec![h.name.clone()], heading, vec![]);
     }
 
     pub fn open_update_all(&mut self) {
         if self.hosts.is_empty() {
             return;
         }
-        let first = &self.hosts[0].name;
+        // The canary (this machine isn't in the rollout).
+        let servers: Vec<String> = self.hosts.iter().filter(|h| !h.local).map(|h| h.name.clone()).collect();
         let mut note = format!("   {}", self.hosts.len());
-        if self.hosts.len() > 1 {
-            note += &format!(" · {first} first");
+        if servers.len() > 1 {
+            note += &format!(" · {} first", servers[self.canary_of(&servers)]);
         }
         let heading = Line::from(vec![Span::styled("All servers", bold(TEXT)), Span::styled(note, fg(MUTED))]);
         let inspect = vec![Item::Row {
@@ -1103,7 +1228,7 @@ impl App {
             label: "Check again".into(),
             detail: "versions and health, changes nothing".into(),
         }];
-        self.update_menu(self.names(), heading, inspect, true);
+        self.update_menu(self.names(), heading, inspect);
     }
 
     pub fn open_desktop(&mut self) {
@@ -1125,7 +1250,7 @@ impl App {
                 detail: "newest release, then reopens".into(),
             },
         ];
-        self.open_modal(Modal::Menu(Menu::new(heading, items, vec![], false)));
+        self.open_modal(Modal::Menu(Menu::new(heading, items, vec![])));
     }
 
     fn update_desktop(&mut self) {
@@ -1164,8 +1289,13 @@ impl App {
     pub fn open_ssh(&mut self, name: &str) {
         if let Some(i) = self.hosts.iter().position(|h| h.name == name) {
             self.select(i);
-            self.fx
-                .push(Effect::Terminal { command: vec![job::ssh_program(), name.to_string()], banner: String::new() });
+            // This machine: a shell right here.
+            let command = if self.is_local(name) {
+                vec![std::env::var("SHELL").unwrap_or_else(|_| "sh".into())]
+            } else {
+                vec![job::ssh_program(), name.to_string()]
+            };
+            self.fx.push(Effect::Terminal { command, banner: String::new() });
         }
     }
 
@@ -1240,10 +1370,7 @@ impl App {
     fn run(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Refresh => self.refresh(),
-            Cmd::Update(only) => {
-                let all = only == "all";
-                self.begin_update(self.names(), &only, all);
-            }
+            Cmd::Update(only) => self.begin_update(self.names(), &only),
             Cmd::Version => self.open_version(),
             Cmd::Servers => self.open_servers(),
             Cmd::Desktop => self.open_desktop(),
@@ -1273,10 +1400,7 @@ impl App {
     fn choose(&mut self, menu: &Menu, choice: Choice) {
         let hosts = menu.hosts.clone();
         match choice {
-            Choice::Update(only) => {
-                let desktop = menu.all && only == "all";
-                self.begin_update(hosts, &only, desktop);
-            }
+            Choice::Update(only) => self.begin_update(hosts, &only),
             Choice::Check => self.start(hosts, Mode::Check, "all"),
             Choice::Logs => self.toggle_output(),
             Choice::Terminal => {
@@ -1664,7 +1788,11 @@ impl App {
                 let header = self.modal.is_none() && m.row < 3;
                 let same = self.hover.as_ref().is_some_and(|h| h.hit == hit && h.header == header);
                 if !same {
-                    self.dirty |= self.hover.as_ref().is_some_and(|h| h.shown);
+                    let was = self.hover.as_ref().and_then(|h| h.hit);
+                    // Toasts spread out (and close up) as the pointer comes and goes.
+                    self.dirty |= self.hover.as_ref().is_some_and(|h| h.shown)
+                        || was == Some(Hit::Toasts)
+                        || hit == Some(Hit::Toasts);
                     let pos = (m.column, m.row);
                     let shown = false;
                     self.hover =
@@ -1973,7 +2101,7 @@ mod tests {
         let id = fx
             .iter()
             .find_map(|e| match e {
-                Effect::StartFlow { id, host, command } if host == "box" => {
+                Effect::StartFlow { id, host, command, .. } if host == "box" => {
                     assert!(command.ends_with("codex login --device-auth"), "{command}");
                     Some(*id)
                 }
@@ -2168,7 +2296,7 @@ mod tests {
         let mut a = app(&["a", "b"]);
         done(&mut a, "b", true);
         a.take_effects();
-        a.begin_update(a.names(), "t3", false);
+        a.begin_update(a.names(), "t3");
         assert!(a.canary.is_none() && a.queued.is_empty());
         assert_eq!(a.toasts.last().unwrap().sev, Sev::Warning);
         done(&mut a, "a", true);
@@ -2179,7 +2307,7 @@ mod tests {
     fn removing_canary_cancels_the_rollout() {
         let mut a = app(&["a", "b"]);
         settle(&mut a);
-        a.begin_update(a.names(), "t3", false);
+        a.begin_update(a.names(), "t3");
         a.take_effects();
         a.set_hosts(vec!["b".into()]);
         done(&mut a, "a", false); // removed hosts' events are ignored
@@ -2194,7 +2322,7 @@ mod tests {
     fn another_job_cannot_release_the_canary_queue() {
         let mut a = app(&["a", "b"]);
         settle(&mut a);
-        a.begin_update(a.names(), "t3", false);
+        a.begin_update(a.names(), "t3");
         a.take_effects();
         a.hosts[0].reset(Mode::Update, "t3");
         done(&mut a, "a", true);
@@ -2207,7 +2335,7 @@ mod tests {
         let mut a = app(&["a", "b"]);
         settle(&mut a);
         a.target = "0.0.45".into();
-        a.begin_update(a.names(), "t3,codex", false);
+        a.begin_update(a.names(), "t3,codex");
         let launched = a.take_effects();
         assert!(launched.iter().any(|e| matches!(e, Effect::StartJob(j) if j.version == "0.0.45")));
         press(&mut a, "v");
@@ -2231,7 +2359,7 @@ mod tests {
     fn failed_canary_cancels_the_queue() {
         let mut a = app(&["a", "b"]);
         settle(&mut a);
-        a.begin_update(a.names(), "all", true);
+        a.begin_update(a.names(), "all");
         assert_eq!(jobs(a.take_effects()).len(), 1);
         a.on_job("a", Event::Output { tag: String::new(), text: "disk full".into() });
         done(&mut a, "a", false);
@@ -2275,21 +2403,21 @@ mod tests {
         settle(&mut a);
         a.hosts[1].busy = Some(2);
         // Not touching T3: no question.
-        a.begin_update(a.names(), "codex", false);
+        a.begin_update(a.names(), "codex");
         assert!(a.modal.is_none());
         settle(&mut a);
-        a.begin_update(vec!["b".into()], "all", false);
+        a.begin_update(vec!["b".into()], "all");
         let Some(Modal::Confirm(c)) = &a.modal else { panic!("no confirm") };
         assert_eq!(c.busy, vec![("b".to_string(), 2)]);
         assert!(jobs(a.take_effects()).is_empty());
         code(&mut a, KeyCode::Enter); // Cancel is the default
         assert!(a.modal.is_none() && jobs(a.take_effects()).is_empty());
-        a.begin_update(vec!["b".into()], "t3,codex", false);
+        a.begin_update(vec!["b".into()], "t3,codex");
         code(&mut a, KeyCode::Left);
         code(&mut a, KeyCode::Enter);
         assert_eq!(jobs(a.take_effects()), vec![("b".into(), Mode::Update, "t3,codex".into())]);
         settle(&mut a);
-        a.begin_update(vec!["b".into()], "all", false);
+        a.begin_update(vec!["b".into()], "all");
         press(&mut a, "y");
         assert_eq!(jobs(a.take_effects()).len(), 1);
     }
@@ -2354,7 +2482,8 @@ mod tests {
     #[test]
     fn grid_navigation_on_two_columns_and_two_rows() {
         let mut a = app(&["first", "second", "third"]);
-        assert_eq!(crate::tui::view::geometry(&a).cols, 2);
+        a.on_resize(140, 30); // two cards of six tools side by side
+        assert_eq!(crate::tui::view::geometry(&a).cols(), 2);
         assert_eq!(a.selected, 0);
         code(&mut a, KeyCode::Down);
         assert_eq!(a.selected, 2);
@@ -2370,7 +2499,7 @@ mod tests {
         press(&mut a, "jj");
         assert_eq!(a.selected, 2);
         a.on_resize(60, 24);
-        assert_eq!(crate::tui::view::geometry(&a).cols, 1);
+        assert_eq!(crate::tui::view::geometry(&a).cols(), 1);
         code(&mut a, KeyCode::Up);
         assert_eq!(a.selected, 1);
     }
@@ -2421,24 +2550,32 @@ mod tests {
     }
 
     #[test]
-    fn narrow_header_keeps_the_outdated_desktop() {
-        let mut a = app(&["box"]);
-        a.desktop = "0.0.46-nightly.20261003.2623".into();
-        a.hosts[0].current.insert("T3".into(), "0.0.46-nightly.20261003.2632".into());
-        a.local = "Ganz-Harbour".into();
-        let (left, _) = crate::tui::view::header_text(&a, 47);
-        assert!(left.to_string().contains("update desktop → #2632"), "{left}");
-        let (left, _) = crate::tui::view::header_text(&a, 200);
+    fn this_machine_has_its_own_card_top_left() {
+        let mut a = app(&["a", "b", "c"]);
+        a.local = "mac".into();
+        a.show_local();
+        let fx = a.take_effects();
         assert!(
-            left.to_string().contains("On Ganz-Harbour") && left.to_string().contains("→ #2632 · d to update"),
-            "{left}"
+            matches!(&fx[..], [.., Effect::StartJob(j)] if j.host == "mac" && j.local && j.mode == Mode::Check),
+            "{fx:?}"
         );
-        // Even when the counts take the room.
-        a.hosts[0].status = Status::Failed;
-        let (left, right) = crate::tui::view::header_text(&a, 33);
-        assert!(left.to_string().contains("update desktop → #2632") && right.width() == 0, "{left} | {right}");
-        a.desktop_updating = true;
-        assert!(crate::tui::view::header_text(&a, 200).0.to_string().contains("updating desktop…"));
+        assert_eq!(a.hosts.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["mac", "a", "b", "c"]);
+        assert_eq!(a.host().unwrap().name, "mac");
+        // Its T3 is the desktop app; none, and it has no T3 tile.
+        a.on_result(Res::Desktop("0.0.46-nightly.20261003.2623".into()));
+        assert_eq!(a.hosts[0].current["T3"], "0.0.46-nightly.20261003.2623");
+        a.on_result(Res::Desktop(String::new()));
+        assert!(!a.hosts[0].installed.contains("T3"));
+        // A shell here, not ssh.
+        press(&mut a, "s");
+        assert!(
+            a.take_effects()
+                .iter()
+                .any(|e| matches!(e, Effect::Terminal { command, .. } if command[0] != job::ssh_program()))
+        );
+        // The rollout's canary is still the first server.
+        press(&mut a, "a");
+        assert!(menu(&a).heading.to_string().ends_with("a first"), "{}", menu(&a).heading);
     }
 
     #[test]
@@ -2446,7 +2583,7 @@ mod tests {
         let known =
             BTreeMap::from([("second".to_string(), vec!["Codex".to_string(), "T3".to_string(), "Nope".to_string()])]);
         let a = App::new(vec!["second".into()], "/tmp/t3up-test/logs".into(), known);
-        assert_eq!(a.tools, vec!["T3", "Codex"]);
+        assert_eq!(a.hosts[0].installed, ["Codex", "T3"].map(String::from).into());
     }
 
     #[test]
@@ -2461,7 +2598,6 @@ mod tests {
             _ => None,
         });
         assert_eq!(saved.unwrap()["second"], vec!["Codex", "T3"]);
-        assert_eq!(a.tools, vec!["T3", "Codex"]);
         assert_eq!(a.toasts.len(), 0, "a healthy check says nothing");
     }
 
@@ -2479,6 +2615,16 @@ mod tests {
         a.start(vec!["a".into()], Mode::Update, "codex");
         done(&mut a, "a", true);
         assert!(a.toasts.last().unwrap().text.starts_with("a updated in "));
+        // An update its updater couldn't make (nothing newer on its channel yet) doesn't say it updated.
+        a.latest.insert("Claude".into(), "2.1.292".into());
+        a.start(vec!["a".into()], Mode::Update, "claude");
+        a.on_job("a", Event::Done("Claude: 2.1.291 (Claude Code) -> 2.1.291 (Claude Code)".into()));
+        done(&mut a, "a", true);
+        let t = a.toasts.last().unwrap();
+        assert_eq!(
+            (t.sev, t.text.as_str()),
+            (Sev::Warning, "a: Claude 2.1.291 stayed. Its updater has nothing newer yet.")
+        );
         // Events of a server that was removed mid-run are ignored.
         a.on_job("gone", Event::Complete);
     }
@@ -2540,11 +2686,41 @@ mod tests {
         a.hosts[1].sys = "kept".into();
         a.selected = 1;
         a.set_hosts(vec!["second".into(), "fourth".into()]);
-        assert_eq!(a.names(), ["second", "fourth"]);
-        assert_eq!(a.hosts[0].sys, "kept");
-        assert_eq!(a.hosts[0].status, Status::Ok);
-        assert_eq!(a.selected, 0, "still on `second`");
+        assert_eq!(a.names(), ["fourth", "second"], "none counted yet: by name");
+        assert_eq!(a.hosts[1].sys, "kept");
+        assert_eq!(a.hosts[1].status, Status::Ok);
+        assert_eq!(a.selected, 1, "still on `second`");
         assert_eq!(jobs(a.take_effects()), vec![("fourth".into(), Mode::Check, "all".into())]);
+    }
+
+    #[test]
+    fn busiest_servers_first_and_the_least_used_is_the_canary() {
+        let mut a = app(&["a", "b", "c"]);
+        a.local = "mac".into();
+        a.show_local();
+        a.select(2); // b
+        for (host, n) in [("a", 3), ("b", 40), ("c", 7), ("mac", 900)] {
+            a.on_job(host, Event::Sys(format!("load 0.1 · up 1d · threads {n}")));
+            a.on_job(host, Event::Complete);
+            a.on_job(host, Event::Exit { code: Some(0), error: None });
+        }
+        assert_eq!(a.names(), ["mac", "b", "c", "a"], "this machine first, whatever its count");
+        assert_eq!(a.host().unwrap().name, "b", "the selection follows its server");
+        let mut saved = a.take_effects().into_iter().rev().filter_map(|e| match e {
+            Effect::SaveThreads(t) => Some(t),
+            _ => None,
+        });
+        assert_eq!(saved.next().unwrap()["b"], 40); // the last save, after every count
+        // A check that finds nothing new leaves the order alone.
+        a.on_job("a", Event::Exit { code: Some(0), error: None });
+        assert!(a.take_effects().iter().all(|e| !matches!(e, Effect::SaveThreads(_))));
+        // The rollout tries the least used server first.
+        press(&mut a, "a");
+        assert!(menu(&a).heading.to_string().ends_with("· a first"), "{}", menu(&a).heading);
+        code(&mut a, KeyCode::Down); // T3
+        code(&mut a, KeyCode::Enter);
+        assert_eq!(jobs(a.take_effects()), vec![("a".into(), Mode::Update, "t3".into())]);
+        assert_eq!(a.queued, HashSet::from(["b".to_string(), "c".to_string()]));
     }
 
     #[test]
@@ -2610,11 +2786,13 @@ mod tests {
     }
 
     #[test]
-    fn updating_everything_on_all_servers_also_updates_an_outdated_desktop() {
+    fn updating_everything_updates_this_machine_and_its_desktop_outside_the_rollout() {
         let mut a = app(&["a", "b"]);
+        a.local = "mac".into();
+        a.show_local();
         settle(&mut a);
-        a.desktop = "0.0.46-nightly.20261003.2623".into();
-        a.hosts[0].current.insert("T3".into(), "0.0.46-nightly.20261003.2632".into());
+        a.on_result(Res::Desktop("0.0.46-nightly.20261003.2623".into()));
+        a.latest.insert("T3".into(), "0.0.46-nightly.20261003.2632".into());
         press(&mut a, "a");
         assert!(
             menu(&a).items.iter().any(
@@ -2625,6 +2803,18 @@ mod tests {
         let fx = a.take_effects();
         assert!(fx.iter().any(|e| matches!(e, Effect::UpdateDesktop)));
         assert!(a.desktop_updating);
+        // This machine's providers start now, beside the canary; it's never queued behind it.
+        let started: Vec<String> = jobs(fx).into_iter().map(|j| j.0).collect();
+        assert_eq!(started, ["mac", "a"]);
+        assert_eq!(a.queued, HashSet::from(["b".to_string()]));
+        // The desktop's update shows on its tile.
+        a.on_result(Res::DesktopDone(Ok("0.0.46-nightly.20261003.2632".into())));
+        assert!(a.hosts[0].steps["T3"].1.contains(" → "), "{:?}", a.hosts[0].steps["T3"]);
+        // Its T3 alone is the desktop app's update only.
+        settle(&mut a);
+        a.begin_update(vec!["mac".into()], "t3");
+        let fx = a.take_effects();
+        assert!(fx.iter().any(|e| matches!(e, Effect::UpdateDesktop)) && jobs(fx).is_empty());
     }
 
     #[test]

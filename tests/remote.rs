@@ -84,6 +84,10 @@ fn reset(home: &Path) {
     fs::write(home.join("grok-auth"), "").unwrap();
 }
 async fn remote(home: &Path, mode: Mode, only: &str) -> (Host, Vec<Event>) {
+    run(home, mode, only, false).await
+}
+/// `local`: as on t3up's own machine, without ssh.
+async fn run(home: &Path, mode: Mode, only: &str, local: bool) -> (Host, Vec<Event>) {
     let script = model::remote_script().replace(":/usr/local/bin:/opt/homebrew/bin:", ":");
     assert!(!script.contains("/usr/local/bin") && !script.contains("/opt/homebrew/bin"));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -95,6 +99,7 @@ async fn remote(home: &Path, mode: Mode, only: &str) -> (Host, Vec<Event>) {
             only: only.into(),
             logs: home.join("logs"),
             script: Arc::from(script),
+            local,
         },
         tx,
     )
@@ -253,7 +258,40 @@ exec /bin/sleep "$@""#,
     assert_eq!(h.steps["OpenCode"], (StepState::Skip, "not installed".into()));
     assert_eq!(h.steps["Pi"], h.steps["OpenCode"]);
     assert_eq!(h.busy, Some(0));
-    assert!(events.iter().any(|e| matches!(e, Event::Sys(s) if s.contains("disk ") && s.contains("cpus "))));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::Sys(s) if s.contains("disk ") && s.contains("cpus ") && s.contains("up ")))
+    );
+
+    // T3's threads, not counting deleted ones, from its database (sqlite3 here; Python where that's missing).
+    assert!(!home.join(".t3").exists());
+    let db = home.join(".t3/userdata/statev2.sqlite");
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let made = std::process::Command::new("sqlite3")
+        .arg(&db)
+        .arg("create table orchestration_v2_projection_threads (thread_id text, deleted_at text); insert into orchestration_v2_projection_threads values ('a', null), ('b', null), ('c', '2026-10-01');")
+        .status()
+        .is_ok_and(|s| s.success());
+    if made {
+        reset(&home);
+        let (_, events) = remote(&home, Mode::Check, "all").await;
+        assert!(events.iter().any(|e| matches!(e, Event::Sys(s) if s.ends_with(" · threads 2"))), "{events:?}");
+    }
+    fs::remove_dir_all(home.join(".t3")).unwrap();
+
+    // On t3up's own machine T3 is the desktop app: the script leaves it (and its health) alone.
+    reset(&home);
+    // No ssh in between: the script inherits this PATH, so keep this Mac's real tools off it.
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    unsafe { std::env::set_var("PATH", "/usr/bin:/bin") };
+    let (h, events) = run(&home, Mode::Update, "all", true).await;
+    unsafe { std::env::set_var("PATH", path) };
+    ok(&h);
+    assert_eq!([value(&h, "Codex"), value(&h, "Claude")], ["0.1.0 → 0.2.0", "1.0.0 → 2.0.0"]);
+    assert!(!h.steps.contains_key("T3") && !h.steps.contains_key("Health"), "{:?}", h.steps);
+    assert!(!fs::read_to_string(home.join("t3-calls")).is_ok_and(|c| !c.is_empty()), "T3 untouched");
+    assert!(!events.iter().any(|e| matches!(e, Event::Busy(_))));
 
     reset(&home);
     let started = Instant::now();
@@ -575,6 +613,7 @@ esac"#,
             only: "all".into(),
             logs: home.join("t3"),
             script: Arc::from(""),
+            local: false,
         },
         tx,
     )
@@ -597,6 +636,7 @@ esac"#,
             only: "all".into(),
             logs: home.join("logs"),
             script: Arc::from("exit 0\n"),
+            local: false,
         },
         tx,
     ));

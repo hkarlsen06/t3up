@@ -195,19 +195,36 @@ busy() {
     }' || printf '0\n'
 }
 system_info() {
-  info=""
+  info="" sysctl=$(command -v sysctl || echo /usr/sbin/sysctl)  # macOS: not on a non-login PATH
   if [ -r /proc/loadavg ]; then read -r load rest < /proc/loadavg
-  else load=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}') || load=""; fi
+  else load=$($sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}') || load=""; fi
   [ -z "$load" ] || info="load $load"
   cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || cpus=""
   [ -z "$cpus" ] || info="${info}${info:+ · }cpus $cpus"
   disk=$(df -P "$HOME" 2>/dev/null | awk 'NR==2 {print $5}') || disk=""
   [ -z "$disk" ] || info="${info}${info:+ · }disk $disk"
-  if [ -r /proc/uptime ]; then
-    up=$(awk '{d=int($1/86400); h=int($1/3600)%24; if (d) printf "%dd %dh",d,h; else printf "%dh",h}' /proc/uptime)
+  if [ -r /proc/uptime ]; then secs=$(awk '{print int($1)}' /proc/uptime)
+  else  # macOS: '{ sec = 1759000000, usec = 0 } ...'
+    boot=$($sysctl -n kern.boottime 2>/dev/null | sed -n 's/.*sec = \([0-9]*\),.*/\1/p') || boot=""
+    secs=${boot:+$(( $(date +%s) - boot ))}
+  fi
+  if [ -n "$secs" ]; then
+    up=$(awk -v s="$secs" 'BEGIN {d=int(s/86400); h=int(s/3600)%24; if (d) printf "%dd %dh",d,h; else printf "%dh",h}')
     info="${info}${info:+ · }up $up"
   fi
+  threads=$(t3_threads 2>/dev/null) || threads=""
+  case $threads in ''|*[!0-9]*) ;; *) info="${info}${info:+ · }threads $threads" ;; esac
   event sys "$info"
+}
+# T3's threads (not deleted), read from its database with sqlite3 or Python: servers rarely have both.
+t3_threads() {
+  db="${T3CODE_HOME:-$HOME/.t3}/userdata/statev2.sqlite"
+  [ -r "$db" ] || return 1
+  q='select count(*) from orchestration_v2_projection_threads where deleted_at is null'
+  if command -v sqlite3 >/dev/null; then sqlite3 -readonly "$db" "$q"
+  else python3 -c 'import sqlite3, sys
+print(sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True).execute(sys.argv[2]).fetchone()[0])' "$db" "$q"
+  fi
 }
 # Both the update and rollback use the existing install method.
 t3_install() {
@@ -310,6 +327,8 @@ rollback_step() {
 }
 system_info || true
 names='T3 Codex Claude OpenCode Grok Pi'
+# On t3up's own machine T3 is the desktop app, which t3up updates itself: providers only.
+[ -z "${T3UP_LOCAL:-}" ] || names='Codex Claude OpenCode Grok Pi'
 for name in $names; do step "$name" "$(printf '%s' "$name" | tr A-Z a-z)_step"; done
 wait
 failed=0

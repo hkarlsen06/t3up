@@ -14,7 +14,30 @@ const RELEASES: &[(&str, &str, &str)] = &[
 /// {'T3': '0.0.46-nightly.20261003.2632', ...}. Blocking: run it on a blocking thread.
 /// A tool the registry can't answer for is left out, so offline just means no update hints.
 pub fn fetch_latest() -> HashMap<String, String> {
-    fetch_at(&std::env::var("T3UP_REGISTRY").unwrap_or_else(|_| "https://registry.npmjs.org".into()))
+    let Ok(registry) = std::env::var("T3UP_REGISTRY") else {
+        let mut latest = fetch_at("https://registry.npmjs.org");
+        // Claude installs itself, and `claude update` reads its own release channel, which can trail npm
+        // by hours: npm's newest would be an update its updater can't make yet.
+        if let Some(version) = claude_channel() {
+            latest.insert("Claude".into(), version);
+        }
+        return latest;
+    };
+    fetch_at(&registry)
+}
+
+/// The newest Claude Code on the channel its own updater reads.
+fn claude_channel() -> Option<String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(5))).build().into();
+    let body = agent
+        .get("https://downloads.claude.ai/claude-code-releases/latest")
+        .call()
+        .ok()?
+        .body_mut()
+        .read_to_string()
+        .ok()?;
+    let version = body.trim();
+    crate::model::VERSION_RE.is_match(version).then(|| version.to_string())
 }
 
 fn fetch_at(registry: &str) -> HashMap<String, String> {

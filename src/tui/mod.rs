@@ -167,18 +167,26 @@ fn take_utf8(buf: &mut Vec<u8>) -> String {
 }
 
 /// Run `command` on `host` under a remote terminal (the tools expect one), streaming its output back.
+/// On this machine (`local`), `script` gives it the terminal.
 fn start_flow(
     id: u64,
     host: String,
     command: String,
+    local: bool,
     res: &UnboundedSender<Res>,
 ) -> (JoinHandle<()>, UnboundedSender<String>) {
     let (input, mut typed) = unbounded_channel::<String>();
     let res = res.clone();
     let task = tokio::spawn(async move {
         let say = |text: String| drop(res.send(Res::FlowOut { id, text }));
-        let spawned = tokio::process::Command::new(job::ssh_program())
-            .args(["-tt", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", &host, &command])
+        let ssh = job::ssh_program();
+        let argv: Vec<&str> = match (local, cfg!(target_os = "macos")) {
+            (false, _) => vec![&ssh, "-tt", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", &host, &command],
+            (true, true) => vec!["script", "-q", "/dev/null", "sh", "-c", &command],
+            (true, false) => vec!["script", "-qfec", &command, "/dev/null"],
+        };
+        let spawned = tokio::process::Command::new(argv[0])
+            .args(&argv[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -292,9 +300,10 @@ fn run_effect(
             );
         }
         Effect::SaveTools(tools) => config::save_known_tools(logs.parent().unwrap_or(logs), &tools),
-        Effect::StartFlow { id, host, command } => {
+        Effect::SaveThreads(threads) => config::save_threads(logs.parent().unwrap_or(logs), &threads),
+        Effect::StartFlow { id, host, command, local } => {
             flows.retain(|_, (task, _)| !task.is_finished());
-            flows.insert(id, start_flow(id, host, command, res_tx));
+            flows.insert(id, start_flow(id, host, command, local, res_tx));
         }
         Effect::FlowInput { id, text } => {
             if let Some((_, input)) = flows.get(&id) {
@@ -345,8 +354,13 @@ pub async fn run(hosts: Vec<String>, logs: PathBuf) -> anyhow::Result<bool> {
     let mut flows = Flows::new();
     let mut restart = false;
     let mut app = App::new(hosts, logs.clone(), known);
+    app.threads = config::threads(logs.parent().unwrap_or(&logs));
+    app.reorder();
     app.motion = motion::Motion::new(std::env::var_os("T3UP_NO_MOTION").is_none());
-    app.desktop = tokio::task::spawn_blocking(desktop::desktop_version).await.unwrap_or_default();
+    if std::env::var_os("T3UP_NO_LOCAL").is_none() {
+        app.show_local();
+    }
+    app.on_result(Res::Desktop(tokio::task::spawn_blocking(desktop::desktop_version).await.unwrap_or_default()));
     let size = term.size()?;
     app.on_resize(size.width, size.height);
     present(&mut term, &mut app, &logos, true)?;

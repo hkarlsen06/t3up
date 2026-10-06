@@ -26,6 +26,8 @@ pub struct Job {
     pub logs: PathBuf,
     /// The script piped to the server: `model::remote_script()` (tests pass a variant).
     pub script: Arc<str>,
+    /// This machine: the script runs here, without ssh, and leaves T3 (the desktop app's) alone.
+    pub local: bool,
 }
 
 pub fn ssh_program() -> String {
@@ -127,11 +129,15 @@ pub async fn run_job(job: Job, tx: Sender) {
         tokio::fs::create_dir_all(&job.logs).await?;
         let mut log = tokio::fs::File::create(log).await?;
         let (read, stdout, stderr) = output_pipe()?;
-        let remote = shlex::try_join(["sh", "-s", "--", job.mode.as_str(), &job.version, &job.only])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let mut command = tokio::process::Command::new(ssh_program());
-        command
-            .args([
+        let args = ["sh", "-s", "--", job.mode.as_str(), &job.version, &job.only];
+        let mut command = if job.local {
+            let mut command = tokio::process::Command::new(args[0]);
+            command.args(&args[1..]).env("T3UP_LOCAL", "1");
+            command
+        } else {
+            let remote = shlex::try_join(args).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            let mut command = tokio::process::Command::new(ssh_program());
+            command.args([
                 "-o",
                 "BatchMode=yes",
                 "-o",
@@ -142,11 +148,10 @@ pub async fn run_job(job: Job, tx: Sender) {
                 "ServerAliveCountMax=2",
                 &job.host,
                 &remote,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(stdout)
-            .stderr(stderr)
-            .kill_on_drop(true);
+            ]);
+            command
+        };
+        command.stdin(Stdio::piped()).stdout(stdout).stderr(stderr).kill_on_drop(true);
         let mut child = command.spawn()?;
         // Command retains the pipe's write descriptors; release them so EOF can arrive.
         drop(command);

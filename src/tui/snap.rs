@@ -164,12 +164,15 @@ fn done(detail: &str) -> Event {
     Event::Done(detail.into())
 }
 
-/// Four servers in different states, as a real session might look.
+/// Four servers in different states and this machine, as a real session might look.
 pub fn demo() -> App {
     let names = ["one-s", "one-m", "mdr", "box"].map(String::from).to_vec();
     let known =
         BTreeMap::from([("one-s".to_string(), ["T3", "Codex", "Claude", "OpenCode"].map(String::from).to_vec())]);
     let mut app = App::new(names, "/tmp/t3up-demo/logs".into(), known);
+    // Busiest first: the cards keep this order.
+    app.threads = [("one-s", 120), ("one-m", 80), ("mdr", 40)].map(|(h, n)| (h.to_string(), n)).into();
+    app.reorder();
     app.take_effects();
     app.local = "Ganz-Harbour".into();
     app.desktop = "0.0.46-nightly.20261003.2623".into();
@@ -245,6 +248,22 @@ pub fn demo() -> App {
             Event::Exit { code: Some(255), error: None },
         ],
     );
+    // This machine: its providers, and the desktop app as its T3.
+    app.show_local();
+    app.on_result(super::app::Res::Desktop("0.0.46-nightly.20261003.2623".into()));
+    feed(
+        &mut app,
+        "Ganz-Harbour",
+        &[
+            log("Ganz-Harbour"),
+            done("Codex: codex-cli 0.161.0"),
+            done("Claude: 2.1.289 (Claude Code)"),
+            Event::Sys("load 2.10 · cpus 10 · disk 74% · up 3d 4h".into()),
+            Event::Complete,
+            Event::Exit { code: Some(0), error: None },
+        ],
+    );
+    app.selected = 1; // one-s
     app.take_effects();
     app.toasts.clear();
     app.modal = None;
@@ -261,10 +280,10 @@ fn snapshots() {
     let mut app = demo();
     save("dashboard", &mut app, 100, 30);
     app.show_output = true;
-    app.selected = 2;
+    app.selected = 3;
     save("output", &mut app, 100, 30);
     app.show_output = false;
-    app.selected = 0;
+    app.selected = 1;
     app.open_actions();
     app.toast(super::app::Sev::Info, "Done", "one-m updated in 12s");
     app.toast(super::app::Sev::Error, "Failed", "mdr: Codex: EACCES: permission denied, mkdir '/usr/lib/node_modules'");
@@ -288,7 +307,7 @@ fn snapshots() {
     }));
     save("servers", &mut app, 100, 30);
     app.modal = None;
-    app.begin_update(vec!["one-s".into(), "one-m".into()], "all", false);
+    app.begin_update(vec!["one-s".into(), "one-m".into()], "all");
     save("confirm", &mut app, 100, 30);
     app.modal = None;
     app.open_version();
@@ -308,20 +327,34 @@ fn snapshots() {
     app.modal = None;
     app.queued.insert("mdr".into());
     app.queued.insert("box".into());
-    app.hosts[2].status = crate::model::Status::Ok;
+    app.hosts[3].status = crate::model::Status::Ok;
     save("queued", &mut app, 100, 30);
     app.queued.clear();
-    app.hosts[0].installed.extend(["Grok".to_string(), "Pi".to_string()]);
-    app.hosts[0].current.insert("Grok".into(), "0.3.0".into());
-    app.hosts[0].steps.insert("Grok".into(), (crate::model::StepState::Done, "0.3.0".into()));
-    app.hosts[0].steps.insert("Pi".into(), (crate::model::StepState::Done, "0.5.0".into()));
+    app.hosts[1].installed.extend(["Grok".to_string(), "Pi".to_string()]);
+    app.hosts[1].current.insert("Grok".into(), "0.3.0".into());
+    app.hosts[1].steps.insert("Grok".into(), (crate::model::StepState::Done, "0.3.0".into()));
+    app.hosts[1].steps.insert("Pi".into(), (crate::model::StepState::Done, "0.5.0".into()));
     app.on_job("one-s", Event::Exit { code: Some(0), error: None });
     save("wrapped", &mut app, 60, 40);
-    app.hosts[0].installed.remove("Grok");
-    app.hosts[0].installed.remove("Pi");
+    app.hosts[1].installed.remove("Grok");
+    app.hosts[1].installed.remove("Pi");
     app.on_job("one-s", Event::Exit { code: Some(0), error: None });
     app.size = (60, 24);
     save("narrow", &mut app, 60, 24);
+    // Toasts: stacked, then spread out under the pointer.
+    app.size = (100, 30);
+    for host in ["depressed-louis", "mdr", "one-s"] {
+        app.toast(super::app::Sev::Info, "Done", format!("{host} updated in 2s"));
+    }
+    save("toasts", &mut app, 100, 30);
+    let stack = app.hits.iter().find(|(_, h)| *h == super::app::Hit::Toasts).expect("toast stack").0;
+    app.on_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: stack.x + 2,
+        row: stack.y,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    });
+    save("toasts-open", &mut app, 100, 30);
     app.open_actions();
     save("narrow-menu", &mut app, 60, 24);
     app.modal = None;

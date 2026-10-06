@@ -169,6 +169,8 @@ pub const MAX_LINES: usize = 2000;
 #[derive(Debug, Clone)]
 pub struct Host {
     pub name: String,
+    /// The machine t3up runs on: no ssh, and its T3 is the desktop app.
+    pub local: bool,
     /// Display lines across runs, newest last, at most MAX_LINES.
     pub lines: VecDeque<String>,
     /// Components seen on this server. Survives runs, so a check only shows tiles for tools seen before.
@@ -203,6 +205,7 @@ impl Host {
     pub fn new(name: &str) -> Self {
         Host {
             name: name.to_string(),
+            local: false,
             lines: VecDeque::new(),
             installed: BTreeSet::from(["T3".to_string()]),
             mode: Mode::Check,

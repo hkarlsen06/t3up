@@ -95,7 +95,8 @@ fn servers_editor() {
     assert_eq!(servers_modal(&app).hosts, ["beta", "alpha"]);
     // Closing applies the list and checks the new servers.
     key(&mut app, KeyCode::Esc);
-    assert_eq!(app.hosts.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["beta", "alpha"]);
+    // Cards go by T3 threads, then name (none counted yet); the file keeps its own order.
+    assert_eq!(app.hosts.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["alpha", "beta"]);
     assert_eq!(start_jobs(&mut app), vec![("beta".into(), Mode::Check), ("alpha".into(), Mode::Check)]);
 
     // Comments survive, kept servers keep their state, removed ones go, new ones get checked.
@@ -124,10 +125,10 @@ fn servers_editor() {
     draw(&mut app);
     click(&mut app, 0, 0); // outside the panel
     assert!(app.modal.is_none());
-    assert_eq!(app.hosts.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["second", "fourth"]);
-    assert_eq!(app.hosts[0].sys, "kept");
-    assert_eq!(app.hosts[0].status, t3up::model::Status::Ok);
-    assert_eq!(app.selected, 0);
+    assert_eq!(app.hosts.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["fourth", "second"]);
+    assert_eq!(app.hosts[1].sys, "kept");
+    assert_eq!(app.hosts[1].status, t3up::model::Status::Ok);
+    assert_eq!(app.selected, 0, "`first` is gone: the top card");
     assert_eq!(start_jobs(&mut app), vec![("fourth".into(), Mode::Check)]);
 
     // Select a row with the arrows, remove it with delete.

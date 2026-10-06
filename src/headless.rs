@@ -38,6 +38,7 @@ pub async fn run(opts: Options, desktop: String, logs: PathBuf) -> i32 {
                 only: opts.only.clone(),
                 logs: logs.clone(),
                 script: script.clone(),
+                local: false,
             },
             tx.clone(),
         ));
