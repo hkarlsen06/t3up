@@ -34,7 +34,8 @@ You can update one server or all of them without leaving the terminal.
 - **No agent on the server.** It runs a POSIX `sh` script over plain SSH. Nothing to install remotely.
 - **Scriptable.** `--check` and `--update` give plain output and an exit code, for cron or CI.
 - **This machine too.** It gets its own row, at the top: its providers, CPU and disk, and the T3 Code desktop app
-  (macOS) as its T3, which t3up can update as well.
+  (macOS) as its T3, which t3up can update as well. A pinned T3 version goes to the desktop app too, so pinning
+  a stable release replaces a nightly app with the stable one.
 - **Only what's needed, fast.** **Update all** updates just the tools each server is behind on and leaves current
   servers alone; only servers whose T3 changes wait for the first one. Runs on a server share one SSH connection,
   and a timer over the button shows how long updating everyone took.
@@ -111,7 +112,12 @@ The dashboard is a table: each tool's logo heads its column with the newest vers
 is a row with its versions in those columns (blue with `↑` when there's newer, green `✓` once updated), tools that
 need you to sign in, its CPU, disk and uptime, and how many agents are running on it. It shows only what's out of
 the ordinary: a healthy server says nothing. Busiest servers (most T3 threads) come first. **Update all** says how
-many servers it will update; its `⋯` opens the menu of what to update.
+many servers it will update; its `⋯` opens the menu of what to update. In Ghostty, kitty and WezTerm (which
+bundle Nerd Font's symbols) an icon before each name says whether it's a laptop, a desktop or a server.
+
+When several servers need a new version of T3, t3up updates the least used one first, the canary, and only
+moves on to the others once T3 passes its health check there. If it fails, t3up rolls it back and leaves the
+other servers alone. The canary's row explains what's happening, and tapping that note explains why.
 
 A server's menu lists what's installed on it. **Everything** updates T3 and all of those. To add something, open
 the **Installer** (in the menu, with <kbd>i</kbd>, or by typing "install" in the palette) and tick what you want:
@@ -133,6 +139,7 @@ t3up --update --host build-01      # just one server (repeatable)
 t3up 0.0.46-nightly.20261003.2632  # install this exact T3 version
 t3up --remove grok,pi --host box   # remove providers; their settings and sign-in stay
 t3up --desktop                     # update the macOS desktop app, then exit
+t3up --desktop 0.0.45              # install that version of the desktop app instead
 t3up --self-update                 # update t3up itself to the newest release
 ```
 

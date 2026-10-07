@@ -15,17 +15,24 @@ pub fn desktop_version() -> String {
     }
 }
 
-/// Install the newest release on the app's own update channel. Blocking. Returns the version.
-pub fn update_desktop(say: &dyn Fn(&str)) -> Result<String, String> {
+/// Install `version`, or with '' the newest release on the app's own update channel. Blocking. Returns the version.
+pub fn update_desktop(version: &str, say: &dyn Fn(&str)) -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
-        macos::update_desktop(say).map_err(|e| e.to_string())
+        macos::update_desktop(version, say).map_err(|e| e.to_string())
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = say;
+        let _ = (version, say);
         Err("T3 Code desktop is not installed in /Applications".into())
     }
+}
+
+/// Where a release's update manifest is: its tag, and the manifest named for its channel (as T3 Code's
+/// build names it: a nightly is a version ending `-nightly.YYYYMMDD.N`).
+pub fn release_manifest(version: &str) -> (String, &'static str) {
+    let nightly = Regex::new(r"-nightly\.\d{8}\.\d+$").unwrap().is_match(version);
+    (format!("v{version}"), if nightly { "nightly-mac.yml" } else { "latest-mac.yml" })
 }
 
 static VERSION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^version: *'?([^'\s]+)").unwrap());
@@ -77,12 +84,15 @@ mod macos {
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .unwrap_or_default();
         let pattern = Regex::new(r"(?m)^(/Applications/T3 Code[^/]*\.app)/").unwrap();
-        PathBuf::from(
-            pattern
-                .captures(&processes)
-                .map(|m| m[1].to_string())
-                .unwrap_or_else(|| "/Applications/T3 Code (Nightly).app".into()),
-        )
+        if let Some(m) = pattern.captures(&processes) {
+            return PathBuf::from(&m[1]);
+        }
+        // Not running: whichever is installed. Stable is 'T3 Code (Alpha)', a nightly 'T3 Code (Nightly)'.
+        ["T3 Code (Nightly).app", "T3 Code (Alpha).app", "T3 Code.app"]
+            .map(|name| Path::new("/Applications").join(name))
+            .into_iter()
+            .find(|app| app.exists())
+            .unwrap_or_else(|| "/Applications/T3 Code (Nightly).app".into())
     }
 
     fn bundle_info(app: &Path) -> plist::Dictionary {
@@ -109,7 +119,7 @@ mod macos {
         Ok(pattern.captures(&String::from_utf8_lossy(&details.stderr)).map(|m| m[1].to_string()).unwrap_or_default())
     }
 
-    fn desktop_release(app: &Path) -> Result<(String, String, String)> {
+    fn desktop_release(app: &Path, pinned: &str) -> Result<(String, String, String)> {
         let config = fs::read_to_string(app.join("Contents/Resources/app-update.yml"))?;
         let pattern = Regex::new(r"(?m)^(\w+): *(\S+)").unwrap();
         let config: HashMap<_, _> =
@@ -117,9 +127,13 @@ mod macos {
         let owner = config.get("owner").context("app-update.yml has no owner")?;
         let repo = config.get("repo").context("app-update.yml has no repo")?;
         let channel = config.get("channel").map(String::as_str).unwrap_or("latest");
-        let manifest = format!("{channel}-mac.yml");
+        let mut manifest = format!("{channel}-mac.yml");
         let github = format!("https://github.com/{owner}/{repo}/releases");
-        let base = if channel == "latest" {
+        let base = if !pinned.is_empty() {
+            let (tag, name) = release_manifest(pinned);
+            manifest = name.into();
+            format!("{github}/download/{tag}")
+        } else if channel == "latest" {
             format!("{github}/latest/download")
         } else {
             let releases =
@@ -135,8 +149,17 @@ mod macos {
         };
         let agent: ureq::Agent =
             ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(20))).build().into();
-        let manifest = agent.get(format!("{base}/{manifest}")).call()?.body_mut().read_to_string()?;
-        mac_zip(&manifest, &base).map_err(anyhow::Error::msg)
+        let manifest = agent
+            .get(format!("{base}/{manifest}"))
+            .call()
+            .with_context(|| format!("no T3 Code desktop {pinned} for macOS"))?
+            .body_mut()
+            .read_to_string()?;
+        let release = mac_zip(&manifest, &base).map_err(anyhow::Error::msg)?;
+        if !pinned.is_empty() && release.0 != pinned {
+            bail!("release {pinned} offers {} instead", release.0);
+        }
+        Ok(release)
     }
 
     // Same volume as the app, so replacing it takes two renames.
@@ -153,9 +176,13 @@ mod macos {
         Ok(String::from_utf8_lossy(&commands.stdout).lines().any(|s| s.starts_with(&prefix)))
     }
 
-    fn swap(app: &Path, new: &Path, backup: &Path) -> Result<()> {
+    /// Move `app` aside to `backup` and `new` to `dest` (a stable and a nightly are named differently).
+    fn swap(app: &Path, new: &Path, dest: &Path, backup: &Path) -> Result<()> {
+        if dest != app && dest.exists() {
+            bail!("{} is already installed; remove one of them first", dest.display());
+        }
         fs::rename(app, backup).context("cannot move the installed app aside")?;
-        if let Err(error) = fs::rename(new, app) {
+        if let Err(error) = fs::rename(new, dest) {
             if let Err(restore) = fs::rename(backup, app) {
                 bail!(
                     "cannot install app: {error}; cannot restore app: {restore}; old app kept at {}",
@@ -167,13 +194,13 @@ mod macos {
         Ok(())
     }
 
-    pub(super) fn update_desktop(say: &dyn Fn(&str)) -> Result<String> {
+    pub(super) fn update_desktop(pinned: &str, say: &dyn Fn(&str)) -> Result<String> {
         let app = desktop_app();
         let info = bundle_info(&app);
         if info.is_empty() {
             bail!("T3 Code desktop is not installed in /Applications");
         }
-        let (latest, url, checksum) = desktop_release(&app)?;
+        let (latest, url, checksum) = desktop_release(&app, pinned)?;
         if latest == version(&info) {
             return Ok(latest);
         }
@@ -236,8 +263,9 @@ mod macos {
             bail!("T3 Code did not quit");
         }
         let backup = work.0.join("old.app");
+        let dest = parent.join(new.file_name().context("download contains no app")?);
         if version(&bundle_info(&app)) != latest
-            && let Err(error) = swap(&app, &new, &backup)
+            && let Err(error) = swap(&app, &new, &dest, &backup)
         {
             // Keep a backup that could not be restored, even when cleanup runs.
             if backup.exists() {
@@ -245,9 +273,9 @@ mod macos {
             }
             return Err(error);
         }
-        if running && let Err(error) = command(Command::new("open").arg(&app)) {
+        if running && let Err(error) = command(Command::new("open").arg(&dest)) {
             if backup.exists()
-                && let Err(restore) = swap(&app, &backup, &work.0.join("failed-new.app"))
+                && let Err(restore) = swap(&dest, &backup, &app, &work.0.join("failed-new.app"))
             {
                 let reason = format!("cannot reopen app: {error}; {restore}; backup folder: {}", work.0.display());
                 std::mem::forget(work);
@@ -268,8 +296,18 @@ mod macos {
             fs::create_dir_all(&root).unwrap();
             let app = root.join("test.app");
             fs::write(&app, "old app").unwrap();
-            assert!(swap(&app, &root.join("missing.app"), &root.join("old.app")).is_err());
-            assert_eq!(fs::read_to_string(app).unwrap(), "old app");
+            assert!(swap(&app, &root.join("missing.app"), &app, &root.join("old.app")).is_err());
+            assert_eq!(fs::read_to_string(&app).unwrap(), "old app");
+            // A stable over a nightly takes its own name, unless that's taken.
+            let (new, dest) = (root.join("new.app"), root.join("other.app"));
+            fs::write(&new, "new app").unwrap();
+            fs::write(&dest, "another app").unwrap();
+            assert!(swap(&app, &new, &dest, &root.join("old.app")).is_err());
+            assert_eq!(fs::read_to_string(&app).unwrap(), "old app");
+            fs::remove_file(&dest).unwrap();
+            swap(&app, &new, &dest, &root.join("old.app")).unwrap();
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "new app");
+            assert!(!app.exists());
             fs::remove_dir_all(root).unwrap();
         }
     }
@@ -278,6 +316,13 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pinned_release_is_found_by_its_tag_and_channel() {
+        let nightly = "0.0.46-nightly.20261007.2787";
+        assert_eq!(release_manifest(nightly), (format!("v{nightly}"), "nightly-mac.yml"));
+        assert_eq!(release_manifest("0.0.45"), ("v0.0.45".into(), "latest-mac.yml"));
+    }
 
     #[test]
     fn zip_for_this_chip_never_dmg() {

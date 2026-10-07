@@ -456,9 +456,12 @@ pub fn desktop_behind(desktop: &str, hosts: &[&Host]) -> String {
     }
 }
 
-/// A newer T3 than this machine's desktop app: what a server runs or, when no version is pinned,
-/// the newest nightly. '' when the app is up to date or not installed.
+/// What this machine's desktop app should update to: the pinned version, else a newer T3 than it, what a
+/// server runs or the newest nightly. '' when the app is up to date or not installed.
 pub fn desktop_outdated(desktop: &str, hosts: &[&Host], latest: &HashMap<String, String>, target: &str) -> String {
+    if !target.is_empty() {
+        return if desktop.is_empty() || desktop == target { String::new() } else { target.into() };
+    }
     let mut best = desktop_behind(desktop, hosts);
     if let Some(l) = latest.get("T3")
         && !desktop.is_empty()
@@ -571,7 +574,9 @@ mod tests {
             desktop_outdated("0.0.46-nightly.20261003.2632", &[&h], &newest, ""),
             "0.0.46-nightly.20261003.2640"
         );
-        assert_eq!(desktop_outdated("0.0.46-nightly.20261003.2632", &[&h], &newest, "0.0.45"), "");
+        // Pinned, it goes to the pin, older or not.
+        assert_eq!(desktop_outdated("0.0.46-nightly.20261003.2632", &[&h], &newest, "0.0.45"), "0.0.45");
+        assert_eq!(desktop_outdated("0.0.45", &[&h], &newest, "0.0.45"), "");
         assert_eq!(
             desktop_outdated("0.0.46-nightly.20261003.2623", &[&h], &HashMap::new(), ""),
             "0.0.46-nightly.20261003.2632"

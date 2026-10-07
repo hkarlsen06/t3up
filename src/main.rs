@@ -73,7 +73,11 @@ async fn main() -> ExitCode {
         };
     }
     if cli.desktop {
-        return match desktop::update_desktop(&|text| println!("{text}")) {
+        let version = cli.target.clone().unwrap_or_default();
+        if !version.is_empty() && !model::VERSION_RE.is_match(&version) {
+            usage(ErrorKind::InvalidValue, "VERSION must be an exact version, for example 0.0.45");
+        }
+        return match desktop::update_desktop(&version, &|text| println!("{text}")) {
             Ok(version) => {
                 println!("T3 Code desktop {version}");
                 ExitCode::SUCCESS

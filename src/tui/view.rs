@@ -110,6 +110,16 @@ fn message_card(h: &Host) -> bool {
     h.status == Status::Ok && crate::model::no_t3(h) || h.status == Status::Failed && h.steps.is_empty()
 }
 
+/// What kind of computer it is, as a Nerd Font icon: laptop, desktop or server.
+fn kind_icon(h: &Host) -> Option<&'static str> {
+    match sys_parts(&h.sys).find(|(k, _)| *k == "kind")?.1 {
+        "laptop" => Some("\u{f0322}"),
+        "desktop" => Some("\u{f0379}"),
+        "server" => Some("\u{f048b}"),
+        _ => None,
+    }
+}
+
 fn uptime(h: &Host) -> Option<&str> {
     sys_parts(&h.sys).find(|(k, _)| *k == "up").map(|(_, v)| v)
 }
@@ -623,7 +633,8 @@ fn cards(app: &mut App, logos: &Logos, buf: &mut Buffer, dim_logos: bool) {
         for (cell, name) in cells {
             let top = y + cell.y as i32;
             if top >= g.view.y as i32 && top + cell.height as i32 <= g.view.bottom() as i32 {
-                app.hits.push((Rect::new(x + cell.x, top as u16, cell.width, cell.height), Hit::Tool(i, name)));
+                let hit = if name == CANARY { Hit::Canary } else { Hit::Tool(i, name) };
+                app.hits.push((Rect::new(x + cell.x, top as u16, cell.width, cell.height), hit));
             }
         }
     }
@@ -796,6 +807,9 @@ fn cell(app: &App, h: &Host, name: &str, behind: bool) -> Span<'static> {
 }
 
 /// Draw card `i` into `buf`; returns where its tools' cells are (in the card), to tap.
+/// Not a tool: `draw_card`'s cell for a canary's note.
+const CANARY: &str = "canary";
+
 fn draw_card(app: &App, g: &Geo, i: usize, buf: &mut Buffer) -> Vec<(Rect, &'static str)> {
     let mut cells = vec![];
     let h = &app.hosts[i];
@@ -825,7 +839,10 @@ fn draw_card(app: &App, g: &Geo, i: usize, buf: &mut Buffer) -> Vec<(Rect, &'sta
     let w = buf.area.width as usize;
     let missing = h.status == Status::Ok && crate::model::no_t3(h);
     // On the left: what went wrong, or what to do about it.
-    let note = if message_card(h) {
+    let canary = app.canary_note(&h.name);
+    let mut note = if canary.is_some() {
+        Span::raw("") // once there's room for it
+    } else if message_card(h) {
         let hint = if missing { "enter → install T3 (latest nightly)" } else { "enter → retry or open a terminal" };
         Span::styled(format!(" {hint} "), fg(DIM))
     } else if !h.error.is_empty() {
@@ -850,13 +867,30 @@ fn draw_card(app: &App, g: &Geo, i: usize, buf: &mut Buffer) -> Vec<(Rect, &'sta
     let right = clip([alert, sub].concat(), w.saturating_sub(4));
     let right_w = right.width() as u16;
     put(buf, buf.area.width.saturating_sub(right_w + 1), note_y, right_w, &right);
-    let room = buf.area.width.saturating_sub(note_x + right_w + 2);
+    let mut room = buf.area.width.saturating_sub(note_x + right_w + 2);
+    // Under the name, a note stays in the name's column; a message row's runs across, like its message.
+    if g.card_h > 2 && !message_card(h) {
+        room = room.min(tb.tool_x(0).saturating_sub(note_x));
+    }
+    // The ⓘ says it explains itself when tapped, so the words give way first.
+    if let Some((text, color)) = canary {
+        note = Span::styled(format!(" {} ⓘ", truncate(text, room.saturating_sub(3) as usize)), fg(color));
+    }
+    let note_w = note.width().min(room as usize) as u16;
     put(buf, note_x, note_y, room, &clip(vec![note], room as usize));
+    if canary.is_some() {
+        cells.push((Rect::new(note_x, note_y, note_w, 1), CANARY));
+    }
 
     let y = 1 + (g.card_h - 1) / 2;
-    // A mark before the name only when something's off: well is the norm and says nothing.
+    // The kind of computer before the name; before that a mark, only when something's off.
+    let kind = kind_icon(h).filter(|_| app.icons);
+    if let Some(kind) = kind {
+        put(buf, Table::NAME_X - 2, y, 1, &Line::styled(kind, fg(MUTED)));
+    }
     if !fine {
-        put(buf, Table::NAME_X - 2, y, 1, &Line::styled(icon.clone(), fg(color)));
+        let x = Table::NAME_X - if kind.is_some() { 4 } else { 2 };
+        put(buf, x, y, 1, &Line::styled(icon.clone(), fg(color)));
     }
     let name = truncate(&h.name, tb.name as usize);
     put(buf, Table::NAME_X, y, tb.name, &Line::styled(name, bold(if selected { ACCENT } else { TEXT })));
@@ -2004,6 +2038,33 @@ mod tests {
     }
 
     #[test]
+    fn the_canary_says_why_it_goes_alone() {
+        let mut app = demo();
+        app.begin_update(vec!["one-m".into(), "mdr".into()], "t3");
+        app.take_effects();
+        let buf = frame(&mut app, 100, 30);
+        let note = "Canary, updating first ⓘ";
+        assert!(has(&buf, note), "{}", text(&buf).join("\n"));
+        assert_eq!(cell_fg(&buf, note).unwrap(), AMBER);
+        // It stays in the name's column.
+        let rows = text(&buf);
+        assert!(rows.iter().any(|r| r.split('┆').next().unwrap().contains(note)), "{}", rows.join("\n"));
+        // Tapping it explains.
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let at = app.hits.iter().find(|(_, h)| *h == Hit::Canary).unwrap().0;
+        let kind = MouseEventKind::Down(MouseButton::Left);
+        app.on_mouse(MouseEvent { kind, column: at.x + 3, row: at.y, modifiers: KeyModifiers::NONE });
+        assert!(app.modal.is_none());
+        assert!(app.toasts.last().unwrap().text.contains("miners"));
+
+        // Once it's through, it says so in green while the others update.
+        app.on_job("mdr", crate::model::Event::Complete);
+        app.on_job("mdr", crate::model::Event::Exit { code: Some(0), error: None });
+        let buf = frame(&mut app, 100, 30);
+        assert_eq!(cell_fg(&buf, "Canary succeeded ⓘ").unwrap(), GREEN, "{}", text(&buf).join("\n"));
+    }
+
+    #[test]
     fn dashboard_at_100x30() {
         let mut app = demo();
         let buf = frame(&mut app, 100, 30);
@@ -2011,7 +2072,9 @@ mod tests {
             "▄█▄ ▀██ █ █ █▀█",        // the name, big
             "✗ 2 failed",             // what's wrong, beside the button
             "↑ Update 2 servers ▏ ⋯", // which counts what it brings forward
-            "Ganz-Harbour",           // this machine, first
+            "\u{f0322} Ganz-Harbour", // this machine, first: a laptop
+            "\u{f048b} one-s",        // the rest are servers
+            "    ✗ box",              // never reached: no kind, so the mark stays by its name
             "3d 4h",
             "one-s",
             "one-m",

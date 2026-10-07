@@ -295,11 +295,11 @@ fn run_effect(
                 move |r| Res::Changelog { key, result: r.unwrap_or_else(|| Err("internal error".into())) },
             );
         }
-        Effect::UpdateDesktop => {
+        Effect::UpdateDesktop(version) => {
             let say = res_tx.clone();
             blocking(
                 res_tx,
-                move || desktop::update_desktop(&|text| drop(say.send(Res::DesktopSay(text.to_string())))),
+                move || desktop::update_desktop(&version, &|text| drop(say.send(Res::DesktopSay(text.to_string())))),
                 |r| Res::DesktopDone(r.unwrap_or_else(|| Err("internal error".into()))),
             );
         }
@@ -361,6 +361,9 @@ pub async fn run(hosts: Vec<String>, logs: PathBuf) -> anyhow::Result<bool> {
     app.threads = config::threads(logs.parent().unwrap_or(&logs));
     app.reorder();
     app.motion = motion::Motion::new(std::env::var_os("T3UP_NO_MOTION").is_none());
+    // Terminals that bundle Nerd Font's symbols; elsewhere they'd draw as boxes.
+    let env = |k| std::env::var(k).unwrap_or_default();
+    app.icons = matches!(env("TERM_PROGRAM").as_str(), "ghostty" | "WezTerm") || env("TERM") == "xterm-kitty";
     if std::env::var_os("T3UP_NO_LOCAL").is_none() {
         app.show_local();
     }

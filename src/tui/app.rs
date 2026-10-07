@@ -38,7 +38,8 @@ pub enum Effect {
         from: String,
         to: String,
     },
-    UpdateDesktop,
+    /// Install this version of the desktop app; '' = the newest on its channel.
+    UpdateDesktop(String),
     SaveTools(BTreeMap<String, Vec<String>>),
     /// Remember each server's T3 threads, for the card order next time.
     SaveThreads(BTreeMap<String, u64>),
@@ -126,6 +127,8 @@ pub enum Hit {
     Tool(usize, &'static str),
     /// The stack of toasts: hovering spreads it out.
     Toasts,
+    /// A canary's note: tapping it explains the canary.
+    Canary,
 }
 
 /// What a sign-in or pairing window's buttons do.
@@ -340,6 +343,11 @@ pub struct Rollout {
     pub took: Option<(Duration, bool)>,
 }
 
+pub const CANARY: &str = "When several servers need a new version of T3, t3up updates the least used one first \
+and waits for it. If T3 fails its health check there, t3up rolls it back and leaves the other servers alone, so a \
+bad build only ever breaks one server. The name comes from the canaries that coal miners took underground, which \
+fell ill from gas before the miners noticed it.";
+
 /// Whether an update of `only` (components, comma-separated) reaches T3.
 fn touches_t3(only: &str) -> bool {
     only.split(',').any(|o| o == "all" || o == "t3")
@@ -374,6 +382,8 @@ pub struct App {
     /// Servers waiting for the canary.
     pub queued: HashSet<String>,
     canary: Option<Canary>,
+    /// A canary that came back healthy, and the servers it released.
+    released: Option<(String, Vec<String>)>,
     /// The last update of every server, over the Update all button.
     pub rollout: Option<Rollout>,
     pub changelogs: HashMap<ChangeKey, Result<Vec<Release>, String>>,
@@ -397,6 +407,8 @@ pub struct App {
     pub modal_rect: Rect,
     pub hover: Option<Hover>,
     pub motion: Motion,
+    /// Whether the terminal draws Nerd Font icons (the kind of computer before each name).
+    pub icons: bool,
     /// Sign-ins waiting for the window: (host, tool).
     flow_queue: VecDeque<(String, String)>,
     next_flow: u64,
@@ -423,6 +435,7 @@ impl App {
             toasts: vec![],
             queued: HashSet::new(),
             canary: None,
+            released: None,
             rollout: None,
             changelogs: HashMap::new(),
             size: (100, 30),
@@ -441,6 +454,7 @@ impl App {
             modal_rect: Rect::default(),
             hover: None,
             motion: Motion::new(false),
+            icons: false,
             flow_queue: VecDeque::new(),
             next_flow: 0,
             self_update: None,
@@ -741,6 +755,7 @@ impl App {
             self.start(vec![first.clone()], Mode::Update, &first_only);
             if let Some(h) = self.hosts.iter().find(|h| h.name == first && h.running() && h.mode == Mode::Update) {
                 let only = t3.into_iter().filter(|(n, _)| *n != first).collect();
+                self.released = None;
                 self.canary = Some(Canary { host: first, started: h.started, version: self.target.clone(), only });
                 self.queued = names.into_iter().filter(|n| !self.is_running(n)).collect();
             }
@@ -766,6 +781,17 @@ impl App {
             let failed = r.hosts.iter().any(|n| host(n).is_some_and(|h| h.status == Status::Failed));
             let took = r.started.elapsed();
             self.rollout.as_mut().unwrap().took = Some((took, failed));
+        }
+    }
+
+    /// Why a rollout is waiting on this server, or that it passed, and in what color.
+    pub fn canary_note(&self, name: &str) -> Option<(&'static str, ratatui::style::Color)> {
+        if self.canary.as_ref().is_some_and(|c| c.host == name) {
+            Some(("Canary, updating first", AMBER))
+        } else if self.released.as_ref().is_some_and(|(c, _)| c == name) {
+            Some(("Canary succeeded", GREEN))
+        } else {
+            None
         }
     }
 
@@ -825,6 +851,9 @@ impl App {
             self.known.insert(h.name.clone(), installed);
             self.fx.push(Effect::SaveTools(self.known.clone()));
         }
+        if self.released.as_ref().is_some_and(|(_, rest)| !rest.iter().any(|n| self.is_running(n))) {
+            self.released = None;
+        }
         let canary = self.canary.take_if(|c| c.host == h.name && c.started == h.started && h.mode == Mode::Update);
         let failed = h.status == Status::Failed;
         // Green means something changed; a check that went well only says it looked, in blue.
@@ -843,10 +872,11 @@ impl App {
                 let rest: Vec<String> =
                     self.hosts.iter().map(|x| x.name.clone()).filter(|n| self.queued.contains(n)).collect();
                 self.queued.clear();
-                for name in rest {
-                    let only = c.only.get(&name).map_or("all", String::as_str);
-                    self.start_version(vec![name], Mode::Update, only, &c.version);
+                for name in &rest {
+                    let only = c.only.get(name).map_or("all", String::as_str);
+                    self.start_version(vec![name.clone()], Mode::Update, only, &c.version);
                 }
+                self.released = Some((h.name.clone(), rest));
             }
         } else if failed {
             self.toast(Sev::Error, "Failed", format!("{}: {}", h.name, h.error));
@@ -1327,7 +1357,11 @@ impl App {
                 choice: Choice::DesktopGo,
                 icon: "↑",
                 label: "Quit and update".into(),
-                detail: "newest release, then reopens".into(),
+                detail: if self.target.is_empty() {
+                    "newest release, then reopens".into()
+                } else {
+                    format!("to {}, then reopens", short(&self.target))
+                },
             },
         ];
         self.open_modal(Modal::Menu(Menu::new(heading, items, vec![])));
@@ -1338,7 +1372,7 @@ impl App {
             self.toast(Sev::Warning, "Warning", "The desktop app is already updating");
         } else {
             self.desktop_updating = true;
-            self.fx.push(Effect::UpdateDesktop);
+            self.fx.push(Effect::UpdateDesktop(self.target.clone()));
         }
     }
 
@@ -1942,6 +1976,7 @@ impl App {
                 Some(Hit::Tool(i, name)) => self.open_tool(i, name),
                 Some(Hit::UpdateAll) => self.begin_update(self.names(), "all"),
                 Some(Hit::UpdateMenu) => self.open_update_all(),
+                Some(Hit::Canary) => self.toast_for(Sev::Info, "The canary", CANARY, 20),
                 _ => {}
             }
             return;
@@ -2364,12 +2399,20 @@ mod tests {
         assert_eq!(jobs(a.take_effects()), vec![("a".into(), Mode::Update, "t3".into())]);
         assert_eq!(a.queued.len(), 2);
         assert_eq!(status(&a.hosts[1], true, Duration::ZERO).2, "queued");
+        assert_eq!(a.canary_note("a"), Some(("Canary, updating first", AMBER)));
+        assert_eq!(a.canary_note("b"), None);
         done(&mut a, "a", true);
         assert_eq!(
             jobs(a.take_effects()),
             vec![("b".into(), Mode::Update, "t3".into()), ("c".into(), Mode::Update, "t3".into())]
         );
         assert!(a.queued.is_empty());
+        // It says what it set off until the last of the rest is back.
+        assert_eq!(a.canary_note("a"), Some(("Canary succeeded", GREEN)));
+        done(&mut a, "b", true);
+        assert!(a.canary_note("a").is_some());
+        done(&mut a, "c", true);
+        assert_eq!(a.canary_note("a"), None);
     }
 
     #[test]
@@ -2923,7 +2966,7 @@ mod tests {
         press(&mut a, "d");
         assert_eq!(menu(&a).heading.to_string(), "T3 Code desktop   not detected");
         code(&mut a, KeyCode::Enter);
-        assert!(matches!(&a.take_effects()[..], [Effect::UpdateDesktop]));
+        assert!(matches!(&a.take_effects()[..], [Effect::UpdateDesktop(_)]));
         assert!(a.desktop_updating);
         press(&mut a, "d");
         assert_eq!(a.toasts.last().unwrap().text, "The desktop app is already updating");
@@ -2950,7 +2993,7 @@ mod tests {
         );
         code(&mut a, KeyCode::Enter);
         let fx = a.take_effects();
-        assert!(fx.iter().any(|e| matches!(e, Effect::UpdateDesktop)));
+        assert!(fx.iter().any(|e| matches!(e, Effect::UpdateDesktop(_))));
         assert!(a.desktop_updating);
         // This machine is never queued behind the canary; with its providers current, its desktop app is
         // all it updates.
@@ -2964,7 +3007,13 @@ mod tests {
         settle(&mut a);
         a.begin_update(vec!["mac".into()], "t3");
         let fx = a.take_effects();
-        assert!(fx.iter().any(|e| matches!(e, Effect::UpdateDesktop)) && jobs(fx).is_empty());
+        assert!(fx.iter().any(|e| matches!(e, Effect::UpdateDesktop(_))) && jobs(fx).is_empty());
+
+        // A pinned version goes to the desktop app too, even an older one.
+        a.on_result(Res::DesktopDone(Ok("0.0.46-nightly.20261003.2632".into())));
+        a.target = "0.0.45".into();
+        a.begin_update(vec!["mac".into()], "all");
+        assert!(a.take_effects().iter().any(|e| matches!(e, Effect::UpdateDesktop(v) if v == "0.0.45")));
     }
 
     #[test]

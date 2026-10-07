@@ -223,6 +223,10 @@ system_info() {
     up=$(awk -v s="$secs" 'BEGIN {d=int(s/86400); h=int(s/3600)%24; if (d) printf "%dd %dh",d,h; else printf "%dh",h}')
     info="${info}${info:+ · }up $up"
   fi
+  # A battery makes it a laptop, a Mac without one a desktop; the rest are servers.
+  if ls /sys/class/power_supply/BAT* >/dev/null 2>&1 || pmset -g batt 2>/dev/null | grep -q InternalBattery
+  then kind=laptop; elif [ "$(uname)" = Darwin ]; then kind=desktop; else kind=server; fi
+  info="${info}${info:+ · }kind $kind"
   threads=$(t3_threads 2>/dev/null) || threads=""
   case $threads in ''|*[!0-9]*) ;; *) info="${info}${info:+ · }threads $threads" ;; esac
   event sys "$info"

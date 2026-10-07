@@ -265,7 +265,7 @@ exec /bin/sleep "$@""#,
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, Event::Sys(s) if s.contains("cpu ") && s.contains("disk ") && s.contains("cpus ") && s.contains("up ")))
+            .any(|e| matches!(e, Event::Sys(s) if s.contains("cpu ") && s.contains("disk ") && s.contains("cpus ") && s.contains("up ") && s.contains("kind ")))
     );
 
     // T3's threads, not counting deleted ones, from its database (sqlite3 here; Python where that's missing).
