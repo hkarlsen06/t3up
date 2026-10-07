@@ -194,12 +194,23 @@ busy() {
       print count
     }' || printf '0\n'
 }
+# CPU busy right now, as an activity monitor shows it. Not the load average: that counts threads
+# waiting on disk too, and on macOS reads 100% on an idle machine. Quick: every run waits for it, since
+# it's taken before the steps start (alongside them it would count their work as the server's).
+cpu_busy() {
+  cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || cpus=""
+  if [ -r /proc/stat ]; then  # user nice system idle iowait irq softirq steal, a quarter second apart
+    stat1=$(sed -n 's/^cpu  *//p' /proc/stat); sleep 0.25; stat2=$(sed -n 's/^cpu  *//p' /proc/stat)
+    cpu=$(printf '%s\n%s\n' "$stat1" "$stat2" | awk '{for (i = 1; i <= 8 && i <= NF; i++) { t[NR] += $i } idle[NR] = $4 + $5}
+      END {if (t[2] > t[1]) printf "%d%%", 100 * (1 - (idle[2] - idle[1]) / (t[2] - t[1])) + 0.5}') || cpu=""
+  else  # macOS: ps's %cpu is already an average over the last seconds
+    cpu=$(ps -A -o %cpu= 2>/dev/null | awk -v n="${cpus:-1}" '{s += $1} END {if (NR) printf "%d%%", s / n + 0.5}') || cpu=""
+  fi
+}
+# The rest of the machine's line, beside the steps.
 system_info() {
   info="" sysctl=$(command -v sysctl || echo /usr/sbin/sysctl)  # macOS: not on a non-login PATH
-  if [ -r /proc/loadavg ]; then read -r load rest < /proc/loadavg
-  else load=$($sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}') || load=""; fi
-  [ -z "$load" ] || info="load $load"
-  cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || cpus=""
+  [ -z "$cpu" ] || info="cpu $cpu"
   [ -z "$cpus" ] || info="${info}${info:+ · }cpus $cpus"
   disk=$(df -P "$HOME" 2>/dev/null | awk 'NR==2 {print $5}') || disk=""
   [ -z "$disk" ] || info="${info}${info:+ · }disk $disk"
@@ -325,7 +336,9 @@ rollback_step() {
   event rollback "T3: $after -> $before"
   event done 'Rollback: OK'
 }
-system_info || true
+cpu="" cpus=""
+cpu_busy || true
+system_info &
 names='T3 Codex Claude OpenCode Grok Pi'
 # On t3up's own machine T3 is the desktop app, which t3up updates itself: providers only.
 [ -z "${T3UP_LOCAL:-}" ] || names='Codex Claude OpenCode Grok Pi'

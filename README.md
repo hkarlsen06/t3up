@@ -33,10 +33,14 @@ You can update one server or all of them without leaving the terminal.
   how long it's valid. Anything unexpected still has **t: open in terminal**.
 - **No agent on the server.** It runs a POSIX `sh` script over plain SSH. Nothing to install remotely.
 - **Scriptable.** `--check` and `--update` give plain output and an exit code, for cron or CI.
-- **This machine too.** It gets its own card, top left: its providers, CPU and disk, and the T3 Code desktop app
+- **This machine too.** It gets its own row, at the top: its providers, CPU and disk, and the T3 Code desktop app
   (macOS) as its T3, which t3up can update as well.
+- **Only what's needed, fast.** **Update all** updates just the tools each server is behind on and leaves current
+  servers alone; only servers whose T3 changes wait for the first one. Runs on a server share one SSH connection,
+  and a timer over the button shows how long updating everyone took.
 - **Alive.** A pixel-art intro rolls in while the first check runs, versions decode in as servers report,
-  light runs around the border of a server that's busy, and finished cards glow green or red.
+  light runs along the lines around a server that's busy, and finished rows flash: blue for a check, green
+  for an update, red for a failure.
   Set `T3UP_NO_MOTION=1` for a still dashboard.
 - **One small binary.** Written in Rust with [ratatui](https://ratatui.rs). Starts instantly, and shows the
   tools' logos in terminals with a graphics protocol (Ghostty, kitty, WezTerm, iTerm2).
@@ -89,7 +93,7 @@ Run `t3up` with no arguments to open the dashboard.
 | Click a tool | That tool on that server: sign in, update, what's new, remove (T3: pairing link) |
 | <kbd>←</kbd> <kbd>↑</kbd> <kbd>↓</kbd> <kbd>→</kbd> / <kbd>j</kbd> <kbd>k</kbd> | Move between servers |
 | <kbd>u</kbd> | Update menu for the selected server |
-| <kbd>a</kbd> | Update all servers (the first one alone first) |
+| <kbd>a</kbd> | Update menu for all servers (the **Update all** button updates everything that's behind) |
 | <kbd>r</kbd> | Check every server again |
 | <kbd>c</kbd> | What's new: release notes of the updates waiting on the selected server |
 | <kbd>v</kbd> | Pin the T3 version updates install (blank means the latest nightly) |
@@ -103,10 +107,11 @@ Run `t3up` with no arguments to open the dashboard.
 | <kbd>?</kbd> | All keys |
 | <kbd>q</kbd> | Quit |
 
-Each card shows a server's tools, their versions and any newer release (`→ 0.161.0`), tools that need you to
-sign in, the server's CPU, disk and uptime, and how many agents are running on it. It shows only what's out of
-the ordinary: a healthy server says nothing. Cards are as wide as their tools, busiest servers (most T3 threads)
-first.
+The dashboard is a table: each tool's logo heads its column with the newest version under it, and each server
+is a row with its versions in those columns (blue with `↑` when there's newer, green `✓` once updated), tools that
+need you to sign in, its CPU, disk and uptime, and how many agents are running on it. It shows only what's out of
+the ordinary: a healthy server says nothing. Busiest servers (most T3 threads) come first. **Update all** says how
+many servers it will update; its `⋯` opens the menu of what to update.
 
 A server's menu lists what's installed on it. **Everything** updates T3 and all of those. To add something, open
 the **Installer** (in the menu, with <kbd>i</kbd>, or by typing "install" in the palette) and tick what you want:
@@ -114,7 +119,7 @@ T3 and any of the five providers, each set up with its own official installer (C
 and Pi all have one), so a new machine needs nothing but SSH and curl. Pi needs Node.js, so t3up adds the official build for it
 (checked against its SHA-256); T3 needs `libatomic`, which t3up adds with `apt`/`dnf` when sudo needs no password.
 
-To remove a provider, click it on its card and choose **Remove**. It goes the way it came (its package manager,
+To remove a provider, click it in its server's row and choose **Remove**. It goes the way it came (its package manager,
 or its own uninstaller), and its settings and sign-in stay, so the Installer can put it back as it was.
 
 ### Headless

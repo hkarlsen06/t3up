@@ -137,7 +137,7 @@ pub enum Event {
     Version(String),
     /// `@@t3up busy N`: agent processes running under the T3 server right now.
     Busy(u32),
-    /// `@@t3up sys TEXT`: one line about the machine, e.g. 'load 0.24 · cpus 4 · disk 21% · up 1d 5h'.
+    /// `@@t3up sys TEXT`: one line about the machine, e.g. 'cpu 6% · cpus 4 · disk 21% · up 1d 5h'.
     Sys(String),
     /// `@@t3up rollback DETAIL`, e.g. 'T3: 0.0.47 -> 0.0.46': health failed after an update, so
     /// T3 was put back. The run still fails.

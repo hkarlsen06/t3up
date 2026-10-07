@@ -108,7 +108,10 @@ pub struct Toast {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
     Card(usize),
+    /// The Update all button: updates everything everywhere.
     UpdateAll,
+    /// The '⋯' at its right end: the menu of what to update.
+    UpdateMenu,
     Output,
     /// A row of the open menu, palette or confirm dialog.
     Row(usize),
@@ -324,7 +327,22 @@ struct Canary {
     host: String,
     started: Instant,
     version: String,
-    only: String,
+    /// What each server waiting on it updates.
+    only: HashMap<String, String>,
+}
+
+/// Updating every server, timed from the start to the last one back (the desktop app's update included).
+#[derive(Debug, Clone)]
+pub struct Rollout {
+    pub started: Instant,
+    hosts: Vec<String>,
+    /// How long it took and whether any server failed, once everything's back.
+    pub took: Option<(Duration, bool)>,
+}
+
+/// Whether an update of `only` (components, comma-separated) reaches T3.
+fn touches_t3(only: &str) -> bool {
+    only.split(',').any(|o| o == "all" || o == "t3")
 }
 
 /// Where the mouse rests: a tooltip shows once it has been still for a moment.
@@ -356,6 +374,8 @@ pub struct App {
     /// Servers waiting for the canary.
     pub queued: HashSet<String>,
     canary: Option<Canary>,
+    /// The last update of every server, over the Update all button.
+    pub rollout: Option<Rollout>,
     pub changelogs: HashMap<ChangeKey, Result<Vec<Release>, String>>,
     pub size: (u16, u16),
     pub started: Instant,
@@ -403,6 +423,7 @@ impl App {
             toasts: vec![],
             queued: HashSet::new(),
             canary: None,
+            rollout: None,
             changelogs: HashMap::new(),
             size: (100, 30),
             started: Instant::now(),
@@ -610,8 +631,11 @@ impl App {
             let text = format!("Already running: {}", running.join(", "));
             self.toast(Sev::Warning, "Warning", text);
         }
-        self.fx.push(Effect::RefreshDesktop);
-        self.fx.push(Effect::FetchLatest);
+        // Once per batch: a rollout starts its servers one by one.
+        if !self.fx.iter().any(|e| matches!(e, Effect::FetchLatest)) {
+            self.fx.push(Effect::RefreshDesktop);
+            self.fx.push(Effect::FetchLatest);
+        }
         for name in names {
             self.queued.remove(&name);
             let Some(h) = self.hosts.iter_mut().find(|h| h.name == name) else { continue };
@@ -634,16 +658,46 @@ impl App {
         self.dirty = true;
     }
 
+    /// What to update on each of `names`, in card order: `only` as asked, except that everything ('all')
+    /// narrows to what each server is behind on. Nothing current is reinstalled, and a server with nothing
+    /// to bring forward is left alone. One never checked, or with no newest versions known, gets everything.
+    fn plan(&self, names: &[String], only: &str) -> Vec<(String, String)> {
+        let unknown = self.latest.is_empty() && self.target.is_empty();
+        self.hosts
+            .iter()
+            .filter(|h| names.contains(&h.name))
+            .filter_map(|h| {
+                if only != "all" || unknown || h.current.is_empty() {
+                    return Some((h.name.clone(), only.to_string()));
+                }
+                let mut parts: Vec<String> = updates(h, &self.latest, &self.target)
+                    .into_iter()
+                    .filter(|(n, _)| !(h.local && n == "T3"))
+                    .map(|(n, _)| n.to_lowercase())
+                    .collect();
+                // Everything installs T3 where it's missing; this machine's T3 is the desktop app.
+                if no_t3(h) || h.local && !self.outdated_desktop().is_empty() {
+                    parts.insert(0, "t3".into());
+                }
+                (!parts.is_empty()).then(|| (h.name.clone(), parts.join(",")))
+            })
+            .collect()
+    }
+
     /// Update `names` (by name). If it would restart T3 on a server with agents running, ask first.
     pub fn begin_update(&mut self, names: Vec<String>, only: &str) {
-        let touches_t3 = only.split(',').any(|o| o == "all" || o == "t3");
+        let plan = self.plan(&names, only);
+        if plan.is_empty() {
+            self.toast(Sev::Info, "Up to date", "Nothing to update: everything runs the newest there is.");
+            return;
+        }
         let busy: Vec<(String, u32)> = self
             .hosts
             .iter()
-            .filter(|h| names.contains(&h.name))
+            .filter(|h| plan.iter().any(|(n, o)| *n == h.name && touches_t3(o)))
             .filter_map(|h| h.busy.filter(|&n| n > 0).map(|n| (h.name.clone(), n)))
             .collect();
-        if touches_t3 && !busy.is_empty() {
+        if !busy.is_empty() {
             let only = only.into();
             self.open_modal(Modal::Confirm(Confirm { names, only, busy, cursor: 1, remove: false }));
             return;
@@ -651,20 +705,24 @@ impl App {
         self.run_update(names, only);
     }
 
-    fn run_update(&mut self, mut names: Vec<String>, only: &str) {
+    fn run_update(&mut self, names: Vec<String>, only: &str) {
+        let mut plan = self.plan(&names, only);
+        let everyone = self.hosts.iter().all(|h| names.contains(&h.name));
+        let timed =
+            Rollout { started: Instant::now(), hosts: plan.iter().map(|(n, _)| n.clone()).collect(), took: None };
         // This machine isn't part of a rollout: it starts now, and its T3 is the desktop app's update.
-        if let Some(i) = names.iter().position(|n| self.hosts.iter().any(|h| h.local && h.name == *n)) {
-            let local = names.remove(i);
-            if only == "t3" || only.split(',').any(|o| o == "all" || o == "t3") && !self.outdated_desktop().is_empty() {
+        if let Some(i) = plan.iter().position(|(n, _)| self.is_local(n)) {
+            let (local, only) = plan.remove(i);
+            if only == "t3" || touches_t3(&only) && !self.outdated_desktop().is_empty() {
                 self.update_desktop();
             }
             if only != "t3" {
-                self.start(vec![local], Mode::Update, only);
-            }
-            if names.is_empty() {
-                return;
+                self.start(vec![local], Mode::Update, &only);
             }
         }
+        // The canary guards T3 (a bad build fails its health check): servers whose T3 stays start now.
+        let (t3, rest): (Vec<_>, Vec<_>) = plan.into_iter().partition(|(_, o)| touches_t3(o));
+        let names: Vec<String> = t3.iter().map(|(n, _)| n.clone()).collect();
         let at = self.canary_of(&names);
         if names.len() > 1 && self.is_running(&names[at]) {
             self.toast(
@@ -674,17 +732,40 @@ impl App {
             );
             return;
         }
+        for (name, only) in rest {
+            self.start(vec![name], Mode::Update, &only);
+        }
         if names.len() > 1 {
             // Canary: one server alone; the rest start when it comes back healthy.
-            let first = names.remove(at);
-            self.start(vec![first.clone()], Mode::Update, only);
+            let (first, first_only) = t3[at].clone();
+            self.start(vec![first.clone()], Mode::Update, &first_only);
             if let Some(h) = self.hosts.iter().find(|h| h.name == first && h.running() && h.mode == Mode::Update) {
-                self.canary =
-                    Some(Canary { host: first, started: h.started, version: self.target.clone(), only: only.into() });
+                let only = t3.into_iter().filter(|(n, _)| *n != first).collect();
+                self.canary = Some(Canary { host: first, started: h.started, version: self.target.clone(), only });
                 self.queued = names.into_iter().filter(|n| !self.is_running(n)).collect();
             }
         } else {
-            self.start(names, Mode::Update, only);
+            for (name, only) in t3 {
+                self.start(vec![name], Mode::Update, &only);
+            }
+        }
+        if everyone {
+            self.rollout = Some(timed);
+            self.settle_rollout();
+        }
+    }
+
+    /// Stop the rollout's clock once all its servers are back, and the desktop app too.
+    fn settle_rollout(&mut self) {
+        let Some(r) = self.rollout.as_ref().filter(|r| r.took.is_none()) else { return };
+        let host = |n: &String| self.hosts.iter().find(|h| h.name == *n);
+        let busy = self.desktop_updating
+            || self.canary.is_some()
+            || r.hosts.iter().any(|n| self.queued.contains(n) || host(n).is_some_and(Host::running));
+        if !busy {
+            let failed = r.hosts.iter().any(|n| host(n).is_some_and(|h| h.status == Status::Failed));
+            let took = r.started.elapsed();
+            self.rollout.as_mut().unwrap().took = Some((took, failed));
         }
     }
 
@@ -722,9 +803,10 @@ impl App {
     pub fn on_job(&mut self, host: &str, event: Event) {
         let Some(i) = self.hosts.iter().position(|h| h.name == host) else { return }; // removed mid-run
         let exit = matches!(event, Event::Exit { .. });
-        if let Event::Done(detail) = &event {
-            let tool = detail.split(':').next().unwrap_or("");
-            self.motion.arrive(host, tool);
+        match &event {
+            Event::Done(detail) => self.motion.arrive(host, detail.split(':').next().unwrap_or("")),
+            Event::Sys(_) => self.motion.arrive(host, "sys"), // the meters grow in
+            _ => {}
         }
         let added = self.hosts[i].apply(event).is_some();
         if added && i == self.selected && self.out_scroll > 0 {
@@ -745,7 +827,13 @@ impl App {
         }
         let canary = self.canary.take_if(|c| c.host == h.name && c.started == h.started && h.mode == Mode::Update);
         let failed = h.status == Status::Failed;
-        self.motion.pulse(&h.name, if failed { RED } else { GREEN });
+        // Green means something changed; a check that went well only says it looked, in blue.
+        let color = match (failed, h.mode) {
+            (true, _) => RED,
+            (false, Mode::Check) => ACCENT,
+            (false, _) => GREEN,
+        };
+        self.motion.pulse(&h.name, color);
         if let Some(c) = canary {
             if failed {
                 self.queued.clear();
@@ -755,7 +843,10 @@ impl App {
                 let rest: Vec<String> =
                     self.hosts.iter().map(|x| x.name.clone()).filter(|n| self.queued.contains(n)).collect();
                 self.queued.clear();
-                self.start_version(rest, Mode::Update, &c.only, &c.version);
+                for name in rest {
+                    let only = c.only.get(&name).map_or("all", String::as_str);
+                    self.start_version(vec![name], Mode::Update, only, &c.version);
+                }
             }
         } else if failed {
             self.toast(Sev::Error, "Failed", format!("{}: {}", h.name, h.error));
@@ -796,6 +887,7 @@ impl App {
             self.fx.push(Effect::SaveThreads(self.threads.clone()));
             self.reorder();
         }
+        self.settle_rollout();
     }
 
     /// A background task finished.
@@ -814,6 +906,7 @@ impl App {
             Res::DesktopSay(text) => self.toast(Sev::Info, "Desktop", text),
             Res::DesktopDone(result) => {
                 self.desktop_updating = false;
+                self.settle_rollout();
                 self.fx.push(Effect::RefreshDesktop);
                 match result {
                     Ok(version) => {
@@ -1098,26 +1191,13 @@ impl App {
         self.dirty = true;
     }
 
-    /// Spatial move: left and right go through the cards in order; up and down to the nearest card in
-    /// the row above or below, else the first or last card.
+    /// Move through the cards, one column of them: any arrow steps to the next or previous.
     fn go(&mut self, dx: isize, dy: isize) {
         if self.hosts.is_empty() {
             return;
         }
-        let last = self.hosts.len() - 1;
-        let g = view::geometry(self);
-        let next = if dy == 0 {
-            (self.selected as isize + dx).clamp(0, last as isize) as usize
-        } else {
-            let at = g.cards[self.selected];
-            let row = at.y as i32 + dy as i32 * (g.card_h as i32 + 1);
-            let middle = |c: &Rect| c.x as i32 * 2 + c.width as i32;
-            (0..=last)
-                .filter(|&i| g.cards[i].y as i32 == row)
-                .min_by_key(|&i| (middle(&g.cards[i]) - middle(&at)).abs())
-                .unwrap_or(if dy > 0 { last } else { 0 })
-        };
-        self.select(next);
+        let next = (self.selected as isize + dx + dy).clamp(0, self.hosts.len() as isize - 1);
+        self.select(next as usize);
     }
 
     pub fn refresh(&mut self) {
@@ -1860,7 +1940,8 @@ impl App {
                     self.open_actions();
                 }
                 Some(Hit::Tool(i, name)) => self.open_tool(i, name),
-                Some(Hit::UpdateAll) => self.open_update_all(),
+                Some(Hit::UpdateAll) => self.begin_update(self.names(), "all"),
+                Some(Hit::UpdateMenu) => self.open_update_all(),
                 _ => {}
             }
             return;
@@ -2177,7 +2258,7 @@ mod tests {
         let tile = a.hits.iter().find(|(_, h)| *h == Hit::Tool(1, "Codex")).expect("a tile to tap").0;
         a.on_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: tile.x + 1,
+            column: tile.x,
             row: tile.y,
             modifiers: KeyModifiers::NONE,
         });
@@ -2356,6 +2437,74 @@ mod tests {
     }
 
     #[test]
+    fn everything_updates_only_what_each_server_is_behind_on() {
+        let mut a = app(&["a", "b", "c", "d"]);
+        settle(&mut a);
+        let t3 = "0.0.46-nightly.20261003.2623";
+        for h in &mut a.hosts {
+            h.current = HashMap::from([("T3".into(), t3.into()), ("Codex".into(), "1.0.0".into())]);
+        }
+        a.hosts[3].current.clear(); // never checked: everything
+        a.latest = HashMap::from([("T3".into(), t3.into()), ("Codex".into(), "1.0.0".into())]);
+        a.hosts[1].current.insert("Codex".into(), "0.9.0".into());
+        a.hosts[2].current.insert("T3".into(), "0.0.46-nightly.20261001.2600".into());
+        a.begin_update(a.names(), "all");
+        // a is current: left alone. b's T3 stays, so it doesn't wait for the canary; c and d update T3.
+        let started = jobs(a.take_effects());
+        assert_eq!(started[0], ("b".into(), Mode::Update, "codex".into()));
+        assert_eq!(started.len(), 2, "{started:?}");
+        assert_eq!(a.queued.len(), 1);
+        let (canary, waiting) = if started[1].0 == "c" { ("c", "d") } else { ("d", "c") };
+        assert_eq!(started[1].2, if canary == "c" { "t3" } else { "all" });
+        done(&mut a, canary, true);
+        let rest = jobs(a.take_effects());
+        assert_eq!(rest, [(waiting.to_string(), Mode::Update, if waiting == "c" { "t3" } else { "all" }.to_string())]);
+        // Nothing behind anywhere: nothing runs.
+        a.hosts
+            .iter_mut()
+            .for_each(|h| h.current = HashMap::from([("T3".into(), t3.into()), ("Codex".into(), "1.0.0".into())]));
+        settle(&mut a);
+        a.take_effects();
+        a.begin_update(a.names(), "all");
+        assert!(jobs(a.take_effects()).is_empty());
+        assert_eq!(a.toasts.last().unwrap().title, "Up to date");
+    }
+
+    #[test]
+    fn updating_everyone_is_timed_over_the_button_until_the_last_is_back() {
+        let mut a = app(&["a", "b", "c"]);
+        settle(&mut a);
+        a.begin_update(vec!["a".into()], "t3");
+        assert!(a.rollout.is_none(), "one server isn't everyone");
+        done(&mut a, "a", true);
+        a.begin_update(a.names(), "t3");
+        assert!(has(&frame(&mut a, 100, 30), "updating · 0s"));
+        let canary = jobs(a.take_effects())[0].0.clone();
+        done(&mut a, &canary, true);
+        assert!(a.rollout.as_ref().unwrap().took.is_none(), "the rest are still to go");
+        for n in ["a", "b", "c"].into_iter().filter(|n| *n != canary) {
+            done(&mut a, n, n != "c");
+        }
+        assert!(matches!(a.rollout.as_ref().unwrap().took, Some((_, true))), "c failed");
+        assert!(has(&frame(&mut a, 100, 30), "✗ done in 0s"));
+    }
+
+    #[test]
+    fn a_check_flashes_blue_an_update_green_a_failure_red() {
+        let mut a = app(&["a"]);
+        a.motion.on = true;
+        let flash = |a: &App| a.motion.pulses["a"].1;
+        done(&mut a, "a", true); // the check t3up starts with
+        assert_eq!(flash(&a), ACCENT);
+        a.begin_update(a.names(), "codex");
+        done(&mut a, "a", true);
+        assert_eq!(flash(&a), GREEN);
+        a.begin_update(a.names(), "codex");
+        done(&mut a, "a", false);
+        assert_eq!(flash(&a), RED);
+    }
+
+    #[test]
     fn failed_canary_cancels_the_queue() {
         let mut a = app(&["a", "b"]);
         settle(&mut a);
@@ -2456,11 +2605,16 @@ mod tests {
         let row = a.hits.iter().find(|(_, h)| *h == Hit::Row(3)).unwrap().0; // Codex
         click(&mut a, row.x + 4, row.y);
         assert_eq!(jobs(a.take_effects()), vec![("second".into(), Mode::Update, "codex".into())]);
-        // The Update all button.
+        // The Update all button updates everything, the canary first; its '⋯' opens the menu.
         settle(&mut a);
         frame(&mut a, 100, 30);
-        let button = a.hits.iter().find(|(_, h)| *h == Hit::UpdateAll).unwrap().0;
-        click(&mut a, button.x + 2, button.y + 1);
+        let button = |a: &App, hit| a.hits.iter().find(|(_, h)| *h == hit).unwrap().0;
+        let main = button(&a, Hit::UpdateAll);
+        click(&mut a, main.x + 2, main.y + 1);
+        assert!(a.modal.is_none());
+        assert_eq!(jobs(a.take_effects()), vec![("first".into(), Mode::Update, "all".into())]);
+        let more = button(&a, Hit::UpdateMenu);
+        click(&mut a, more.x + 2, more.y + 1);
         assert_eq!(menu(&a).heading.to_string(), "All servers   2 · first first");
     }
 
@@ -2480,27 +2634,20 @@ mod tests {
     }
 
     #[test]
-    fn grid_navigation_on_two_columns_and_two_rows() {
+    fn arrows_and_jk_move_through_the_cards() {
         let mut a = app(&["first", "second", "third"]);
-        a.on_resize(140, 30); // two cards of six tools side by side
-        assert_eq!(crate::tui::view::geometry(&a).cols(), 2);
+        a.on_resize(140, 30);
         assert_eq!(a.selected, 0);
         code(&mut a, KeyCode::Down);
-        assert_eq!(a.selected, 2);
-        code(&mut a, KeyCode::Up);
-        assert_eq!(a.selected, 0);
+        assert_eq!(a.selected, 1);
         code(&mut a, KeyCode::Right);
-        code(&mut a, KeyCode::Down); // nothing below `second`: clamps to the last card
+        code(&mut a, KeyCode::Down); // the last: stays
         assert_eq!(a.selected, 2);
-        press(&mut a, "k");
+        press(&mut a, "kk");
         assert_eq!(a.selected, 0);
         code(&mut a, KeyCode::Left);
         assert_eq!(a.selected, 0);
-        press(&mut a, "jj");
-        assert_eq!(a.selected, 2);
-        a.on_resize(60, 24);
-        assert_eq!(crate::tui::view::geometry(&a).cols(), 1);
-        code(&mut a, KeyCode::Up);
+        press(&mut a, "j");
         assert_eq!(a.selected, 1);
     }
 
@@ -2514,7 +2661,7 @@ mod tests {
         assert_eq!(a.selected, 5);
         assert!(a.scroll > 0);
         let buf = frame(&mut a, 60, 20);
-        assert!(has(&buf, "─ f ─") || has(&buf, "╭ f "), "{:?}", crate::tui::snap::text(&buf));
+        assert!(crate::tui::snap::text(&buf).iter().any(|r| r.contains(" f ") && r.contains("┆")));
     }
 
     #[test]
@@ -2700,7 +2847,7 @@ mod tests {
         a.show_local();
         a.select(2); // b
         for (host, n) in [("a", 3), ("b", 40), ("c", 7), ("mac", 900)] {
-            a.on_job(host, Event::Sys(format!("load 0.1 · up 1d · threads {n}")));
+            a.on_job(host, Event::Sys(format!("cpu 3% · up 1d · threads {n}")));
             a.on_job(host, Event::Complete);
             a.on_job(host, Event::Exit { code: Some(0), error: None });
         }
@@ -2737,7 +2884,9 @@ mod tests {
         a.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
         press(&mut a, "upd codex");
         code(&mut a, KeyCode::Enter);
-        assert_eq!(jobs(a.take_effects())[0], ("alpha".into(), Mode::Update, "codex".into()), "the canary goes first");
+        // Codex alone: T3 stays, so there's no canary to wait for.
+        let both = vec![("alpha".into(), Mode::Update, "codex".into()), ("beta".into(), Mode::Update, "codex".into())];
+        assert_eq!(jobs(a.take_effects()), both);
     }
 
     #[test]
@@ -2803,9 +2952,10 @@ mod tests {
         let fx = a.take_effects();
         assert!(fx.iter().any(|e| matches!(e, Effect::UpdateDesktop)));
         assert!(a.desktop_updating);
-        // This machine's providers start now, beside the canary; it's never queued behind it.
+        // This machine is never queued behind the canary; with its providers current, its desktop app is
+        // all it updates.
         let started: Vec<String> = jobs(fx).into_iter().map(|j| j.0).collect();
-        assert_eq!(started, ["mac", "a"]);
+        assert_eq!(started, ["a"]);
         assert_eq!(a.queued, HashSet::from(["b".to_string()]));
         // The desktop's update shows on its tile.
         a.on_result(Res::DesktopDone(Ok("0.0.46-nightly.20261003.2632".into())));

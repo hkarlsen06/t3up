@@ -34,6 +34,37 @@ pub fn ssh_program() -> String {
     std::env::var("T3UP_SSH").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "ssh".into())
 }
 
+/// ssh options that let runs on one server share its connection: the first opens it and keeps it 60s past
+/// its last use, so the next check, update or sign-in skips the handshake. Options on the command line, so
+/// it needs nothing in anyone's ssh config. None without a good place for the sockets: private, a socket's
+/// path at most ~104 bytes (macOS), and nothing ssh would split the option's value at.
+pub static SHARED: LazyLock<Vec<String>> = LazyLock::new(|| shared(&crate::config::state_dir().join("ssh")));
+
+#[cfg(unix)]
+fn shared(dir: &std::path::Path) -> Vec<String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let path = dir.to_string_lossy().into_owned();
+    // %C: 40 hex characters, a hash of this machine, the server, its port and user.
+    if path.len() + 41 > 100 || path.contains(|c: char| c.is_whitespace() || "%\"'\\".contains(c)) {
+        return vec![];
+    }
+    let private = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).is_ok()
+        && std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).is_ok();
+    if !private {
+        return vec![];
+    }
+    ["ControlMaster=auto".to_string(), format!("ControlPath={path}/%C"), "ControlPersist=60".into()]
+        .into_iter()
+        .flat_map(|o| ["-o".to_string(), o])
+        .collect()
+}
+
+/// Windows' OpenSSH can't share connections.
+#[cfg(not(unix))]
+fn shared(_: &std::path::Path) -> Vec<String> {
+    vec![]
+}
+
 static TAG: LazyLock<Regex> = LazyLock::new(|| {
     let names = model::COMPONENTS.iter().map(|(n, _)| regex::escape(n)).collect::<Vec<_>>().join("|");
     Regex::new(&format!("^({names})\\| ?(.*)")).unwrap()
@@ -137,7 +168,7 @@ pub async fn run_job(job: Job, tx: Sender) {
         } else {
             let remote = shlex::try_join(args).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
             let mut command = tokio::process::Command::new(ssh_program());
-            command.args([
+            command.args(SHARED.iter()).args([
                 "-o",
                 "BatchMode=yes",
                 "-o",
@@ -190,6 +221,21 @@ pub async fn run_job(job: Job, tx: Sender) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn connections_are_shared_from_a_private_short_place_or_not_at_all() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::path::PathBuf::from(format!("/tmp/t3up-ssh-{}", std::process::id()));
+        let opts = shared(&dir.join("ssh"));
+        assert_eq!(opts[..2], ["-o", "ControlMaster=auto"]);
+        assert!(opts.contains(&format!("ControlPath={}/ssh/%C", dir.display())));
+        assert_eq!(std::fs::metadata(dir.join("ssh")).unwrap().permissions().mode() & 0o777, 0o700);
+        // Too long for a socket, or a path ssh would split: plain connections.
+        assert!(shared(&dir.join("x".repeat(60))).is_empty());
+        assert!(shared(&dir.join("with space")).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn overlong_lines() {

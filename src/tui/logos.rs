@@ -15,7 +15,7 @@ use ratatui::style::Color;
 
 use super::theme::{BG, blend, rgb};
 
-/// The widest a logo may be, in cells; every tile is this wide (`view::TILE`).
+/// The widest a logo may be, in cells (`view::TILE`).
 const MAX_WIDTH: u16 = 9;
 pub const HEIGHT: u16 = 2;
 

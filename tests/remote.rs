@@ -239,7 +239,11 @@ esac"#
         r#"case $1 in show-user) echo "Linger=$(cat "$HOME/linger" 2>/dev/null || echo no)";; enable-linger) echo yes > "$HOME/linger";; esac"#,
     );
     tool(&home, ".local/bin/sudo", r#"shift; exec "$@""#);
-    tool(&home, ".local/bin/ps", r#"cat "$HOME/ps-output" 2>/dev/null"#);
+    tool(
+        &home,
+        ".local/bin/ps",
+        r#"case "$*" in *%cpu*) printf ' 12.0\n 6.0\n' ;; *) cat "$HOME/ps-output" 2>/dev/null ;; esac"#,
+    );
     tool(
         &home,
         ".local/bin/sleep",
@@ -261,7 +265,7 @@ exec /bin/sleep "$@""#,
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, Event::Sys(s) if s.contains("disk ") && s.contains("cpus ") && s.contains("up ")))
+            .any(|e| matches!(e, Event::Sys(s) if s.contains("cpu ") && s.contains("disk ") && s.contains("cpus ") && s.contains("up ")))
     );
 
     // T3's threads, not counting deleted ones, from its database (sqlite3 here; Python where that's missing).

@@ -181,7 +181,11 @@ fn start_flow(
         let say = |text: String| drop(res.send(Res::FlowOut { id, text }));
         let ssh = job::ssh_program();
         let argv: Vec<&str> = match (local, cfg!(target_os = "macos")) {
-            (false, _) => vec![&ssh, "-tt", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", &host, &command],
+            (false, _) => [&ssh, "-tt"]
+                .into_iter()
+                .chain(job::SHARED.iter().map(String::as_str))
+                .chain(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", &host, &command])
+                .collect(),
             (true, true) => vec!["script", "-q", "/dev/null", "sh", "-c", &command],
             (true, false) => vec!["script", "-qfec", &command, "/dev/null"],
         };

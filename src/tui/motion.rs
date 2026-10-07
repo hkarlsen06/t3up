@@ -98,6 +98,14 @@ impl Motion {
             .collect()
     }
 
+    /// How far in a meter has grown, 0 to 1, since `key` arrived for `host`.
+    pub fn grown(&self, host: &str, key: &str) -> f32 {
+        match self.arrived.get(&(host.to_string(), key.to_string())) {
+            Some(at) if self.on => ease_out(at.elapsed().as_secs_f32() / DECODE),
+            _ => 1.0,
+        }
+    }
+
     /// Whether anything is mid-animation (beyond the always-on dust): the caller redraws faster.
     pub fn busy(&self) -> bool {
         self.on
@@ -310,7 +318,7 @@ pub fn dust(buf: &mut Buffer, area: Rect, solid: &[Rect], t: f32) {
 // ── on cards ───────────────────────────────────────────────────────────────
 
 fn is_border(symbol: &str) -> bool {
-    matches!(symbol, "─" | "│" | "╭" | "╮" | "╰" | "╯")
+    matches!(symbol, "─" | "│" | "╭" | "╮" | "╰" | "╯" | "━" | "┆" | "┼" | "┿" | "┴" | "┷")
 }
 
 /// The border cells of `area`, clockwise from the top-left corner.
@@ -323,28 +331,31 @@ fn perimeter(area: Rect) -> Vec<(u16, u16)> {
     p
 }
 
-/// Light running around a card's border while its job runs (two when it updates); slower and
-/// softer (`strength` < 1) as the selected card's idle gleam.
-pub fn comet(buf: &mut Buffer, t: f32, color: Color, heads: usize, speed: f32, strength: f32) {
-    let area = buf.area;
-    if area.width < 3 || area.height < 3 {
-        return;
-    }
-    let path = perimeter(area);
-    let len = path.len() as f32;
-    let tail = (len / 4.0).clamp(8.0, 28.0);
+/// Light running left to right along the rule in the top row of `area` (`heads` of it, evenly apart),
+/// `speed` cells a second, fading in at `strength`. Called on the rules over and under a row together,
+/// so they light up side by side, framing it: a job runs there (two when it updates), or it's selected.
+pub fn streak(buf: &mut Buffer, area: Rect, t: f32, color: Color, heads: usize, speed: f32, strength: f32) {
+    let tail = (area.width as f32 / 4.0).clamp(8.0, 28.0);
+    let len = area.width as f32 + tail; // the light leaves on the right before it comes in on the left
     for k in 0..heads {
         let head = (t * speed + len * k as f32 / heads as f32).rem_euclid(len);
         for d in 0..tail as usize {
-            let idx = (head - d as f32).rem_euclid(len) as usize;
-            let (x, y) = path[idx];
-            if let Some(cell) = buf.cell_mut((x, y)).filter(|c| is_border(c.symbol())) {
+            let x = head - d as f32;
+            if x < 0.0 || x >= area.width as f32 {
+                continue;
+            }
+            if let Some(cell) = buf.cell_mut((area.x + x as u16, area.y)).filter(|c| is_border(c.symbol())) {
                 let k = (1.0 - d as f32 / tail).powf(1.3) * strength;
                 let lit = if d < 2 { blend(WHITE, color, 0.8) } else { color };
                 cell.set_fg(blend(lit, cell.fg, k));
             }
         }
     }
+}
+
+/// Color of a check vs an update in motion: teal for a look, amber for a change.
+pub fn running_color(update: bool) -> Color {
+    if update { AMBER } else { TEAL }
 }
 
 /// A band of light sweeping across the text in row `y` of `area`, once per `period` seconds.
@@ -358,22 +369,6 @@ pub fn shimmer(buf: &mut Buffer, area: Rect, y: u16, t: f32, period: f32) {
             let d = (x - area.x) as f32 - pos;
             let k = (-d * d / 10.0).exp();
             cell.set_fg(blend(WHITE, cell.fg, k * 0.85));
-        }
-    }
-}
-
-/// A light sweeping across a painted background (the badge), now and then.
-pub fn sweep_bg(buf: &mut Buffer, area: Rect, t: f32, period: f32) {
-    let phase = t.rem_euclid(period);
-    if phase > 0.9 {
-        return;
-    }
-    let pos = phase / 0.9 * (area.width as f32 + 6.0) - 3.0;
-    for x in area.left()..area.right() {
-        if let Some(cell) = buf.cell_mut((x, area.y)) {
-            let d = (x - area.x) as f32 - pos;
-            let k = (-d * d / 3.0).exp() * 0.55;
-            cell.set_bg(blend(WHITE, cell.bg, k));
         }
     }
 }
@@ -408,14 +403,24 @@ pub fn breathe(t: f32) -> Color {
     blend(blend(WHITE, ACCENT, 0.45), ACCENT, 0.5 + 0.5 * (t * 2.4).sin())
 }
 
-/// Color of a check vs an update in motion: teal reads on any border, the accent one included.
-pub fn running_color(update: bool) -> Color {
-    if update { AMBER } else { TEAL }
+/// A wave of light running down `rows` rows every few seconds: how lit `row` is now, 0 to 1.
+pub fn ripple(t: f32, row: usize, rows: usize) -> f32 {
+    let pos = (t / 3.2).fract() * (rows as f32 + 4.0) - 2.0;
+    let d = pos - row as f32;
+    (-d * d / 0.9).exp()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ripple_reaches_the_rows_in_order() {
+        let peak = |row| {
+            (0..320).max_by(|&a, &b| ripple(a as f32 / 100.0, row, 5).total_cmp(&ripple(b as f32 / 100.0, row, 5)))
+        };
+        assert!(peak(0) < peak(2) && peak(2) < peak(4));
+    }
 
     #[test]
     fn decode_settles_and_hash_is_stable() {

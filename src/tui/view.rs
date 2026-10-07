@@ -19,31 +19,31 @@ use super::logos::{self, Logos};
 use super::motion;
 use super::theme::*;
 use crate::changelog::Release;
-use crate::model::{COMPONENTS, Host, Status, StepState, compact, newer, short, updates, versions_detail};
+use crate::model::{COMPONENTS, Host, Status, StepState, newer, short, updates, versions_detail};
 
-/// A tool's tile: its width, and the gap between tiles.
+/// A logo's width, in cells (`logos::MAX_WIDTH`).
 pub const TILE: u16 = 9;
-pub const GAP: u16 = 1;
-/// Rows of one tile: logo, version, note.
-const TILE_ROWS: u16 = logos::HEIGHT + 2;
+/// One tool's column: its dashed line, the cell a mark hangs in, its version centered, room after.
+const COL: u16 = 15;
 const HEADER: u16 = 3;
-/// Blank rows between a card's top border and its logos.
-const TOP_PAD: u16 = 1;
+/// The column heads: a blank row, logos, the newest versions under them, right on the first rule.
+const HEAD: u16 = logos::HEIGHT + 2;
 
 // ── geometry ───────────────────────────────────────────────────────────────
 
-/// Where the cards and the output panel go, from the screen size and what is in them.
+/// Where the column heads, the cards and the output panel go, from the screen size and what is in them.
 pub struct Geo {
-    /// Each card's place: x on screen, y down the (scrolled) content. All are `card_h` tall.
+    /// Each server's row: x on screen, y down the (scrolled) content. All are `card_h` tall: the rule
+    /// over it, then its line of versions, with a blank row above and below when there's room.
     pub cards: Vec<Rect>,
     pub card_h: u16,
-    /// A card too wide for the screen: every card full width, one per row, tiles wrapped.
-    pub wrapped: bool,
-    pub per_row: usize,
-    pub tile_rows: usize,
+    /// The rows and the rule that closes the table under the last.
     pub content_h: u16,
+    /// The logos over the columns; they stay put while the cards scroll under them.
+    pub head: Rect,
     pub view: Rect,
     pub out: Rect,
+    pub table: Table,
 }
 
 #[cfg(test)]
@@ -54,10 +54,49 @@ impl Geo {
     }
 }
 
-/// Columns between cards side by side.
-const GUTTER: u16 = 3;
+/// The columns every card shares, so versions line up down the screen: name, uptime, a column
+/// per tool any server has, then the CPU and disk meters. Offsets count from a card's left border.
+#[derive(Debug, Clone, Default)]
+pub struct Table {
+    name: u16,
+    /// 0 once there's no room for it.
+    up: u16,
+    tools: Vec<&'static str>,
+    col: u16,
+    /// Each meter's width; 0 once there's no room for them.
+    meter: u16,
+}
 
-/// The tools a card shows a tile for, in order.
+impl Table {
+    /// The name, after the server's status mark when it has one.
+    const NAME_X: u16 = 4;
+
+    fn up_x(&self) -> u16 {
+        Self::NAME_X + self.name + 2
+    }
+
+    fn tool_x(&self, k: usize) -> u16 {
+        self.up_x() + if self.up > 0 { self.up + 2 } else { 0 } + k as u16 * self.col
+    }
+
+    /// Where the CPU meter starts, past the last column's closing line; the disk meter follows two cells after it.
+    fn meter_x(&self) -> u16 {
+        self.tool_x(self.tools.len()) + 2
+    }
+
+    /// The columns' dashed lines: one opening each tool's column, one closing the last.
+    fn lines(&self) -> Vec<u16> {
+        if self.tools.is_empty() { vec![] } else { (0..=self.tools.len()).map(|k| self.tool_x(k)).collect() }
+    }
+
+    fn width(&self) -> u16 {
+        let end = if self.meter > 0 { self.meter_x() + 2 * self.meter + 2 } else { self.tool_x(self.tools.len()) };
+        // Room for a message where the columns would be (no T3, or no connection).
+        (end + 2).max(self.up_x() + 40)
+    }
+}
+
+/// The tools a card shows a version for, in order.
 fn present(h: &Host) -> Vec<&'static str> {
     COMPONENTS
         .iter()
@@ -66,58 +105,60 @@ fn present(h: &Host) -> Vec<&'static str> {
         .collect()
 }
 
-/// A card with a message where its tiles would be: no T3 there, or it never got as far as a step.
+/// A card with a message where its versions would be: no T3 there, or it never got as far as a step.
 fn message_card(h: &Host) -> bool {
     h.status == Status::Ok && crate::model::no_t3(h) || h.status == Status::Failed && h.steps.is_empty()
 }
 
-/// As wide as its own tiles, and wide enough for its name and meters (or its message).
-fn card_width(h: &Host) -> u16 {
-    if message_card(h) {
-        return 38;
+fn uptime(h: &Host) -> Option<&str> {
+    sys_parts(&h.sys).find(|(k, _)| *k == "up").map(|(_, v)| v)
+}
+
+/// The widest table that fits `avail`: narrower meters, columns too tight for a whole nightly (its build
+/// stays), no meters, no uptime, tighter columns still, shorter names. Past that, the rows clip on the right.
+fn table(app: &App, avail: u16) -> Table {
+    let tools = COMPONENTS
+        .iter()
+        .map(|(n, _)| *n)
+        .filter(|n| app.hosts.iter().any(|h| !message_card(h) && present(h).contains(n)))
+        .collect();
+    let name = app.hosts.iter().map(|h| h.name.width()).max().unwrap_or(0).clamp(6, 20) as u16;
+    let up = app.hosts.iter().filter_map(uptime).map(|u| u.width()).max().unwrap_or(0) as u16;
+    let mut t = Table { name, up, tools, col: COL, meter: 10 };
+    let shrink: [fn(&mut Table); 7] = [
+        |t| t.meter = 8,
+        |t| t.col = 13,
+        |t| t.meter = 6,
+        |t| t.meter = 0,
+        |t| t.up = 0,
+        |t| t.col = 12,
+        |t| t.name = t.name.min(10),
+    ];
+    for step in shrink {
+        if t.width() <= avail {
+            break;
+        }
+        step(&mut t);
     }
-    let n = present(h).len().max(1) as u16;
-    32.max(n * (TILE + GAP) - GAP + 4)
+    t
 }
 
 pub fn geometry(app: &App) -> Geo {
     let (w, h) = app.size;
     let body = h.saturating_sub(HEADER + 1);
     let out_h = if app.show_output { (body * 45 / 100).max(5).min(body) } else { 0 };
-    let view = Rect::new(0, HEADER, w, body - out_h);
+    let head_h = if app.hosts.is_empty() { 0 } else { HEAD.min(body - out_h) };
+    let head = Rect::new(0, HEADER, w, head_h);
+    let view = Rect::new(0, HEADER + head_h, w, body - out_h - head_h);
     let out = Rect::new(0, HEADER + body - out_h, w, out_h);
-    let avail = w.saturating_sub(4);
-    let mut widths: Vec<u16> = app.hosts.iter().map(card_width).collect();
-    let wrapped = widths.iter().any(|&cw| cw > avail);
-    if wrapped {
-        widths.fill(avail.max(12));
-    }
-    let per_row = if wrapped { ((avail.max(12) - 4 + GAP) / (TILE + GAP)).max(1) as usize } else { COMPONENTS.len() };
-    let most = app.hosts.iter().map(|h| present(h).len()).max().unwrap_or(1).max(1);
-    let tile_rows = most.div_ceil(per_row);
-    let error_row = app.hosts.iter().any(|h| !h.error.is_empty() && !h.steps.is_empty()) as u16;
-    let card_h = 2 + TOP_PAD + tile_rows as u16 * TILE_ROWS + (tile_rows as u16 - 1) + 1 + error_row;
-    // Left to right, a new row when the next card won't fit; the rows start together, centered.
-    let mut rows: Vec<Vec<(usize, u16)>> = vec![];
-    let mut x = 0;
-    for (i, &cw) in widths.iter().enumerate() {
-        if rows.is_empty() || x + cw > avail {
-            rows.push(vec![]);
-            x = 0;
-        }
-        rows.last_mut().unwrap().push((i, x));
-        x += cw + GUTTER;
-    }
-    let block = rows.iter().filter_map(|r| r.last().map(|&(i, x)| x + widths[i])).max().unwrap_or(0);
-    let left = w.saturating_sub(block) / 2;
-    let mut cards = vec![Rect::default(); widths.len()];
-    for (r, row) in rows.iter().enumerate() {
-        for &(i, x) in row {
-            cards[i] = Rect::new(left + x, 1 + r as u16 * (card_h + 1), widths[i], card_h);
-        }
-    }
-    let rows = rows.len().max(1) as u16;
-    Geo { cards, card_h, wrapped, per_row, tile_rows, content_h: 2 + rows * card_h + (rows - 1), view, out }
+    let table = table(app, w.saturating_sub(4));
+    let cw = table.width().min(w.saturating_sub(2)).max(1);
+    let left = w.saturating_sub(cw) / 2;
+    // Tall rows, a blank row above and below their versions, when they fit without scrolling; slim otherwise.
+    let n = app.hosts.len() as u16;
+    let card_h = if n * 4 < view.height { 4 } else { 2 };
+    let cards = (0..n).map(|i| Rect::new(left, i * card_h, cw, card_h)).collect();
+    Geo { cards, card_h, content_h: n * card_h + 1, head, view, out, table }
 }
 
 pub fn max_scroll(app: &App) -> u16 {
@@ -285,8 +326,11 @@ pub fn render(app: &mut App, logos: &Logos, buf: &mut Buffer) {
     header(app, buf);
     cards(app, logos, buf, dim_logos);
     if app.motion.on {
-        let solid: Vec<Rect> = app.hits.iter().filter(|(_, h)| matches!(h, Hit::Card(_))).map(|(r, _)| *r).collect();
-        motion::dust(buf, geometry(app).view, &solid, t);
+        // Through the table too (it only lands on blank cells), but never on the logos: an image there
+        // would be cut by a dot.
+        let g = geometry(app);
+        let logos = Rect::new(0, g.head.y + 1, area.width, logos::HEIGHT.min(g.head.height));
+        motion::dust(buf, g.head.union(g.view), &[logos], t);
     }
     if app.show_output {
         output(app, buf);
@@ -317,56 +361,117 @@ pub fn render(app: &mut App, logos: &Logos, buf: &mut Buffer) {
 /// Space between the screen's edge and the header's and footer's content.
 const MARGIN: u16 = 2;
 
+/// 't3up' in half blocks, two rows tall.
+const WORDMARK: [&str; 2] = ["▄█▄ ▀██ █ █ █▀█", " █▄ ▄▄█ █▄█ █▀▀"];
+
 fn header(app: &mut App, buf: &mut Buffer) {
     let w = buf.area.width;
-    buf.set_style(Rect::new(0, 0, w, HEADER), Style::new().bg(SURFACE));
-    // A filled pill on the text row, like the badge on the left: padded two cells each side.
-    let label = "↑ Update all";
-    let bw = label.width() as u16 + 4;
-    let shown = w >= 40;
-    let button = Rect::new(w.saturating_sub(bw + MARGIN), 1, bw, 1);
-    let enabled = !app.hosts.is_empty();
-    if shown {
-        let t = app.clock().as_secs_f32();
-        let hovered = app.hover.as_ref().is_some_and(|h| h.hit == Some(Hit::UpdateAll));
-        let waiting =
-            app.hosts.iter().any(|h| h.status == Status::Ok && !updates(h, &app.latest, &app.target).is_empty());
-        let alpha = match (enabled, hovered) {
-            (false, _) => 0.0,
-            (true, true) => 0.42,
-            // Updates waiting: it breathes, gently.
-            (true, false) if waiting && app.motion.on => 0.2 + 0.12 * (0.5 + 0.5 * (t * 2.2).sin()),
-            (true, false) => 0.22,
-        };
-        let bg = if enabled { blend(ACCENT, SURFACE, alpha) } else { blend(FAINT, SURFACE, 0.35) };
-        let color = if enabled { if hovered { TEXT } else { ACCENT } } else { DIM };
-        buf.set_style(button, Style::new().bg(bg));
-        put(buf, button.x + 2, 1, bw - 2, &Line::styled(label, bold(color)));
-        // Rounded ends: Powerline's half circles, which Ghostty, kitty and WezTerm draw themselves.
-        for (x, cap) in [(button.x, "\u{e0b6}"), (button.right() - 1, "\u{e0b4}")] {
-            if let Some(cell) = buf.cell_mut((x, 1)) {
-                cell.set_symbol(cap).set_style(Style::new().fg(bg).bg(SURFACE));
+    let t = app.clock().as_secs_f32();
+    // The name, big when there's room; the text and the button sit on its bottom row.
+    let y = HEADER - 1;
+    let big = w >= 70;
+    let name_w = if big {
+        for (k, row) in WORDMARK.iter().enumerate() {
+            put(buf, MARGIN, y - 1 + k as u16, row.width() as u16, &Line::styled(*row, bold(ACCENT)));
+        }
+        let phase = t.rem_euclid(6.0);
+        if app.motion.on && phase < 1.2 {
+            // Now and then, a light passes over it.
+            for row in [y - 1, y] {
+                motion::shimmer(buf, Rect::new(MARGIN, y - 1, WORDMARK[0].width() as u16, 2), row, phase, 1.2);
             }
         }
+        WORDMARK[0].width() as u16
+    } else {
+        put(buf, MARGIN, y, 4, &Line::styled("t3up", bold(ACCENT)));
+        4
+    };
+    // A filled pill, split: the button updates everything and says how many servers that brings
+    // forward; its '⋯' end opens the menu of what to update.
+    let behind =
+        app.hosts.iter().filter(|h| h.status == Status::Ok && !updates(h, &app.latest, &app.target).is_empty()).count();
+    let label = match behind {
+        0 => "↑ Update all".to_string(),
+        1 => "↑ Update 1 server".to_string(),
+        n => format!("↑ Update {n} servers"),
+    };
+    let main_w = label.width() as u16 + 3; // a rounded end, then a cell of padding each side
+    let more_w = 5; // the divider, padding, '⋯', padding, a rounded end
+    let bw = main_w + more_w;
+    let shown = w >= 2 * MARGIN + name_w + 2 + bw;
+    let button = Rect::new(w.saturating_sub(bw + MARGIN), y, bw, 1);
+    let more_x = button.x + main_w;
+    let enabled = !app.hosts.is_empty();
+    if shown {
+        let segment = |hit| {
+            let hovered = app.hover.as_ref().is_some_and(|h| h.hit == Some(hit));
+            let alpha = match (enabled, hovered) {
+                (false, _) => 0.0,
+                (true, true) => 0.42,
+                // Updates waiting: it breathes, gently.
+                (true, false) if behind > 0 && app.motion.on => 0.2 + 0.12 * (0.5 + 0.5 * (t * 2.2).sin()),
+                (true, false) => 0.22,
+            };
+            let bg = if enabled { blend(ACCENT, BG, alpha) } else { blend(FAINT, BG, 0.35) };
+            let color = if enabled { if hovered { TEXT } else { ACCENT } } else { DIM };
+            (bg, color)
+        };
+        let (main_bg, main_fg) = segment(Hit::UpdateAll);
+        let (more_bg, more_fg) = segment(Hit::UpdateMenu);
+        buf.set_style(Rect::new(button.x, y, main_w, 1), Style::new().bg(main_bg));
+        buf.set_style(Rect::new(more_x, y, more_w, 1), Style::new().bg(more_bg));
+        put(buf, button.x + 2, y, main_w - 2, &Line::styled(label, bold(main_fg)));
+        put(buf, more_x + 2, y, 1, &Line::styled("⋯", bold(more_fg)));
+        if let Some(cell) = buf.cell_mut((more_x, y)) {
+            // On the cell's left edge, so each half's color ends right at it (a '│' sits mid-cell).
+            cell.set_symbol("▏").set_fg(BG);
+        }
+        // Rounded ends: Powerline's half circles, which Ghostty, kitty and WezTerm draw themselves.
+        for (x, cap, bg) in [(button.x, "\u{e0b6}", main_bg), (button.right() - 1, "\u{e0b4}", more_bg)] {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_symbol(cap).set_style(Style::new().fg(bg).bg(BG));
+            }
+        }
+        // Over the button: how long updating everyone takes, counting while it runs.
+        if let Some(r) = &app.rollout {
+            let (mark, color, text) = match r.took {
+                None => {
+                    (spinner(app.clock()).to_string(), AMBER, format!("updating · {}", minutes(r.started.elapsed())))
+                }
+                Some((took, false)) => ("✓".into(), GREEN, format!("updated in {}", minutes(took))),
+                Some((took, true)) => ("✗".into(), RED, format!("done in {}", minutes(took))),
+            };
+            let line = Line::from(vec![Span::styled(format!("{mark} "), fg(color)), Span::styled(text, fg(MUTED))]);
+            let lw = line.width() as u16;
+            put(buf, button.x + bw.saturating_sub(lw) / 2, y - 1, bw, &line);
+        }
         if enabled {
-            // The whole height of the bar is clickable, not just the text row.
-            app.hits.push((Rect::new(button.x, 0, bw, HEADER), Hit::UpdateAll));
+            // The whole height of the header is clickable, not just the button's row.
+            app.hits.push((Rect::new(button.x, 0, main_w, HEADER), Hit::UpdateAll));
+            app.hits.push((Rect::new(more_x, 0, more_w, HEADER), Hit::UpdateMenu));
         }
     }
+    let left_x = MARGIN + name_w + 3;
     let right_edge = if shown { button.x.saturating_sub(3) } else { w.saturating_sub(MARGIN) };
-    let avail = right_edge.saturating_sub(MARGIN) as usize;
+    let avail = right_edge.saturating_sub(left_x) as usize;
     let (left, right) = header_text(app, avail);
     let right_w = right.width() as u16;
-    put(buf, MARGIN, 1, avail as u16, &left);
-    put(buf, right_edge - right_w.min(avail as u16), 1, right_w, &right);
-    if app.motion.on {
-        motion::sweep_bg(buf, Rect::new(MARGIN, 1, 6.min(w.saturating_sub(MARGIN)), 1), app.clock().as_secs_f32(), 6.0);
+    put(buf, left_x, y, avail as u16, &left);
+    put(buf, right_edge - right_w.min(avail as u16), y, right_w, &right);
+}
+
+/// '42s', '3m 07s'.
+fn minutes(d: Duration) -> String {
+    match d.as_secs() {
+        s @ 0..60 => format!("{s}s"),
+        s => format!("{}m {:02}s", s / 60, s % 60),
     }
 }
 
-/// The widest layout that fits: narrow terminals lose the long counts, then the pinned version.
+/// Beside the name: the pinned version and a newer t3up; beside the button, what's wrong (how many can
+/// update is on the button). The widest layout that fits: narrow terminals lose the long words, then the
+/// pinned version.
 pub fn header_text(app: &App, width: usize) -> (Line<'static>, Line<'static>) {
-    let badge = Span::styled(" t3up ", Style::new().fg(BG).bg(ACCENT).add_modifier(Modifier::BOLD));
     let pinned = if app.target.is_empty() {
         vec![]
     } else {
@@ -374,15 +479,7 @@ pub fn header_text(app: &App, width: usize) -> (Line<'static>, Line<'static>) {
     };
     let count = |f: &dyn Fn(&Host) -> bool| app.hosts.iter().filter(|h| f(h)).count();
     let counts = [
-        (count(&Host::running), AMBER, "busy", "…"),
-        (app.queued.len(), DIM, "queued", "◌"),
         (count(&|h| h.status == Status::Ok && crate::model::no_t3(h)), AMBER, "no T3", "○"),
-        (
-            count(&|h| h.status == Status::Ok && !updates(h, &app.latest, &app.target).is_empty()),
-            ACCENT,
-            "can update",
-            "↑",
-        ),
         (count(&|h| h.status == Status::Failed), RED, "failed", "✗"),
     ];
     let tally = |short: bool| -> Vec<Span<'static>> {
@@ -390,13 +487,17 @@ pub fn header_text(app: &App, width: usize) -> (Line<'static>, Line<'static>) {
             .iter()
             .filter(|c| c.0 > 0)
             .map(|&(n, color, label, mark)| {
-                let text = if short { format!("  {mark} {n}") } else { format!("  ● {n} {label}") };
+                let text = if short { format!("  {mark} {n}") } else { format!("  {mark} {n} {label}") };
                 Span::styled(text, fg(color))
             })
             .collect()
     };
     let cat = |parts: &[&Vec<Span<'static>>]| -> Vec<Span<'static>> {
-        std::iter::once(badge.clone()).chain(parts.iter().flat_map(|p| p.iter().cloned())).collect()
+        let mut spans: Vec<Span<'static>> = parts.iter().flat_map(|p| p.iter().cloned()).collect();
+        if let Some(first) = spans.first_mut() {
+            first.content = first.content.trim_start().to_string().into(); // the header spaces it from the name
+        }
+        spans
     };
     // A newer t3up: worth a word in every layout.
     let (mine, mine_terse) = match (&app.self_update, app.self_updating) {
@@ -506,6 +607,7 @@ fn cards(app: &mut App, logos: &Logos, buf: &mut Buffer, dim_logos: bool) {
         put(buf, x, y, g.view.width, &line);
         return;
     }
+    head(app, &g, logos, buf, dim_logos);
     for (i, place) in g.cards.iter().enumerate() {
         let x = place.x;
         let y = g.view.y as i32 + place.y as i32 - app.scroll as i32;
@@ -514,15 +616,42 @@ fn cards(app: &mut App, logos: &Logos, buf: &mut Buffer, dim_logos: bool) {
         }
         let mut card = Buffer::empty(Rect::new(0, 0, place.width, g.card_h));
         card.set_style(card.area, Style::new().bg(BG).fg(TEXT));
-        let tiles = draw_card(app, &g, logos, i, &mut card, dim_logos);
+        let cells = draw_card(app, &g, i, &mut card);
         let visible = blit(&card, buf, x, y, g.view);
         app.hits.push((visible, Hit::Card(i)));
-        // Each tool's tile, on top of its card: tapping one opens that tool's menu.
-        for (tile, name) in tiles {
-            let top = y + tile.y as i32;
-            if top >= g.view.y as i32 && top + tile.height as i32 <= g.view.bottom() as i32 {
-                app.hits.push((Rect::new(x + tile.x, top as u16, tile.width, tile.height), Hit::Tool(i, name)));
+        // Each tool's cell, on top of its card: tapping one opens that tool's menu.
+        for (cell, name) in cells {
+            let top = y + cell.y as i32;
+            if top >= g.view.y as i32 && top + cell.height as i32 <= g.view.bottom() as i32 {
+                app.hits.push((Rect::new(x + cell.x, top as u16, cell.width, cell.height), Hit::Tool(i, name)));
             }
+        }
+    }
+    // The rule that closes the table, under the last server.
+    let (Some(last), y) = (g.cards.last(), (g.view.y + g.content_h - 1) as i32 - app.scroll as i32) else { return };
+    if (g.view.y as i32..g.view.bottom() as i32).contains(&y) {
+        let mut close = Buffer::empty(Rect::new(0, 0, last.width, 1));
+        let heavy = app.hosts.last().is_some_and(|h| h.local);
+        rule(&mut close, &g.table.lines(), heavy, LINE, if heavy { "┷" } else { "┴" });
+        blit(&close, buf, last.x, y, g.view);
+    }
+    // Light on the rules over and under a running (or the selected) row at once, framing it. After every
+    // row: the rule under one is drawn with the next.
+    for (i, (h, place)) in app.hosts.iter().zip(&g.cards).enumerate().filter(|_| app.motion.on) {
+        let t = app.clock().as_secs_f32();
+        let (color, heads, speed, strength, t) = if h.running() {
+            let update = h.mode != crate::model::Mode::Check; // a change: two lights
+            (motion::running_color(update), if update { 2 } else { 1 }, 42.0, 1.0, t + i as f32 * 0.37)
+        } else if i == app.selected {
+            (blend(TEXT, ACCENT, 0.6), 1, 9.0, 0.55, t) // the idle gleam
+        } else {
+            continue;
+        };
+        let top = (g.view.y + place.y) as i32 - app.scroll as i32;
+        for y in
+            [top, top + g.card_h as i32].into_iter().filter(|y| (g.view.y as i32..g.view.bottom() as i32).contains(y))
+        {
+            motion::streak(buf, Rect::new(place.x, y as u16, place.width, 1), t, color, heads, speed, strength);
         }
     }
     if g.content_h > g.view.height {
@@ -534,6 +663,21 @@ fn cards(app: &mut App, logos: &Logos, buf: &mut Buffer, dim_logos: bool) {
             .thumb_symbol("┃")
             .thumb_style(fg(FAINT))
             .render(g.view, buf, &mut state);
+    }
+}
+
+/// A rule across the top row of `buf`, heavy (around this machine) or light, crossing the columns'
+/// dashed lines at `lines` with `cross`.
+fn rule(buf: &mut Buffer, lines: &[u16], heavy: bool, color: ratatui::style::Color, cross: &str) {
+    for x in 0..buf.area.width {
+        let symbol = if lines.contains(&x) {
+            cross
+        } else if heavy {
+            "━"
+        } else {
+            "─"
+        };
+        buf[(x, 0)].set_symbol(symbol).set_fg(color);
     }
 }
 
@@ -555,81 +699,119 @@ fn blit(src: &Buffer, dst: &mut Buffer, x: u16, y: i32, clip: Rect) -> Rect {
     Rect::new(x, top as u16, src.area.width.min(clip.right().saturating_sub(x)), (bottom - top).max(0) as u16)
 }
 
-/// The tool's version for its tile: '↑ 2.1.289' after an update, a spinner while it runs.
-fn tile_version(app: &App, h: &Host, name: &str) -> Span<'static> {
+/// The version an update would bring `tool` to: the pinned T3, else the newest any server is
+/// behind on, else the newest there is.
+fn newest(app: &App, tool: &str) -> Option<String> {
+    if tool == "T3" && !app.target.is_empty() {
+        return Some(app.target.clone());
+    }
+    app.hosts
+        .iter()
+        .find_map(|h| updates(h, &app.latest, &app.target).into_iter().find(|(n, _)| n == tool).map(|(_, v)| v))
+        .or_else(|| app.latest.get(tool).cloned())
+}
+
+/// Text centered in a column `col` wide, past its dashed line and the cell a mark (`MARKS`) hangs in,
+/// and the logo that sits over it lined up to the pixel: (text's x, logo's x, whether the text is an
+/// odd width), from the column's left.
+fn over(col: u16, w: u16) -> (u16, u16, bool) {
+    let x = 2 + col.saturating_sub(w + 2) / 2;
+    let twice_middle = 2 * x + w;
+    let odd = twice_middle % 2 == 1;
+    (x, twice_middle.saturating_sub(if odd { TILE } else { TILE - 1 }) / 2, odd)
+}
+
+/// The column heads: each tool's logo with the latest version under it, so a server behind on one
+/// shows it right below; the meters' names beside the logos.
+fn head(app: &App, g: &Geo, logos: &Logos, buf: &mut Buffer, dim: bool) {
+    let (Some(card), true) = (g.cards.first(), g.head.height >= HEAD) else { return };
+    let t = &g.table;
+    let y = g.head.y + 1 + logos::HEIGHT;
+    let mut any = false;
+    for (k, name) in t.tools.iter().enumerate() {
+        let x = card.x + t.tool_x(k);
+        let text = fit(&newest(app, name).map(|v| version_label(&v)).unwrap_or_default(), t.col as usize - 3);
+        any |= !text.is_empty();
+        let (tx, lx, odd) = over(t.col, text.width() as u16);
+        let logo = Rect::new(x + lx, g.head.y + 1, TILE, logos::HEIGHT).intersection(buf.area);
+        logos.draw_tile(name, odd, logo, buf, dim);
+        put(buf, x + tx, y, t.col, &Line::styled(text, fg(MUTED)));
+    }
+    // The columns' dashed lines, from the top of the logos down into the rows.
+    for x in t.lines() {
+        for y in g.head.y + 1..g.head.bottom() {
+            put(buf, card.x + x, y, 1, &Line::styled("┆", fg(LINE)));
+        }
+    }
+    if any {
+        // In the names' column: these versions are a row of their own, the one to match.
+        put(buf, card.x + Table::NAME_X, y, t.name, &Line::styled("latest", fg(DIM)));
+    }
+    if t.meter > 0 {
+        for (k, name) in ["cpu", "disk"].into_iter().enumerate() {
+            let x = card.x + t.meter_x() + k as u16 * (t.meter + 2);
+            put(buf, x + (t.meter - name.len() as u16) / 2, y - 1, t.meter, &Line::styled(name, fg(DIM)));
+        }
+    }
+}
+
+/// What hangs left of a version: '↑' newer to install, '✓' just updated.
+const MARKS: [char; 2] = ['↑', '✓'];
+
+/// `text` in `w` cells: a nightly that won't fit keeps its build, the part that changes: '#2623'.
+fn fit(text: &str, w: usize) -> String {
+    match text.split_once(" #") {
+        Some((version, build)) if text.width() > w => {
+            let mark = version.chars().next().filter(|c| MARKS.contains(c)).map(String::from).unwrap_or_default();
+            truncate(&format!("{mark}#{build}"), w)
+        }
+        _ => truncate(text, w),
+    }
+}
+
+/// A tool's version in its cell: '0.0.46 #2623', '↑0.0.46 #2623' in the accent when there's newer,
+/// '✓2.1.289' after an update, a spinner while it runs, or what it waits on.
+fn cell(app: &App, h: &Host, name: &str, behind: bool) -> Span<'static> {
     let (state, value) = h.steps.get(name).map_or((None, ""), |(s, v)| (Some(*s), v.as_str()));
+    let shown = h.current.get(name).map_or_else(|| value.to_string(), |v| version_label(v));
     let span = if (state == Some(StepState::Begin) && h.running()) || (h.local && name == "T3" && app.desktop_updating)
     {
         Span::styled(spinner(app.clock()).to_string(), fg(AMBER))
     } else if matches!(state, Some(StepState::Begin | StepState::Fail)) {
         Span::styled("✗ failed", fg(RED))
+    } else if h.auth.iter().any(|a| a == name) {
+        Span::styled("sign in", fg(AMBER))
     } else if value.contains(" → ") {
-        let done = match (value.ends_with(')'), h.current.get(name)) {
-            (true, Some(cur)) => format!("#{}", cur.rsplit('.').next().unwrap_or(cur)),
-            _ => value.rsplit(" → ").next().unwrap_or(value).to_string(),
-        };
-        Span::styled(format!("↑{done}"), bold(GREEN))
+        Span::styled(format!("✓{shown}"), bold(GREEN))
+    } else if shown.is_empty() {
+        Span::styled("—", fg(FAINT))
+    } else if behind {
+        Span::styled(format!("↑{shown}"), fg(ACCENT))
     } else {
-        let value = if value.is_empty() { "—" } else { value };
-        Span::styled(value.to_string(), fg(if state.is_some() { TEXT } else { FAINT }))
+        Span::styled(shown, fg(if state.is_some() { TEXT } else { FAINT }))
     };
     let text = span.content.replace("-nightly", "");
     let text = if state == Some(StepState::Done) { app.motion.decode(&h.name, name, &text) } else { text };
     Span::styled(text, span.style)
 }
 
-/// One line under the version: 'sign in', or the update waiting. Always there, so cards are equal height.
-fn tile_note(app: &App, h: &Host, name: &str, new: Option<&String>) -> Span<'static> {
-    if h.auth.iter().any(|a| a == name) {
-        Span::styled("sign in", fg(AMBER))
-    } else if let (Some(new), Some(cur), false) = (new, h.current.get(name), h.running()) {
-        let _ = app;
-        Span::styled(format!("→ {}", compact(new, cur)), fg(ACCENT))
-    } else {
-        Span::raw("")
-    }
-}
-
-/// Draw card `i` into `buf`; returns where its tools' tiles are (in the card), to tap.
-fn draw_card(
-    app: &App,
-    g: &Geo,
-    logos: &Logos,
-    i: usize,
-    buf: &mut Buffer,
-    dim_logos: bool,
-) -> Vec<(Rect, &'static str)> {
-    let mut tiles = vec![];
+/// Draw card `i` into `buf`; returns where its tools' cells are (in the card), to tap.
+fn draw_card(app: &App, g: &Geo, i: usize, buf: &mut Buffer) -> Vec<(Rect, &'static str)> {
+    let mut cells = vec![];
     let h = &app.hosts[i];
     let t = app.clock();
     let queued = app.queued.contains(&h.name);
     let selected = i == app.selected;
-    let border = if selected {
-        ACCENT
-    } else if h.status == Status::Failed {
-        blend(RED, BG, 0.6)
-    } else {
-        LINE
-    };
-    let border = app.motion.border(&h.name, border);
     let (icon, color, label) = status(h, queued, t);
     let new = updates(h, &app.latest, &app.target);
-    // Healthy is the norm and says nothing: the status shows only what isn't.
+    // Healthy is the norm and says nothing: the status shows only what isn't. A run says so by the
+    // spinner before the name and in the footer.
     let fine = h.status == Status::Ok && !queued && !crate::model::no_t3(h);
     let mut sub = vec![];
-    if !fine {
-        sub.push(Span::styled(format!(" {icon} {label}"), fg(color)));
+    if !fine && !h.running() {
+        sub.push(Span::styled(format!(" {icon} {label} "), fg(color)));
     }
-    if fine && !new.is_empty() {
-        sub.push(Span::styled(format!(" ↑ {} to update", new.len()), fg(ACCENT)));
-    }
-    if h.running() && !queued {
-        sub.push(Span::styled(format!("  {:.0}s", h.took().as_secs_f64()), fg(DIM)));
-    }
-    if !sub.is_empty() {
-        sub.push(Span::raw(" "));
-    }
-    // What needs attention sits on the top border, opposite the name.
+    // What needs attention, on the right under the versions (on the rule when the row is slim).
     let mut alert: Vec<Span<'static>> = vec![];
     if let Some(n) = h.busy.filter(|&n| n > 0) {
         alert.push(Span::styled(format!(" ● {n} agent{} live ", if n == 1 { "" } else { "s" }), fg(AMBER)));
@@ -640,128 +822,106 @@ fn draw_card(
     if fine && h.mode == crate::model::Mode::Update {
         alert.push(Span::styled(" ✓ updated ", fg(GREEN)));
     }
-    // Uptime follows the name, when it fits beside what needs attention.
-    let name = Span::styled(format!(" {} ", h.name), bold(if selected { ACCENT } else { TEXT }));
-    let alert_w = Line::from(alert.clone()).width();
-    let up = sys_parts(&h.sys)
-        .find(|(k, _)| *k == "up")
-        .map(|(_, v)| Span::styled(format!("up {v} "), fg(DIM)))
-        .filter(|u| name.width() + u.width() + alert_w + 4 <= buf.area.width as usize);
-    let alert =
-        clip(alert, (buf.area.width as usize).saturating_sub(name.width() + up.as_ref().map_or(0, Span::width) + 4));
-    Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(fg(border))
-        .title(Line::from([name].into_iter().chain(up.clone()).collect::<Vec<_>>()))
-        .title(alert.right_aligned())
-        .title_bottom(Line::from(sub).right_aligned())
-        .render(buf.area, buf);
-    if app.motion.on && h.running() {
-        let update = h.mode != crate::model::Mode::Check; // a change: two amber lights
-        let secs = t.as_secs_f32() + i as f32 * 0.37; // cards out of step, not marching together
-        motion::comet(buf, secs, motion::running_color(update), if update { 2 } else { 1 }, 42.0, 1.0);
-        let bottom = buf.area.bottom() - 1;
-        motion::shimmer(buf, buf.area, bottom, secs, 1.8);
-    } else if app.motion.on && selected {
-        motion::comet(buf, t.as_secs_f32(), blend(TEXT, ACCENT, 0.6), 1, 9.0, 0.55);
-    }
-
-    let (x0, inner_w) = (2u16, buf.area.width.saturating_sub(4));
-    let top = 1 + TOP_PAD;
-    let tiles_h = g.tile_rows as u16 * TILE_ROWS + (g.tile_rows as u16 - 1);
+    let w = buf.area.width as usize;
     let missing = h.status == Status::Ok && crate::model::no_t3(h);
-    if message_card(h) {
-        // Never got as far as a step, or there's no T3 here: say so, as tall as the tiles.
-        let lines = if missing {
-            [
-                Line::styled("T3 isn't installed on this server", fg(AMBER)),
-                Line::styled("enter → install T3 (latest nightly)", fg(DIM)),
-            ]
-        } else {
-            [
-                clip(vec![Span::styled(format!("✗ {}", h.error), fg(RED))], inner_w as usize),
-                Line::styled("enter → retry or open a terminal", fg(DIM)),
-            ]
-        };
-        for (k, line) in lines.iter().enumerate() {
-            put(buf, x0, top + 1 + k as u16, inner_w, line);
+    // On the left: what went wrong, or what to do about it.
+    let note = if message_card(h) {
+        let hint = if missing { "enter → install T3 (latest nightly)" } else { "enter → retry or open a terminal" };
+        Span::styled(format!(" {hint} "), fg(DIM))
+    } else if !h.error.is_empty() {
+        Span::styled(format!(" ✗ {} ", h.error), fg(RED))
+    } else {
+        Span::raw("")
+    };
+    let tb = &g.table;
+    // The rule over the row, heavier around this machine (the top row).
+    let heavy = h.local || i > 0 && app.hosts[i - 1].local;
+    rule(buf, &tb.lines(), heavy, LINE, if heavy { "┿" } else { "┼" });
+    // The selected row is lit under its rule; a row flashes as its run ends (`Motion::border`).
+    let base = if selected { SURFACE } else { BG };
+    let lit = blend(app.motion.border(&h.name, base), base, 0.25);
+    buf.set_style(Rect::new(0, 1, buf.area.width, g.card_h - 1), Style::new().bg(lit));
+    for x in tb.lines() {
+        for y in 1..g.card_h {
+            put(buf, x, y, 1, &Line::styled("┆", fg(LINE)));
         }
+    }
+    let (note_x, note_y) = if g.card_h > 2 { (Table::NAME_X - 3, g.card_h - 1) } else { (1, 0) };
+    let right = clip([alert, sub].concat(), w.saturating_sub(4));
+    let right_w = right.width() as u16;
+    put(buf, buf.area.width.saturating_sub(right_w + 1), note_y, right_w, &right);
+    let room = buf.area.width.saturating_sub(note_x + right_w + 2);
+    put(buf, note_x, note_y, room, &clip(vec![note], room as usize));
+
+    let y = 1 + (g.card_h - 1) / 2;
+    // A mark before the name only when something's off: well is the norm and says nothing.
+    if !fine {
+        put(buf, Table::NAME_X - 2, y, 1, &Line::styled(icon.clone(), fg(color)));
+    }
+    let name = truncate(&h.name, tb.name as usize);
+    put(buf, Table::NAME_X, y, tb.name, &Line::styled(name, bold(if selected { ACCENT } else { TEXT })));
+    if let Some(up) = uptime(h).filter(|_| tb.up > 0) {
+        put(buf, tb.up_x() + tb.up - up.width() as u16, y, tb.up, &Line::styled(up.to_string(), fg(DIM)));
+    }
+    if message_card(h) {
+        // Never got as far as a step, or there's no T3 here: say so across the columns.
+        let line = if missing {
+            Line::styled("T3 isn't installed on this server", fg(AMBER))
+        } else {
+            clip(vec![Span::styled(format!("✗ {}", h.error), fg(RED))], w.saturating_sub(tb.tool_x(0) as usize + 4))
+        };
+        let x = tb.tool_x(0) + 2;
+        put(buf, x, y, buf.area.width.saturating_sub(x + 2), &line);
     } else {
         let present = present(h);
-        // Side by side, centered when the card is wider than its tiles (its name or meters need the room).
-        let per_row = g.per_row.min(present.len()).max(1) as u16;
-        let indent = if g.wrapped { 0 } else { inner_w.saturating_sub(per_row * (TILE + GAP) - GAP) / 2 };
-        for (k, name) in present.into_iter().enumerate() {
-            let (dx, row) = ((k as u16 % per_row) * (TILE + GAP), k as u16 / per_row);
-            let tx = x0 + indent + dx;
-            let ty = top + row * (TILE_ROWS + 1);
-            tiles.push((Rect::new(tx, ty, TILE, TILE_ROWS), name));
-            let version = tile_version(app, h, name);
-            // The logo centers on the version number under it, to the pixel.
-            let number = truncate(&version.content, TILE as usize);
-            let odd = number.trim_start_matches('↑').width() % 2 == 1;
-            logos.draw_tile(name, odd, Rect::new(tx, ty, TILE, logos::HEIGHT), buf, dim_logos);
-            let note = tile_note(app, h, name, new.iter().find(|(n, _)| n == name).map(|(_, v)| v));
-            for (k, span) in [version, note].into_iter().enumerate() {
-                let text = truncate(&span.content, TILE as usize);
-                // The number itself sits under the logo; an update's arrow hangs to its left.
-                let (arrow, number) = text.strip_prefix('↑').map_or(("", text.as_str()), |n| ("↑", n));
-                let (cx, _) = centered(Line::raw(number.to_string()), TILE);
-                let cx = cx.max(arrow.width() as u16) - arrow.width() as u16;
-                put(buf, tx + cx, ty + logos::HEIGHT + k as u16, TILE, &Line::styled(text.clone(), span.style));
+        for (k, name) in tb.tools.iter().enumerate() {
+            if !present.contains(name) {
+                continue;
+            }
+            let x = tb.tool_x(k);
+            cells.push((Rect::new(x + 1, 1, tb.col - 1, g.card_h - 1), *name));
+            let behind = new.iter().any(|(n, _)| n == name);
+            let mut span = cell(app, h, name, behind);
+            if app.motion.on && span.style.fg == Some(ACCENT) {
+                // Light runs down the versions there's newer of.
+                let k = motion::ripple(t.as_secs_f32(), i, app.hosts.len());
+                span.style = fg(blend(TEXT, ACCENT, 0.7 * k));
+            }
+            let text = fit(&span.content, tb.col as usize - 3 + usize::from(span.content.starts_with(MARKS)));
+            // A mark hangs left of the version, which centers as if alone.
+            let mark = text.chars().next().filter(|c| MARKS.contains(c)).map_or(0, |c| c.len_utf8());
+            let (mark, number) = text.split_at(mark);
+            let cx = over(tb.col, number.width() as u16).0 - mark.width() as u16;
+            put(buf, x + cx, y, tb.col, &Line::styled(text.clone(), span.style));
+        }
+        if tb.meter > 0 {
+            for (k, key) in ["cpu", "disk"].into_iter().enumerate() {
+                let x = tb.meter_x() + k as u16 * (tb.meter + 2);
+                let grown = app.motion.grown(&h.name, "sys");
+                put(buf, x, y, tb.meter, &Line::from(meter(&h.sys, key, tb.meter as usize, grown)));
             }
         }
     }
-    // The machine, then any error.
-    put(buf, x0, top + tiles_h, inner_w, &clip(machine(&h.sys, inner_w as usize, up.is_none()), inner_w as usize));
-    if !h.error.is_empty() && !h.steps.is_empty() {
-        put(
-            buf,
-            x0,
-            top + tiles_h + 1,
-            inner_w,
-            &clip(vec![Span::styled(format!("✗ {}", h.error), fg(RED))], inner_w as usize),
-        );
+    if app.motion.on && h.running() {
+        motion::shimmer(buf, buf.area, y, t.as_secs_f32() + i as f32 * 0.37, 1.8);
     }
-    tiles
+    cells
 }
 
-/// The `sys` report as (key, value) pairs, e.g. ("load", "0.24").
+/// The `sys` report as (key, value) pairs, e.g. ("cpu", "6%").
 fn sys_parts(sys: &str) -> impl Iterator<Item = (&str, &str)> {
     sys.split(" · ").filter_map(|p| p.split_once(' '))
 }
 
-/// The machine row: load (per CPU) and disk as meters sharing the width `w`, then the uptime if `with_up`.
-fn machine(sys: &str, w: usize, with_up: bool) -> Vec<Span<'static>> {
-    let up = sys_parts(sys).find(|(k, _)| *k == "up" && with_up).map(|(_, v)| format!("  up {v}"));
-    let w = w.saturating_sub(up.as_ref().map_or(0, |u| u.width()));
-    let cpus = sys_parts(sys).find(|(k, _)| *k == "cpus").and_then(|(_, c)| c.parse::<f64>().ok());
-    let meters: Vec<(&str, &str, Option<f64>)> = sys_parts(sys)
-        .filter_map(|(key, value)| {
-            let frac = match key {
-                "load" => value.parse::<f64>().ok().zip(cpus.filter(|&c| c > 0.0)).map(|(l, c)| l / c),
-                "disk" => value.trim_end_matches('%').parse::<f64>().ok().map(|d| d / 100.0),
-                _ => return None,
-            };
-            Some((key, value, frac))
-        })
-        .collect();
-    let each = w.saturating_sub(2 * meters.len().saturating_sub(1)) / meters.len().max(1);
-    let mut out = vec![];
-    for (key, value, frac) in meters {
-        if !out.is_empty() {
-            out.push(Span::raw("  "));
-        }
-        // Load per CPU reads as how busy the CPUs are; a bare load average stays 'load'.
-        let key = if key == "load" && frac.is_some() { "cpu" } else { key };
-        out.push(Span::styled(format!("{key} "), fg(DIM)));
-        let cells = each.saturating_sub(key.len() + 1).max(4);
-        // How busy is a measure (blue); free disk is good news (green).
-        let color = if key == "disk" { GREEN } else { ACCENT };
-        out.extend(frac.map_or_else(|| vec![Span::styled(value.to_string(), fg(DIM))], |f| bar(f, cells, color)));
+/// The `key` ('cpu' or 'disk') meter, `w` cells, `grown` of the way in: how busy is a measure (blue);
+/// free disk is good news (green).
+fn meter(sys: &str, key: &str, w: usize, grown: f32) -> Vec<Span<'static>> {
+    let Some((_, value)) = sys_parts(sys).find(|(k, _)| *k == key) else { return vec![] };
+    let color = if key == "disk" { GREEN } else { ACCENT };
+    match value.trim_end_matches('%').parse::<f64>() {
+        Ok(p) => bar(p / 100.0 * grown as f64, w, color),
+        Err(_) => vec![Span::styled(truncate(value, w), fg(DIM))],
     }
-    out.extend(up.map(|u| Span::styled(u, fg(DIM))));
-    out
 }
 
 /// A bar of `cells` in half cells, in `color`, then amber past 70%, red past 90%.
@@ -1830,48 +1990,58 @@ mod tests {
     }
 
     #[test]
+    fn versions_line_up_under_the_newest_one() {
+        let mut app = demo();
+        let buf = frame(&mut app, 120, 30);
+        let rows = text(&buf);
+        let col = |row: &str, needle: &str| row.find(needle).map(|b| row[..b].chars().count());
+        // The newest T3 heads its column; each server's own sits right under it, in the accent when behind.
+        let head = rows.iter().find_map(|r| col(r, "0.0.46 #2648")).expect("head");
+        let one_s = rows.iter().find(|r| r.contains("one-s")).unwrap();
+        assert_eq!(col(one_s, "0.0.46 #2623"), Some(head), "{}", rows.join("\n"));
+        assert_eq!(cell_fg(&buf, "0.0.46 #2623").unwrap(), ACCENT);
+        assert_eq!(cell_fg(&buf, "1.18.34").unwrap(), TEXT, "up to date");
+    }
+
+    #[test]
     fn dashboard_at_100x30() {
         let mut app = demo();
         let buf = frame(&mut app, 100, 30);
         for needle in [
-            " t3up ",
-            "Update all",
-            "Ganz-Harbour up 3d 4h", // this machine, top left
-            "● 1",                   // header; tallies are terse at this width
+            "▄█▄ ▀██ █ █ █▀█",        // the name, big
+            "✗ 2 failed",             // what's wrong, beside the button
+            "↑ Update 2 servers ▏ ⋯", // which counts what it brings forward
+            "Ganz-Harbour",           // this machine, first
+            "3d 4h",
             "one-s",
             "one-m",
             "mdr",
             "box",
-            "↑ 3 to update",
-            "0.0.46",
-            "0.160.0",
-            "2.1.288",
-            "1.18.34",
-            "→ #2648",
-            "→ 0.161.0",
-            "sign in",
-            "cpu ━━━━━━━━━━━━━━  disk ━━╸━━━━━━━━━━",
-            "one-s up 1d 5h",
-            "one-m up 12d 2h",
+            "#2648", // the newest, heading its column; too wide for it whole, the build stays
+            "↑#2623   ┆  ↑0.160.0  ┆   sign in  ┆   1.18.34  ┆",
+            "latest",
+            "cpu     disk",
+            "1d 5h",
+            "12d 2h",
             "● 2 agents live",
-            "updating",
-            "↑2.1.289",
+            "✓#2648",
+            "✓2.1.289",
             "✗ failed",
             "Codex: EACCES",
             "enter → retry or open a terminal",
             "enter actions",
             "q quit",
         ] {
-            if needle == "● 1" {
-                continue;
-            }
             assert!(has(&buf, needle), "{needle:?} missing from\n{}", text(&buf).join("\n"));
         }
-        // The selected card has the accent border, others the line color.
+        // The selected row is lit under its rule; the others aren't.
         let card = |i| app.hits.iter().find(|(_, h)| *h == Hit::Card(i)).unwrap().0;
-        assert_eq!(buf[(card(1).x, card(1).y)].fg, ACCENT);
-        assert_eq!(buf[(card(0).x, card(0).y)].fg, LINE);
+        assert_eq!(buf[(card(1).x, card(1).y + 1)].bg, SURFACE);
+        assert_eq!(buf[(card(1).x, card(1).y)].bg, BG);
+        assert_eq!(buf[(card(0).x, card(0).y + 1)].bg, BG);
         assert_eq!(cell_fg(&buf, "✗ failed").unwrap(), RED);
+        // A run shows as the spinner before its name, not in words on its row.
+        assert!(!has(&buf, "updating"));
     }
 
     #[test]
@@ -1920,46 +2090,38 @@ mod tests {
     }
 
     #[test]
-    fn cards_are_as_wide_as_their_tools_and_flow_into_rows() {
+    fn cards_stack_in_one_column_of_rows() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = demo();
         frame(&mut app, 100, 30);
         let g = geometry(&app);
-        let at = |name| app.hosts.iter().position(|h| h.name == name).unwrap();
-        let card = |name| g.cards[at(name)];
-        // Four tools, three, two (the least a card is), and a message.
-        assert_eq!(
-            ["one-s", "Ganz-Harbour", "mdr", "box"].map(|n| card(n).width),
-            [4 * (TILE + GAP) - GAP + 4, 3 * (TILE + GAP) - GAP + 4, 32, 38]
-        );
-        // Left to right, wrapping: Ganz-Harbour and one-s, then one-m and mdr, then box. Rows start together.
-        let rows = ["Ganz-Harbour", "one-s", "one-m", "mdr", "box"].map(|n| (card(n).y - 1) / (g.card_h + 1));
-        assert_eq!(rows, [0, 0, 1, 1, 2]);
-        assert!(card("Ganz-Harbour").x == card("one-m").x && card("one-m").x == card("box").x);
-        // Up and down go to the nearest card in the next row.
+        assert_eq!(g.cols(), 1);
+        assert!(g.cards.iter().all(|c| c.x == g.cards[0].x && c.width == g.cards[0].width));
+        assert!(g.cards.windows(2).all(|w| w[1].y == w[0].y + g.card_h));
+        // Up and down go through them in order, clamped at the ends.
         let key = |app: &mut App, code| app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
-        app.selected = at("one-s");
+        app.selected = 1;
         key(&mut app, KeyCode::Down);
-        assert_eq!(app.host().unwrap().name, "mdr");
-        key(&mut app, KeyCode::Down);
-        assert_eq!(app.host().unwrap().name, "box");
+        assert_eq!(app.selected, 2);
         key(&mut app, KeyCode::Up);
-        assert_eq!(app.host().unwrap().name, "one-m");
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.selected, 0);
     }
 
     #[test]
-    fn an_update_arrow_hangs_left_of_a_centered_version() {
+    fn a_mark_hangs_left_of_a_centered_version() {
         let mut app = demo();
         app.on_job("one-m", Event::Done("Codex: codex-cli 0.160.0 -> codex-cli 1.0.47".into()));
         let buf = frame(&mut app, 100, 30);
         let one_m = app.hosts.iter().position(|h| h.name == "one-m").unwrap();
         let row = |tool| {
-            let tile = app.hits.iter().find(|(_, h)| *h == Hit::Tool(one_m, tool)).unwrap().0;
-            (tile.x..tile.right()).map(|x| buf[(x, tile.y + logos::HEIGHT)].symbol()).collect::<String>()
+            let cell = app.hits.iter().find(|(_, h)| *h == Hit::Tool(one_m, tool)).unwrap().0;
+            (cell.x..cell.right()).map(|x| buf[(x, cell.y + 1)].symbol()).collect::<String>()
         };
-        // Each number centered in its tile as if alone, its arrow right before it, no space.
-        assert_eq!(row("Claude"), "↑2.1.289 ");
-        assert_eq!(row("Codex"), "↑1.0.47  ", "where a lone 1.0.47 would be");
+        // Each number centered in its column as if alone, its mark right before it, no space.
+        assert_eq!(row("Claude"), "  ✓2.1.289  ");
+        assert_eq!(row("Codex"), "  ✓1.0.47   ", "where a lone 1.0.47 would be");
     }
 
     #[test]
@@ -2037,28 +2199,51 @@ mod tests {
         let mut app = demo();
         for w in [60u16, 91, 150] {
             let buf = frame(&mut app, w, 24);
-            let row = &text(&buf)[1];
-            let x = row.find("↑ Update all").map(|b| row[..b].chars().count()).expect("button");
-            let end = x + "↑ Update all".chars().count();
-            let bg = buf[(x as u16, 1)].bg;
-            // A cell of the pill on each side of the label, then its rounded ends, then the screen's margin.
+            let (y, label) = (HEADER - 1, "↑ Update 2 servers");
+            let row = &text(&buf)[y as usize];
+            let x = row.find(label).map(|b| row[..b].chars().count()).expect("button");
+            let end = x + label.chars().count();
+            let bg = buf[(x as u16, y)].bg;
+            // A cell of the pill on each side of the label, the divider, '⋯' padded, its rounded ends,
+            // then the screen's margin.
             for dx in [x - 1, end] {
-                assert_eq!(buf[(dx as u16, 1)].bg, bg, "pill padding at {dx} (width {w})");
+                assert_eq!(buf[(dx as u16, y)].bg, bg, "pill padding at {dx} (width {w})");
             }
-            for (dx, cap) in [(x - 2, "\u{e0b6}"), (end + 1, "\u{e0b4}")] {
+            assert_eq!(&row[row.char_indices().nth(end + 1).unwrap().0..][..7], "▏ ⋯", "(width {w})");
+            for (dx, cap) in [(x - 2, "\u{e0b6}"), (end + 5, "\u{e0b4}")] {
                 assert_eq!(
-                    (buf[(dx as u16, 1)].symbol(), buf[(dx as u16, 1)].fg),
+                    (buf[(dx as u16, y)].symbol(), buf[(dx as u16, y)].fg),
                     (cap, bg),
                     "rounded end (width {w})"
                 );
             }
-            assert_ne!(buf[(x as u16 - 3, 1)].bg, bg, "pill starts two cells before the label (width {w})");
-            assert_eq!(end + 2 + MARGIN as usize, w as usize, "right margin (width {w})");
+            assert_ne!(buf[(x as u16 - 3, y)].bg, bg, "pill starts two cells before the label (width {w})");
+            assert_eq!(end + 6 + MARGIN as usize, w as usize, "right margin (width {w})");
         }
+        // Nothing to bring forward: it updates everything all the same.
+        app.latest.clear();
+        assert!(has(&frame(&mut app, 100, 24), "↑ Update all ▏ ⋯"));
     }
 
     #[test]
-    fn healthy_says_nothing_updated_sits_top_right_of_the_card() {
+    fn light_frames_a_running_row_on_both_its_rules() {
+        let mut app = demo();
+        app.motion.on = true;
+        app.started = std::time::Instant::now() - Duration::from_secs(1);
+        let buf = frame(&mut app, 100, 30);
+        let top = |name: &str| {
+            let i = app.hosts.iter().position(|h| h.name == name).unwrap();
+            app.hits.iter().find(|(_, h)| *h == Hit::Card(i)).unwrap().0.y
+        };
+        let lit = |y: u16| (0..buf.area.width).any(|x| buf[(x, y)].symbol() == "─" && buf[(x, y)].fg != LINE);
+        // one-m runs: the rules over and under it light up together (mdr's top is one-m's bottom).
+        assert!(lit(top("one-m")) && lit(top("mdr")));
+        // Nothing runs on or is selected around the last row's rules.
+        assert!(!lit(top("box")) && !lit(top("box") + 4));
+    }
+
+    #[test]
+    fn healthy_says_nothing_updated_sits_under_the_versions() {
         let mut app = demo();
         let buf = frame(&mut app, 100, 30);
         assert!(!has(&buf, "healthy") && !has(&buf, " ok"), "{}", text(&buf).join("\n"));
@@ -2067,35 +2252,22 @@ mod tests {
         app.on_job("one-s", Event::Complete);
         app.on_job("one-s", Event::Exit { code: Some(0), error: None });
         let buf = frame(&mut app, 100, 30);
-        let top = text(&buf).into_iter().find(|r| r.contains("one-s")).unwrap_or_default();
-        assert!(top.contains("✓ updated"), "{}", text(&buf).join("\n"));
+        let rows = text(&buf);
+        let one_s = rows.iter().position(|r| r.contains('┆') && r.contains("one-s")).unwrap();
+        assert!(rows[one_s + 1].contains("✓ updated"), "{}", rows.join("\n"));
     }
 
     #[test]
     fn dashboard_at_60x24() {
         let mut app = demo();
         let buf = frame(&mut app, 60, 24);
-        for needle in ["Update all", "one-s", "↑ 3 to update", "? help"] {
+        for needle in ["t3up", "Update 2 servers", "one-s", "↑#2623", "? help"] {
             assert!(has(&buf, needle), "{needle:?} missing from\n{}", text(&buf).join("\n"));
         }
         assert_eq!(geometry(&app).cols(), 1);
         // Too small for even a header: still draws.
         frame(&mut app, 20, 6);
         frame(&mut app, 1, 1);
-    }
-
-    #[test]
-    fn six_tools_wrap_in_a_narrow_card() {
-        let mut app = demo();
-        app.on_job("one-s", Event::Done("Pi: 0.5.0".into()));
-        app.on_job("one-s", Event::Done("Grok: grok 0.3.0".into()));
-        app.on_job("one-s", Event::Exit { code: Some(0), error: None });
-        let _ = frame(&mut app, 100, 30); // fits in a row: one card per column
-        assert!(!geometry(&app).wrapped);
-        let buf = frame(&mut app, 60, 40);
-        let g = geometry(&app);
-        assert!(g.wrapped && g.tile_rows == 2, "{}", g.tile_rows);
-        assert!(has(&buf, "0.5.0") && has(&buf, "0.3.0"), "{}", text(&buf).join("\n"));
     }
 
     #[test]
@@ -2140,7 +2312,39 @@ mod tests {
         assert!(has(&buf, "mdr output · mdr-153012-check.log"), "{}", text(&buf).join("\n"));
         assert!(has(&buf, "✗ Codex  EACCES: permission denied"));
         assert!(has(&buf, "Codex: EACCES"), "tagged line");
-        assert_eq!(cell_fg(&buf, "Codex:").unwrap(), ACCENT);
+        // The output's tag, not mdr's row above it.
+        let rows = text(&buf);
+        let (y, row) = rows.iter().enumerate().rev().find(|(_, r)| r.contains("Codex:")).unwrap();
+        let x = row[..row.find("Codex:").unwrap()].chars().count();
+        assert_eq!(buf[(x as u16, y as u16)].fg, ACCENT);
+    }
+
+    #[test]
+    fn six_tools_get_a_column_each_and_narrow_screens_shed_the_extras() {
+        let mut app = demo();
+        app.on_job("one-s", Event::Done("Pi: 0.5.0".into()));
+        app.on_job("one-s", Event::Done("Grok: grok 0.3.0".into()));
+        app.on_job("one-s", Event::Exit { code: Some(0), error: None });
+        let buf = frame(&mut app, 130, 30);
+        assert!(has(&buf, "0.5.0") && has(&buf, "0.3.0") && has(&buf, "disk"), "{}", text(&buf).join("\n"));
+        assert_eq!(geometry(&app).table.tools.len(), 6);
+        // Narrower: the meters go before any version does.
+        let buf = frame(&mut app, 100, 30);
+        assert!(has(&buf, "0.5.0") && !has(&buf, "disk"), "{}", text(&buf).join("\n"));
+    }
+
+    #[test]
+    fn a_nightly_too_wide_keeps_its_build() {
+        assert_eq!(fit("0.0.46 #2623", 12), "0.0.46 #2623");
+        assert_eq!(fit("0.0.46 #2623", 11), "#2623");
+        assert_eq!(fit("↑0.0.46 #2648", 12), "↑#2648");
+        assert_eq!(fit("2.1.289 (stable)", 8), "2.1.289…");
+    }
+
+    #[test]
+    fn minutes_read_as_a_stopwatch() {
+        assert_eq!(minutes(Duration::from_secs(42)), "42s");
+        assert_eq!(minutes(Duration::from_secs(187)), "3m 07s");
     }
 
     #[test]

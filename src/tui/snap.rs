@@ -196,7 +196,7 @@ pub fn demo() -> App {
             done("OpenCode: 1.18.34"),
             Event::Auth("Claude".into()),
             done("Health: OK"),
-            Event::Sys("load 0.24 · cpus 4 · disk 21% · up 1d 5h".into()),
+            Event::Sys("cpu 6% · cpus 4 · disk 21% · up 1d 5h".into()),
             Event::Busy(2),
             Event::Complete,
             Event::Exit { code: Some(0), error: None },
@@ -215,7 +215,7 @@ pub fn demo() -> App {
             done("T3: t3 0.0.46-nightly.20261003.2623 -> t3 0.0.46-nightly.20261003.2648"),
             done("Claude: 2.1.288 (Claude Code) -> 2.1.289 (Claude Code)"),
             Event::Output { tag: "Codex".into(), text: "added 1 package in 2s".into() },
-            Event::Sys("load 1.92 · disk 63% · up 12d 2h".into()),
+            Event::Sys("cpu 48% · disk 63% · up 12d 2h".into()),
         ],
     );
     app.hosts[1].installed.insert("Codex".into());
@@ -258,7 +258,7 @@ pub fn demo() -> App {
             log("Ganz-Harbour"),
             done("Codex: codex-cli 0.161.0"),
             done("Claude: 2.1.289 (Claude Code)"),
-            Event::Sys("load 2.10 · cpus 10 · disk 74% · up 3d 4h".into()),
+            Event::Sys("cpu 21% · cpus 10 · disk 74% · up 3d 4h".into()),
             Event::Complete,
             Event::Exit { code: Some(0), error: None },
         ],
@@ -279,6 +279,8 @@ fn save(name: &str, app: &mut App, w: u16, h: u16) {
 fn snapshots() {
     let mut app = demo();
     save("dashboard", &mut app, 100, 30);
+    save("wide", &mut app, 113, 36);
+    save("roomy", &mut app, 140, 44);
     app.show_output = true;
     app.selected = 3;
     save("output", &mut app, 100, 30);
@@ -335,7 +337,7 @@ fn snapshots() {
     app.hosts[1].steps.insert("Grok".into(), (crate::model::StepState::Done, "0.3.0".into()));
     app.hosts[1].steps.insert("Pi".into(), (crate::model::StepState::Done, "0.5.0".into()));
     app.on_job("one-s", Event::Exit { code: Some(0), error: None });
-    save("wrapped", &mut app, 60, 40);
+    save("six-tools", &mut app, 130, 30);
     app.hosts[1].installed.remove("Grok");
     app.hosts[1].installed.remove("Pi");
     app.on_job("one-s", Event::Exit { code: Some(0), error: None });
