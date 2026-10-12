@@ -11,6 +11,11 @@ A full-screen terminal dashboard for checking and updating your <a href="https:/
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
 </p>
 
+> [!NOTE]
+> **t3up is archived.** T3 Code now updates everything itself: the app's **Update all** updates the desktop app,
+> T3 on every environment and the providers on each, then continues your threads (nightly since October 2026).
+> Use that instead. Existing installs keep working, but t3up won't get new releases.
+
 ![t3up dashboard](docs/screenshot.png)
 
 <p align="center"><img src="docs/intro.png" width="520" alt="t3up intro"></p>
